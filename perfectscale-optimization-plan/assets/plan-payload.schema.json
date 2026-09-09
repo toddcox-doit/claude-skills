@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "perfectscale-optimization-plan/plan-payload",
+  "title": "PerfectScale Optimization Plan payload",
+  "type": "object",
+  "required": ["tenant", "generated", "scope", "totals", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "_comment": {
+      "type": "string",
+      "description": "Free-text note about the payload itself. Ignored by the builder, never rendered, never leak-scanned."
+    },
+    "tenant": { "type": "string", "minLength": 1 },
+    "generated": { "type": "string", "description": "ISO date, e.g. 2026-09-08" },
+    "data_window_days": { "type": "integer", "default": 30 },
+    "scope": {
+      "type": "object",
+      "required": ["clusters_analyzed", "clusters_total"],
+      "properties": {
+        "clusters_analyzed": { "type": "integer" },
+        "clusters_total": { "type": "integer" },
+        "cluster_names": { "type": "array", "items": { "type": "string" } },
+        "exclusions": { "type": "string" }
+      }
+    },
+    "session_length_min": { "enum": [30, 60, 90] },
+    "actions_shown": { "type": "integer" },
+    "constraints": {
+      "type": "string",
+      "description": "Verbatim Gate C Q6 answer: change freezes, approval requirements, team ownership."
+    },
+    "totals": {
+      "type": "object",
+      "required": ["achievable_now_monthly", "blocked_pending_monthly", "resiliency_investment_monthly"],
+      "additionalProperties": false,
+      "properties": {
+        "achievable_now_monthly": { "type": "number" },
+        "blocked_pending_monthly": { "type": "number" },
+        "resiliency_investment_monthly": {
+          "type": "number",
+          "description": "Positive number representing added spend. Rendered in parentheses."
+        }
+      }
+    },
+    "unblocker_sentence": {
+      "type": "string",
+      "description": "How much of the total sits behind zero-savings prerequisites. Required in the artifact; the builder warns if absent."
+    },
+    "where_it_is": { "type": "string", "description": "3-4 sentence concentration summary." },
+    "decisions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "3-5 yes/no or name-a-person asks that drive the session."
+    },
+    "flywheel_note": { "type": "string", "description": "Rendered at the Phase 1/2 boundary." },
+    "baseline": {
+      "type": "object",
+      "description": "Impact Tracker state at plan time; the Step 8 verification baseline.",
+      "properties": {
+        "days_active": { "type": "integer" },
+        "total_saved_usd": { "type": "number" },
+        "risks_addressed": { "type": "integer" }
+      }
+    },
+    "checkpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "date", "what", "expected"],
+        "properties": {
+          "name": { "type": "string" },
+          "date": { "type": "string" },
+          "what": { "type": "string" },
+          "expected": { "type": "string" }
+        }
+      }
+    },
+    "method_notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Appendix B bullets. Customer-facing language only."
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/action" }
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "object",
+      "required": [
+        "id", "title", "action_type", "cluster", "scope",
+        "savings_monthly_usd", "savings_basis", "confidence",
+        "effort_tier", "effort_rationale", "change_risk", "owner_role",
+        "depends_on", "unblocks", "phase", "steps", "verification", "evidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^A[0-9]+$" },
+        "title": { "type": "string", "minLength": 1 },
+        "action_type": {
+          "type": "string",
+          "description": "Closed vocabulary from references/action-catalog.md.",
+          "enum": [
+            "automation_entitlement", "automation_enable_policy", "automation_enable_workload",
+            "restriction_clear_user", "restriction_clear_system", "policy_headroom_tune",
+            "custom_grouping", "rightsize_manual", "rightsize_stateful", "limit_remove_cpu",
+            "oom_remediate", "limitrange_adjust", "daemonset_rightsize",
+            "nodegroup_instance_change", "nodegroup_consolidate",
+            "autoscaler_tune_ca", "autoscaler_tune_karpenter",
+            "unevictable_antiaffinity", "unevictable_pdb", "unevictable_karpenter_optout",
+            "unevictable_emptydir", "unevictable_hostpath", "unevictable_localpv",
+            "unevictable_mirror_pod", "unevictable_system_pod",
+            "commitment_realignment", "policy_default_new_ns", "automation_default_on",
+            "review_cadence", "plan_rerun", "other"
+          ]
+        },
+        "cluster": { "type": "string" },
+        "scope": { "type": "string" },
+        "savings_monthly_usd": { "type": ["number", "null"] },
+        "savings_basis": { "enum": ["achievable_now", "blocked_pending", "resiliency_investment"] },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "effort_tier": { "enum": ["XS", "S", "M", "L"] },
+        "effort_rationale": { "type": "string", "minLength": 1 },
+        "change_risk": { "enum": ["low", "medium", "high", "critical"] },
+        "owner_role": { "enum": ["ps-admin", "platform", "app-team", "finops", "ps-csm"] },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "unblocks": { "type": "array", "items": { "type": "string" } },
+        "released_value": { "type": "number", "default": 0 },
+        "is_unblocker": { "type": "boolean", "default": false },
+        "phase": { "enum": [1, 2, 3] },
+        "roi_score": { "type": ["number", "null"] },
+        "severity": {
+          "enum": ["critical", "serious", "warning"],
+          "description": "Resiliency actions only; drives their phase placement."
+        },
+        "steps": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 6 },
+        "verification": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "in_body": {
+          "type": "boolean",
+          "default": true,
+          "description": "False for actions below the session cap: appendix only."
+        }
+      }
+    }
+  }
+}

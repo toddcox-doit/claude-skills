@@ -1,0 +1,238 @@
+{
+  "_comment": "Fictional tenant. Matches the worked example in references/roi-scoring.md. Modelled as a CLI-only run (no browser enrichment), so PodFit automation actions are floored at S and capped at medium confidence per roi-scoring.md section 'CLI-only scoring discipline'. Use to smoke-test the HTML builder: python3 ../scripts/build_plan_html.py example-payload.json /tmp/plan.html",
+  "tenant": "Northwind Logistics",
+  "generated": "2026-09-08",
+  "data_window_days": 30,
+  "scope": {
+    "clusters_analyzed": 3,
+    "clusters_total": 7,
+    "cluster_names": ["prod-eu-west-a", "prod-ap-south-a", "nonprod-eu-west-a"],
+    "exclusions": "none"
+  },
+  "session_length_min": 60,
+  "actions_shown": 6,
+  "constraints": "Change freeze 20 Dec - 5 Jan. Prod changes need a CAB ticket with 5 working days' notice. The data namespace is owned by the analytics team, who are mid-migration until November.",
+  "totals": {
+    "achievable_now_monthly": 16500,
+    "blocked_pending_monthly": 9800,
+    "resiliency_investment_monthly": 640
+  },
+  "unblocker_sentence": "$13,400/mo of the $16,500 sits behind two actions that save nothing by themselves and take under a day of work between them.",
+  "where_it_is": "Two of your seven clusters carry 81% of the opportunity, and both show the same pattern: automation is licensed but was never switched on, so every recommendation PerfectScale has generated since March is sitting unapplied. The second pattern is on ng-general in prod-eu-west-a, where four pods are pinning nodes the autoscaler has been trying to consolidate for weeks. Neither is a tuning problem. Both are switches nobody has thrown.",
+  "decisions": [
+    "Who owns PerfectScale policy configuration day to day? Phase 1 needs one name.",
+    "Can we enable automation on the platform namespace in prod-eu-west-a this sprint?",
+    "Who do we talk to about the four analytics/reporting Deployments on ng-general?",
+    "Does the 20 Dec change freeze affect the Phase 2 node group work, or can it land in November?"
+  ],
+  "flywheel_note": "Sequencing note: Phase 1 shrinks pods, Phase 2 takes the nodes away. Those have to happen in that order and they will not look like progress in isolation — right-sizing on its own will barely move your bill, because the nodes you paid for are still running. The cost curve steps down in Phase 2, when the pods have re-packed and InfraFit can show which nodes can leave.",
+  "baseline": {
+    "days_active": 184,
+    "total_saved_usd": 11200,
+    "risks_addressed": 37
+  },
+  "checkpoints": [
+    {
+      "name": "Phase 1 close",
+      "date": "2026-10-08",
+      "what": "Impact Tracker: Total Saved and Risks Addressed",
+      "expected": "Both rise; roughly $4,800/mo realized"
+    },
+    {
+      "name": "Phase 2 close",
+      "date": "2026-12-07",
+      "what": "Trends: daily cost for prod-eu-west-a",
+      "expected": "Visible step down at each change date"
+    },
+    {
+      "name": "Phase 3 review",
+      "date": "2027-03-08",
+      "what": "Waste % on workloads created since December",
+      "expected": "Flat as the estate grows — new workloads land already optimized"
+    }
+  ],
+  "method_notes": [
+    "Data window: 30 days ending 8 September 2026.",
+    "Scope: 3 of 7 clusters — the four excluded carry under 6% of estate potential savings between them.",
+    "Data source: PerfectScale's public API. Everything below is reproducible from your own service token — nothing here came from a source you cannot query yourself.",
+    "Confidence: 2 actions high, 4 medium. Medium is marked in the row. Three of the four are automation actions: the public API shows that a workload is unautomated but not why, so we scored them conservatively and each one's first step is the check that settles it. Two minutes in the PodFit view on the call resolves all three.",
+    "The cost/resiliency split is inferred from PerfectScale's recommendation reasoning, not a native product field.",
+    "Not included: Kafka and OpenSearch workloads, which PerfectScale does not automate — these are covered separately as manual right-sizing and are not counted in the automation business case.",
+    "This was an analysis only. Nothing in your environment was changed."
+  ],
+  "actions": [
+    {
+      "id": "A1",
+      "title": "Enable automation on the platform namespace policy",
+      "action_type": "automation_enable_policy",
+      "cluster": "prod-eu-west-a",
+      "scope": "policy: platform-default — covers 14 workloads",
+      "savings_monthly_usd": 0,
+      "savings_basis": "achievable_now",
+      "confidence": "medium",
+      "effort_tier": "S",
+      "effort_rationale": "XS (catalog) → S: CLI-only floor — no automation history on this policy, so status reads as Not Enabled but could be Limited (inferred — cause not confirmed)",
+      "change_risk": "medium",
+      "owner_role": "ps-admin",
+      "depends_on": [],
+      "unblocks": ["A3", "A4"],
+      "released_value": 7000,
+      "is_unblocker": true,
+      "phase": 1,
+      "roi_score": 0,
+      "steps": [
+        "Confirm current state: PerfectScale → Policies → platform-default. Automation should read Off — if it reads On but the workloads show Limited, this is a different problem and we re-scope on the call.",
+        "Review the 14 workloads the policy covers and confirm none are on your do-not-touch list.",
+        "Set Automation to On. Leave the existing headroom settings alone for now — we tune those in Phase 3 once there is a baseline.",
+        "Watch the first automation window (24h). Expect in-place resizes, not restarts, for all 14.",
+        "Verify: Impact Tracker registers activity within 24h. This gates A3 ($4,800/mo) and A4 ($2,200/mo)."
+      ],
+      "verification": "Impact Tracker shows automation activity within 24h",
+      "evidence": "Automation is licensed on this tenant and has been off since onboarding in March. 14 workloads under this policy have unapplied recommendations."
+    },
+    {
+      "id": "A5",
+      "title": "Clear the emptyDir eviction blocker on ng-general",
+      "action_type": "unevictable_emptydir",
+      "cluster": "prod-eu-west-a",
+      "scope": "node group ng-general — namespaces analytics, reporting (4 pods)",
+      "savings_monthly_usd": 0,
+      "savings_basis": "achievable_now",
+      "confidence": "high",
+      "effort_tier": "S",
+      "effort_rationale": "S (catalog), no escalators — annotation change, normal deploy cycle, no restart window needed",
+      "change_risk": "medium",
+      "owner_role": "app-team",
+      "depends_on": [],
+      "unblocks": ["A6"],
+      "released_value": 6400,
+      "is_unblocker": true,
+      "phase": 1,
+      "roi_score": 0,
+      "steps": [
+        "Confirm still blocking: PerfectScale → InfraFit → ng-general → Unevictable Pods. Expect 4 pods across analytics and reporting.",
+        "For each of the 4 Deployments, determine whether the emptyDir holds durable state or scratch. Scratch is the common case — a cache or temp path.",
+        "Where it is scratch, add the pod-template annotation cluster-autoscaler.kubernetes.io/safe-to-evict: \"true\".",
+        "Where it holds durable state, move it to a PVC — that is a larger change; split it out into Phase 3 rather than blocking on it.",
+        "Roll the Deployments on the normal deploy cycle. No maintenance window required.",
+        "Verify: unevictable pod count on ng-general falls to zero within 24h. This gates A6 ($6,400/mo)."
+      ],
+      "verification": "Unevictable pod count on ng-general → 0",
+      "evidence": "4 pods have blocked node drain on ng-general for the full 30-day window, holding $6,400/mo of consolidation savings out of reach."
+    },
+    {
+      "id": "A3",
+      "title": "Automate 14 eligible workloads in the platform namespace",
+      "action_type": "automation_enable_workload",
+      "cluster": "prod-eu-west-a",
+      "scope": "namespace: platform",
+      "savings_monthly_usd": 4800,
+      "savings_basis": "achievable_now",
+      "confidence": "medium",
+      "effort_tier": "S",
+      "effort_rationale": "XS (catalog) → S: CLI-only floor. No escalator for A1 — it is in this plan, in this phase (inferred — cause not confirmed)",
+      "change_risk": "medium",
+      "owner_role": "ps-admin",
+      "depends_on": ["A1"],
+      "unblocks": [],
+      "released_value": 0,
+      "is_unblocker": false,
+      "phase": 1,
+      "roi_score": 1800,
+      "steps": [
+        "Confirm A1 is complete and the policy shows Automation: On.",
+        "PerfectScale → PodFit → filter namespace = platform, automation status = Not Enabled. Expect 14.",
+        "Enable in two waves — 4 lowest-traffic workloads first, then the remaining 10 after 48h clean.",
+        "Verify: PodFit pod waste for the platform namespace falls; Trends shows a step down within 14 days."
+      ],
+      "verification": "Pod waste % for namespace platform falls; Trends steps down",
+      "evidence": "14 workloads are eligible and unautomated, carrying $4,800/mo of recommendations generated but never applied."
+    },
+    {
+      "id": "A6",
+      "title": "Tune Karpenter consolidation on ng-general",
+      "action_type": "autoscaler_tune_karpenter",
+      "cluster": "prod-eu-west-a",
+      "scope": "NodePool: ng-general",
+      "savings_monthly_usd": 6400,
+      "savings_basis": "blocked_pending",
+      "confidence": "medium",
+      "effort_tier": "M",
+      "effort_rationale": "M (catalog), no escalators — cluster-level config, needs a change window",
+      "change_risk": "medium",
+      "owner_role": "platform",
+      "depends_on": ["A5"],
+      "unblocks": [],
+      "released_value": 0,
+      "is_unblocker": false,
+      "phase": 2,
+      "roi_score": 1200,
+      "steps": [
+        "Confirm A5 is complete — unevictable count on ng-general is zero. Tuning consolidation while pods pin the nodes changes nothing.",
+        "Set disruption.consolidationPolicy to WhenEmptyOrUnderutilized and consolidateAfter to 5m on the ng-general NodePool.",
+        "Add a disruption budget capping concurrent node disruption at 10% so consolidation is gradual.",
+        "Widen the instance-type requirement — the current NodePool pins one family, which is why Karpenter cannot find a cheaper fit.",
+        "Verify: node count on ng-general tracks demand; Overview node idle for this cluster falls within 7 days."
+      ],
+      "verification": "Overview node idle $ for prod-eu-west-a falls; ng-general node count tracks demand",
+      "evidence": "ng-general has run 30-40% idle for the full window. Consolidation is configured as WhenEmpty only, and the NodePool is pinned to a single instance family."
+    },
+    {
+      "id": "A2",
+      "title": "Right-size checkout-api requests",
+      "action_type": "rightsize_manual",
+      "cluster": "prod-eu-west-a",
+      "scope": "namespace payments / Deployment checkout-api",
+      "savings_monthly_usd": 3100,
+      "savings_basis": "achievable_now",
+      "confidence": "high",
+      "effort_tier": "M",
+      "effort_rationale": "S (catalog) → M: change-managed — prod payment path and audit-logs show this cluster evicts rather than resizing in place. Counts once, not twice",
+      "change_risk": "high",
+      "owner_role": "app-team",
+      "depends_on": [],
+      "unblocks": [],
+      "released_value": 0,
+      "is_unblocker": false,
+      "phase": 2,
+      "roi_score": 775,
+      "steps": [
+        "Confirm the recommendation still holds: PerfectScale → PodFit → checkout-api. Check observed p99 has not moved.",
+        "Held out of automation at your request, so this is a manifest change: CPU request 2000m → 750m, memory request 4Gi → 2.5Gi. Limits unchanged.",
+        "Raise the CAB ticket — this needs a restart and it is on the payment path.",
+        "Deploy to staging first and hold 48h under production-shaped load before promoting.",
+        "Verify: checkout-api waste in PodFit drops below 15%; no new throttling or OOM indicators appear within 7 days."
+      ],
+      "verification": "PodFit waste for checkout-api < 15%, no new risk indicators",
+      "evidence": "Observed p99 CPU is 610m against a 2000m request over 30 days. Peak in the window never exceeded 780m."
+    },
+    {
+      "id": "A4",
+      "title": "Automate 6 eligible workloads in the data namespace",
+      "action_type": "automation_enable_workload",
+      "cluster": "prod-ap-south-a",
+      "scope": "namespace: data",
+      "savings_monthly_usd": 2200,
+      "savings_basis": "achievable_now",
+      "confidence": "medium",
+      "effort_tier": "M",
+      "effort_rationale": "XS (catalog) → S: CLI-only floor → M: cross-team (analytics owns this namespace) (inferred — cause not confirmed)",
+      "change_risk": "medium",
+      "owner_role": "ps-admin",
+      "depends_on": ["A1"],
+      "unblocks": [],
+      "released_value": 0,
+      "is_unblocker": false,
+      "phase": 2,
+      "roi_score": 413,
+      "steps": [
+        "Confirm A1 is complete, and confirm with the analytics team that their migration has landed — they are mid-move until November.",
+        "PerfectScale → PodFit → filter namespace = data, automation status = Not Enabled. Expect 6.",
+        "Enable all 6 together — none are on the request path and all are horizontally scaled.",
+        "Verify: pod waste for namespace data falls; Impact Tracker registers 6 more automated workloads."
+      ],
+      "verification": "Pod waste % for namespace data falls; Impact Tracker count rises by 6",
+      "evidence": "6 eligible unautomated workloads. Medium confidence for two reasons — two are multi-container and only the primary container's history was long enough to read reliably, and the API does not say why the other four are unautomated."
+    }
+  ]
+}
