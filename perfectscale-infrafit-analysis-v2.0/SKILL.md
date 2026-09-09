@@ -1,15 +1,15 @@
 ---
 name: perfectscale-infrafit-analysis-v2.0
 description: >
-  Runs the PerfectScale InfraFit unevictable-pods analysis via `pscli` — no
-  browser required. Use this skill whenever the user wants to analyze
-  unevictable pods, check why nodes can't be drained, investigate Cluster
-  Autoscaler blocking issues, or review idle node costs in PerfectScale.
-  Triggers on: "unevictable pods", "infra fit", "infrafit", "node idle", "why
-  can't nodes drain", "cluster autoscaler blocking", "perfectscale analysis",
-  "check idle costs". Always use this skill when the user asks to run the
-  PerfectScale workflow or check unevictable pods — even if they don't
-  mention all the steps explicitly.
+  Quick-look PerfectScale InfraFit unevictable-pods check via `pscli` — no
+  browser required. Deliberately lightweight: which pods are unevictable, why,
+  and on which nodes, with no customer-ready report. `infrafit-improved-v2.0`
+  is the default for InfraFit work and covers the same ground in full
+  (executive summary, pattern tables, fix syntax, emptyDir origin
+  cross-check). Use this skill only when the user explicitly asks for a quick
+  or terse check, names this skill, or wants the raw unevictable list without
+  a report — for example "just list the unevictable pods", "quick infrafit
+  check", "which pods are blocking, no report".
 compatibility: >
   Preferred: pscli (public API service token). UI fallback only for token
   generation and for a snapshot that failed to process.
