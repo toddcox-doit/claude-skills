@@ -1,0 +1,4 @@
+# Optional. The plan and all other formats render without this —
+# only the .xlsx workbook needs it. Install with:
+#   python3 -m pip install -r requirements-optional.txt
+openpyxl>=3.1

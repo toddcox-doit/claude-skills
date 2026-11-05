@@ -1,0 +1,9 @@
+{
+  "name": "perfectscale-optimization-plan",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Executive summary renderer (exec_summary.js) for the PerfectScale optimization plan skill.",
+  "dependencies": {
+    "docx": "^9.0.0"
+  }
+}

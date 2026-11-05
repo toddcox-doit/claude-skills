@@ -78,10 +78,16 @@ copies only the library.
 
 | Need | Check | If missing |
 |---|---|---|
-| `pscli`, authenticated for this tenant | `pscli auth status` | `pscli auth login --client-id … --client-secret …`; never echo the secret |
+| `pscli`, authenticated for this tenant | `pscli auth status` | Not vendored here — see README.md "Installing `pscli`"; install from [doitintl/perfectscale-cli](https://github.com/doitintl/perfectscale-cli), then `pscli auth login --client-id … --client-secret …` (never echo the secret) |
 | Python 3.10+ | `python3 -V` | — |
-| `docx` npm package (for the .docx one-pager) | `node -e "require('docx')"` | `npm install -g docx`; without it the run still completes and warns |
-| `openpyxl` (for XLSX) | `python3 -c "import openpyxl"` | optional; CSV is always written |
+| Node.js 22+ (only for the .docx one-pager or browser enrichment) | `node -v` | `scripts/browser/cdp-chrome.js` needs the native `WebSocket` global, stable only from Node 22 |
+| `docx` npm package (for the .docx one-pager) | `node -e "require('docx')"` from `scripts/` | `cd scripts && npm install`; without it the run still completes and warns |
+| `openpyxl` (for XLSX) | `python3 -c "import openpyxl"` | optional: `python3 -m pip install -r scripts/requirements-optional.txt`; CSV is always written |
+
+The optional PodFit eligibility browser pass (`references/eligibility-enrichment.md`)
+is macOS-only: `cdp-chrome.js` reads a hard-coded macOS Chrome profile path. On
+Linux/Windows, skip it — the plan still runs at medium confidence for PodFit
+actions.
 
 `expires_at` in `pscli auth status` can read as past while calls still work.
 Probe with a real call before concluding the token is dead.

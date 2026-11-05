@@ -29,19 +29,81 @@ a static report.
 
 | Need | Check | If missing |
 |---|---|---|
-| `pscli`, authenticated for the tenant | `pscli auth status` | `pscli auth login --client-id … --client-secret …` (never echo the secret) |
-| Python 3.10+ | `python3 -V` | — |
-| Node + `docx` (for the `.docx` summary) | `node -e "require('docx')"` | `npm install -g docx`; without it the run completes and warns, and you still get the HTML |
-| `openpyxl` (for `.xlsx`) | `python3 -c "import openpyxl"` | optional; CSV is always written |
+| `pscli`, authenticated for the tenant | `pscli auth status` | See [Installing `pscli`](#installing-pscli) below |
+| Python 3.10+ | `python3 -V` | [python.org/downloads](https://www.python.org/downloads/) |
+| Node.js 22+ (only for the `.docx` summary or browser enrichment) | `node -v` | [nodejs.org](https://nodejs.org/) — 22+ is required because `scripts/browser/cdp-chrome.js` uses the native `WebSocket` global, only stable from Node 22 onward |
+| `docx` npm package (for the `.docx` summary) | `node -e "require('docx')"` from `scripts/` | `cd scripts && npm install`; without it the run completes and warns, and you still get the HTML |
+| `openpyxl` (for `.xlsx`) | `python3 -c "import openpyxl"` | optional: `python3 -m pip install -r scripts/requirements-optional.txt`; CSV is always written |
+| Google Chrome (only for the optional PodFit eligibility browser pass) | — | macOS only today — `scripts/browser/cdp-chrome.js` hard-codes the macOS Chrome profile path; skip this entirely on Linux/Windows, the plan still runs at medium confidence without it |
+
+Nothing above except `pscli` and Chrome is vendored in this skill or needs a
+system install — Python's standard library and a local `npm install` cover the
+rest. See [Tooling scrub](#tooling-scrub-what-this-skill-needs-that-it-does-not-ship) for the full accounting.
 
 ## Install
 
-Unzip it anywhere. Then either:
+### 1. Get the code
 
-- **Using Claude Code?** Drop the `perfectscale-optimization-plan/` folder into
-  `~/.claude/skills/` and the skill becomes available by name.
+- **Received a zip from a colleague** (built by `scripts/package.py`)? Unzip it
+  anywhere.
+- **Cloning the source repo?**
+  ```bash
+  git clone https://github.com/toddcox-doit/claude-skills.git
+  cd claude-skills/perfectscale-optimization-plan
+  ```
+
+### 2. Make it available
+
+- **Using Claude Code?** Drop (or symlink) the `perfectscale-optimization-plan/`
+  folder into `~/.claude/skills/` and the skill becomes available by name:
+  ```bash
+  cp -R perfectscale-optimization-plan ~/.claude/skills/
+  ```
 - **Not using it?** Nothing to install. Call the scripts by path; the examples
   below assume `SKILL=/path/to/perfectscale-optimization-plan`.
+
+### 3. Install `pscli` {#installing-pscli}
+
+This is the one hard external prerequisite — a Go binary, not something this
+skill can vendor or install for you.
+
+```bash
+# macOS / Linux / WSL / Git Bash
+curl -fsSL https://raw.githubusercontent.com/doitintl/perfectscale-cli/main/install.sh | bash
+# or, if you also have the sibling perfectscale-cli skill checked out:
+bash ../perfectscale-cli/scripts/install.sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File ..\perfectscale-cli\scripts\install.ps1 -AddToPath
+```
+
+Both fetch the latest release for your OS/arch from
+[doitintl/perfectscale-cli](https://github.com/doitintl/perfectscale-cli/releases/latest).
+Then authenticate:
+
+```bash
+pscli auth login --client-id … --client-secret …   # never echo the secret
+pscli auth status                                   # confirm it is the right tenant
+```
+
+### 4. Install the optional renderers
+
+```bash
+cd $SKILL/scripts
+npm install                                          # for the .docx executive summary
+python3 -m pip install -r requirements-optional.txt  # for the .xlsx workbook
+```
+
+Skip either and the run still completes — you get HTML instead of `.docx`, CSV
+instead of `.xlsx`, and a warning telling you what was skipped.
+
+### 5. Verify the toolchain
+
+```bash
+python3 -V          # 3.10+
+node -v              # 22+ (only needed for step 4/browser enrichment)
+pscli auth status    # confirms the right tenant
+```
 
 ## Quickstart
 
@@ -108,7 +170,10 @@ engagement.
 ```
 SKILL.md                  the runbook, and the rules the engine encodes
 README.md                 this file
+LICENSE                   Apache-2.0
 scripts/
+  package.json            npm manifest for the one runtime dep: docx
+  requirements-optional.txt  pip manifest for the one optional dep: openpyxl
   new_tenant.py           create a tenant folder; write its config from the ranking
   rank_clusters.py        rank every cluster before you commit to a scope
   run_plan.py             collect -> analyse -> render -> verify -> diff
@@ -126,6 +191,26 @@ Run the tests after any change:
 cd $SKILL/scripts && python3 -W ignore -m unittest discover -s tests
 ```
 
+## Tooling scrub: what this skill needs that it does not ship
+
+An honest accounting of every external dependency, found by reading every
+`import`/`require` in `scripts/`, so a new user doesn't discover a gap mid-run:
+
+| Tool | Vendored here? | Why it's missing / how it's resolved |
+|---|---|---|
+| `pscli` binary | **No** | External Go binary from a separate GitHub repo ([doitintl/perfectscale-cli](https://github.com/doitintl/perfectscale-cli)). The only hard prerequisite — nothing in this skill works without it. See [Installing `pscli`](#installing-pscli). |
+| `docx` (npm) | **No**, but now declared | Used only by `scripts/exec_summary.js` for the `.docx` summary. Previously undeclared — no `package.json` existed, so a fresh clone had no record of the dependency or its version. Added `scripts/package.json` pinning `docx@^9`; run `npm install` in `scripts/`. |
+| `openpyxl` (pip) | **No**, but now declared | Used only by `scripts/psplan/render.py` for the `.xlsx` workbook. Previously undeclared — no `requirements*.txt` existed. Added `scripts/requirements-optional.txt`. |
+| Node.js 22+ | **No** (system install) | `scripts/browser/cdp-chrome.js` calls the global `WebSocket` constructor directly with no `ws` package fallback. That global is only available, unflagged, from Node 22 onward — on Node ≤21 the eligibility-enrichment path fails with `ReferenceError: WebSocket is not defined`. This minimum version was previously undocumented anywhere in the skill. |
+| Google Chrome | **No** (system app) | `cdp-chrome.js` reads `~/Library/Application Support/Google/Chrome/DevToolsActivePort` — a **macOS-only** path. The optional browser eligibility pass (`references/eligibility-enrichment.md`) silently has no Linux/Windows equivalent; this was previously undocumented as a platform limitation. |
+| Python 3.10+ stdlib | Fully vendored logic, system Python required | Confirmed by scanning every `scripts/**/*.py` import: nothing outside `argparse`, `json`, `csv`, `pathlib`, etc. plus the optional `openpyxl`. No stdlib surprises. |
+| `LICENSE` file | **Added** | `SKILL.md` declared `license: Apache-2.0` but no `LICENSE` file existed in the folder, so a recipient of the zip bundle had no actual license text. Added `LICENSE` (Apache-2.0) and included it in `scripts/package.py`'s `SHIP` list so it's in every bundle from now on. |
+
+Net effect of this scrub: `pscli` and Chrome are real external installs you
+must do yourself (documented above); everything else now has a manifest
+(`package.json`, `requirements-optional.txt`) so `npm install` / `pip install
+-r` replace guesswork.
+
 ## Where to look when something fails
 
 | Symptom | Cause / fix |
@@ -134,7 +219,7 @@ cd $SKILL/scripts && python3 -W ignore -m unittest discover -s tests
 | `collection incomplete` | Re-run with `--collect`; it resumes |
 | Verifier fails on a money total | The plan and the raw files disagree. Fix the model, never the output |
 | Verifier fails on a foreign tenant name | Copy carried over from another engagement; fix the source text |
-| No `.docx` summary, only `.html` | `npm install -g docx` |
+| No `.docx` summary, only `.html` | `cd scripts && npm install` (needs Node 22+; `node -v` to check) |
 | A cluster name is ambiguous | Two live clusters share it. Address it by UID |
 | A cluster reports nothing | Decommissioned or no longer reporting; valid, not an error |
 

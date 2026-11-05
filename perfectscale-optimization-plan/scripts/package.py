@@ -25,10 +25,13 @@ from datetime import date
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parent.parent
-SHIP = ["SKILL.md", "README.md", "scripts", "templates", "references"]
+SHIP = ["SKILL.md", "README.md", "LICENSE", "scripts", "templates", "references"]
 DROP_DIRS = {"__pycache__", ".git", "dist", "node_modules", ".pytest_cache"}
 DROP_FILES = {".DS_Store", ".env"}
 TEXT = {".py", ".js", ".md", ".json", ".txt", ".yml", ".yaml", ".cfg", ".toml", ".sh"}
+# Extensionless files that are nonetheless plain text and must be scanned, not
+# rejected as "unexpected binary" (e.g. LICENSE).
+TEXT_NAMES = {"LICENSE", "NOTICE", "AUTHORS"}
 
 # Things that must never appear in a bundle, whatever the customer is called.
 PATTERNS = [
@@ -78,7 +81,7 @@ def scan(root: Path, deny):
         if not p.is_file():
             continue
         rel = p.relative_to(root).as_posix()
-        if p.suffix.lower() not in TEXT:
+        if p.suffix.lower() not in TEXT and p.name not in TEXT_NAMES:
             hits.append((rel, "unexpected binary in bundle", p.suffix or "no suffix"))
             continue
         try:
