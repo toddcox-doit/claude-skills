@@ -1,0 +1,33 @@
+{
+  "customer": "ExampleCo",
+  "prepared": "2026-10-15",
+  "profile": "exampleco",
+  "cloud": "gcp",
+  "clusters": [
+    {
+      "name": "prod",
+      "uid": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "data_dir": "data/plan-run",
+  "out_dir": "reports/v2",
+  "version_tag": "v2",
+  "rerun_days": 90,
+  "assumptions": {
+    "scope": "entire cluster",
+    "delivery": null,
+    "gitops": null
+  },
+  "intake": {
+    "change_freeze": null,
+    "approval_lead_time": null,
+    "namespace_owners": null
+  },
+  "foreign_tenants": [],
+  "exclusions": [],
+  "held_out_from_automation": [],
+  "cluster_settings": {},
+  "eligibility_file": null,
+  "trends_csv": null,
+  "previous_plan": null
+}

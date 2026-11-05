@@ -1,6 +1,6 @@
 # Action catalog
 
-The lookup table behind Step 2 and Step 3. Every action in a plan must have an
+The lookup table behind every `r_*` rule in `psplan/actions.py`. Every action in a plan must have an
 `action_type` from this file — the vocabulary is **closed**. If a finding does not
 map, use `other` and write the effort tier's justification explicitly in
 `effort_rationale`; do not invent a new type silently, because an unlisted type
@@ -12,8 +12,8 @@ Catalog tier is a **floor**. Apply the escalators in `roi-scoring.md` § 2 on to
 
 ## Action record schema
 
-Every action carries these fields. See `assets/plan-payload.schema.json` for the
-machine-readable form.
+Every action carries these fields. `Plan.add` in `psplan/actions.py` is the
+authoritative form; `render.ACOLS` is the column order the artifacts use.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -31,12 +31,12 @@ machine-readable form.
 | `owner_role` | enum | See § Owner roles |
 | `depends_on` | string[] | Action ids |
 | `unblocks` | string[] | Action ids |
-| `released_value` | number | Computed in Step 4 |
+| `released_value` | number | Transitive sum over `unblocks`; computed by the engine |
 | `is_unblocker` | boolean | Set by the promotion rule |
 | `phase` | 1 \| 2 \| 3 | |
 | `roi_score` | number \| null | `null` for resiliency actions |
 | `steps` | string[] | The "detailed optimization steps" — see § Step writing |
-| `verification` | string | From SKILL.md Step 8's table |
+| `verification` | string | The observable check, with its expected direction |
 | `evidence` | string | Where this came from, in customer language |
 
 ---
@@ -204,7 +204,7 @@ loud, once, near the phase boundary where it bites.
 4. **First step is always verification of current state**, so the owner can
    confirm the finding is still true before changing anything. Between collection
    and execution the estate moves.
-5. **Last step is always the verification method** from SKILL.md Step 8, with the
+5. **Last step is always the action's `verification` method**, with the
    expected direction. An action without a check is a hope.
 6. **No internal mechanics.** No `pscli`, no impersonation, no Backoffice. Steps
    are written for the customer's engineer, in their own console and their own

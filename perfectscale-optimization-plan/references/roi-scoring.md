@@ -31,7 +31,7 @@ half-to-even and would give 412.
 | Low | 0.5 | Inferred, estimated, or extrapolated from a sample — e.g. a namespace-level projection from three sampled workloads |
 
 Confidence is the **finding's own** badge, carried forward. For a rolled-up
-action that collapses several findings (Step 2), take the **worst** contributing
+action that collapses several findings, take the **worst** contributing
 confidence, never the average. A collapse is only as trustworthy as its weakest
 member.
 

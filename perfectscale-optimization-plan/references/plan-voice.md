@@ -27,7 +27,8 @@ Every number needs a traceable source; every recommendation needs a "because."
   loud, in the row. A plan that admits its soft numbers is trusted on its hard
   ones.
 - **Say "POV," never "science project" or "science experiment"** — including in
-  negation. Carried forward from `perfectscale-executive-1pager`.
+  negation. Carried forward from `perfectscale-executive-1pager`, retired
+  2026-10-21 (see `~/.claude/skills-archive/ARCHIVE.md`).
 - **No internal mechanics.** No impersonation, Backoffice, `pscli`, `frontegg`,
   CDP, `idleCost`. Appendix B says what the data is and how confident it is, not
   how it was extracted.
