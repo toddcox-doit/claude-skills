@@ -19,6 +19,7 @@ from .util import human_list, pct, roi_score, usd
 TIERS = ["XS", "S", "M", "L"]
 # Which PerfectScale product a recommendation comes from. PodFit = workload requests/automation; InfraFit = node pools and what blocks node scale-down.
 FIT = {"automation_proof": "PodFit", "automation_w2": "PodFit", "automation_w3": "PodFit", "memory_limits": "PodFit", "oom_fix": "PodFit", "job_grouping": "PodFit",
+       "replicated_grouping": "PodFit",
        "job_rightsize": "PodFit", "stateful_manual": "PodFit", "heldout_manual": "PodFit", "underprov_other": "PodFit", "headroom_policy": "PodFit", "default_policy": "PodFit",
        "stale_optout": "InfraFit", "pdb": "InfraFit", "unevictable_affinity": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
        "pool_machine_recs": "InfraFit", "autoprov_review": "InfraFit", "gpu_cap": "InfraFit", "commitments": "InfraFit", "review_cadence": "Governance", "rerun": "Governance",
@@ -138,7 +139,8 @@ class Plan:
 
     # ------------------------------------------------------------------ rules
     def build(self):
-        for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_automation, self.r_memory_limits, self.r_oom, self.r_jvm,
+        for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_replicated_grouping, self.r_automation,
+                     self.r_memory_limits, self.r_oom, self.r_jvm,
                      self.r_grouping, self.r_stale_optout, self.r_pdb, self.r_unevictable_affinity,
                      self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_autoprov, self.r_gpu, self.r_underprov,
                      self.r_headroom, self.r_local_storage, self.r_governance):
@@ -211,16 +213,23 @@ class Plan:
                     esc.append("change-managed - a change freeze or approval lead time was reported at intake for a production cluster in this wave")
                 t, r = effort("XS", esc)
                 prio = ", ".join(f"{f['name']} ({usd(self.pot_ctl(f)[0])}/mo)" for f in grp)
+                # Catalog dependency edge: custom_grouping -> automation_enable_policy. Group first so
+                # the repeated copies are one policy decision instead of thousands. The proof action is
+                # deliberately left free of it: proving the loop on a few controllers needs no grouping.
+                wave_deps = [prev] + (["replicated_grouping"] if self.has("replicated_grouping") else [])
+                group_step = ("Apply the custom grouping rule first, so the repeated workload copies arrive as one policy decision rather than thousands."
+                              if self.has("replicated_grouping") else None)
                 self.add(key, action_type="automation_enable_policy", title=f"{label} - enable automation on {self.names(grp)}",
                          cluster=self.names(grp), scope=f"{nctl} long-running controllers across {len(grp)} cluster{'s' if multi else ''}; managed add-ons held out",
                          savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
-                         effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="ps-admin", phase=ph, depends_on=[prev],
+                         effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="ps-admin", phase=ph, depends_on=wave_deps,
                          _uids=sorted({f["uid"] for f in grp}),
-                         steps=[f"Confirm {self.by[proof['name']]['name']} (or the previous wave) has run clean for at least 48 hours.",
+                         steps=[x for x in [f"Confirm {self.by[proof['name']]['name']} (or the previous wave) has run clean for at least 48 hours.",
+                                group_step,
                                 hold_txt,
                                 f"Enable in descending order of value: {prio}.",
                                 "Watch the execution mode on the first window. Expect in-place resizes; if you see evictions instead, pause and re-check.",
-                                "Verify: pod waste falls on the enabled controllers and the audit log shows in-place resizes."],
+                                "Verify: pod waste falls on the enabled controllers and the audit log shows in-place resizes."] if x],
                          verification="Pod waste falls on enabled controllers; audit log shows in-place resizes",
                          evidence=f"{usd(pot)}/mo of computed savings on long-running controllers across {self.names(grp)}, "
                                   f"{pct(pot, self.pod_pot)} of everything PerfectScale found in scope" +
@@ -313,6 +322,71 @@ class Plan:
                  verification="Grouped job workloads appear with non-zero potential savings",
                  evidence=f"{n:,} job workloads carry {usd(waste)}/mo of waste and currently produce {usd(sum(f['grouping']['plain_job_pot'] for f in fs))}/mo of potential savings, because each run is too short-lived to learn from." +
                           (f" {pr:,} workloads carry pull-request environment labels." if pr else "") + " No dollar claim: the figure appears once grouping lets PerfectScale compute it.")
+
+    # ---- replicated controller grouping
+    def r_replicated_grouping(self):
+        """One controller name repeated across many namespaces is one decision, not N.
+
+        Carries no dollars of its own. The savings already sit in the controller lane and are
+        claimed by the automation waves, so attributing them here too would count the same
+        dollar twice. Its value is the automation it makes tractable, which is what
+        `is_unblocker` and the released figure express - and why the evidence states the
+        covered amount in words rather than putting it in the money column.
+        """
+        fs = [f for f in self.F if f["replicated"]["n_groups"]]
+        if not fs:
+            return
+        agg = {}
+        for f in fs:
+            for g in f["replicated"]["groups"]:
+                a = agg.setdefault(g["name"], {"name": g["name"], "n": 0, "ns": 0, "pot": 0.0, "pot_o": 0.0,
+                                               "clusters": [], "types": set(), "sample": g})
+                a["n"] += g["n"]; a["ns"] += g["ns_count"]; a["pot"] += g["pot"]; a["pot_o"] += g["pot_o"]
+                a["clusters"].append(f["name"]); a["types"].update(g["types"])
+                if g["pot"] > a["sample"]["pot"]:
+                    a["sample"] = g
+        G = sorted(agg.values(), key=lambda g: -g["pot"])
+        inst = sum(g["n"] for g in G)
+        pot = sum(g["pot"] for g in G)
+        ctl = sum(f["lanes"]["controller"]["pot"] for f in self.F)
+        top = G[0]
+        s = top["sample"]
+        prefix = s["ns_prefix"]
+        where = (f"a namespace filter on `{prefix}*` plus the workload name" if prefix
+                 else "a filter on the workload name, since the namespaces share no common stem")
+        # Dormant-and-bursty is the characteristic shape of a per-tenant copy, and the reason
+        # grouping plus automation beats a single static cut: only one of the two re-sizes when
+        # a tenant wakes up. Stated only when the sample actually shows it.
+        bursty = s["cpu_p100"] > max(s["cpu_p95"] * 10, 0.5)
+        steps = [f"Confirm the shape: `{top['name']}` runs in {top['ns']:,} namespaces across {human_list(sorted(set(top['clusters'])))} "
+                 f"and carries {usd(top['pot'])}/mo of PerfectScale's computed savings - {pct(top['pot'], ctl)} of everything in the automation lane.",
+                 f"Create a custom grouping rule in the PerfectScale console using {where}, so the copies collapse into one workload with one policy.",
+                 "Check the collapsed group's recommendation against a few individual copies before relying on it: grouping is only safe where the copies really are the same shape."]
+        if len(G) > 1:
+            more = human_list([f"{g['name']} ({g['ns']:,} namespaces)" for g in G[1:4]])
+            steps.append(f"Repeat for the remaining candidates: {more}.")
+        steps.append(f"Let one full window accumulate under the new group{'s' if len(G) > 1 else ''}.")
+        steps.append("Verify: the grouped workload appears with a single recommendation and the individual copies no longer each carry their own.")
+        ev = (f"{inst:,} workload copies share {len(G)} name{'s' if len(G) > 1 else ''} across {sum(g['ns'] for g in G):,} namespaces, carrying {usd(pot)}/mo "
+              f"of computed savings - {pct(pot, ctl)} of the automation lane. No dollar claim of its own: that money is already counted in the automation actions. "
+              f"What grouping changes is the number of decisions it takes to capture it, from {inst:,} to {len(G)}.")
+        if bursty:
+            ev += (f" The copies are mostly dormant and burst when used - the largest reaches {s['cpu_p100']:.1f} cores against {s['cpu_p95']:.2f} at p95"
+                   + (" and already shows CPU throttling" if s["throttled"] else "") +
+                   " - so automation with in-place resizing fits them better than one static cut (inferred - cause not confirmed).")
+        t, r = effort("S", [])
+        self.add("replicated_grouping", action_type="custom_grouping",
+                 title=f"Group the {top['ns']:,} copies of `{top['name']}` into one policy" + (f", and {len(G) - 1} more repeated workload{'s' if len(G) > 2 else ''}" if len(G) > 1 else ""),
+                 cluster=self.names(fs),
+                 scope=(f"{inst:,} copies of {len(G)} repeated workload names across {sum(g['ns'] for g in G):,} namespaces" if len(G) > 1
+                        else f"{inst:,} copies of `{top['name']}` across {top['ns']:,} namespaces"),
+                 savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", effort_tier=t,
+                 effort_rationale=r + " - a grouping rule in the PerfectScale console, applied in place",
+                 change_risk="low", owner_role="ps-csm", phase=1, lane="toggle", is_unblocker=True,
+                 _uids=sorted({f["uid"] for f in fs}), _resource=top["name"],
+                 steps=steps,
+                 verification="The grouped workload carries one recommendation; the individual copies no longer each carry their own",
+                 evidence=ev)
 
     # ---- stale opt-out
     def r_stale_optout(self):

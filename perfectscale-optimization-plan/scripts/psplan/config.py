@@ -1,4 +1,5 @@
 """Tenant config. One JSON file describes a run; nothing customer-specific lives in code."""
+import copy
 import json
 import re
 import sys
@@ -47,6 +48,8 @@ DEFAULTS = {
     "thresholds": {
         "plain_job_group_min": 200,         # ungrouped Job workloads before grouping is recommended
         "plain_job_waste_min_usd": 50.0,    # ...and the waste they carry must be worth a rule (run-rate)
+        "replicated_group_min": 25,         # namespaces one controller name must repeat across to be a grouping candidate
+        "replicated_group_pot_min_usd": 100.0,  # ...and the savings that name carries must be worth a rule (run-rate)
         "pool_idle_min_usd": 50.0,          # long-lived pool idle (run-rate) worth its own action
         "gpu_idle_share_min": 0.25,
         "request_inflation_ratio": 5.0,     # requested/used CPU on a pool => request-inflation driven
@@ -103,7 +106,10 @@ def _validate_patterns(cfg):
 
 
 def _merge(base, over):
-    out = dict(base)
+    # Deep copy, not dict(base): a shallow copy hands back the DEFAULTS nested dicts themselves, so a
+    # caller adjusting one threshold on a loaded config silently rewrites the default for every config
+    # loaded afterwards in the same process.
+    out = copy.deepcopy(base)
     for k, v in (over or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _merge(out[k], v)

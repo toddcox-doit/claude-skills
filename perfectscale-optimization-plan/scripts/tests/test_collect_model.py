@@ -95,6 +95,38 @@ class TestModel(Base):
         self.assertTrue(a["grouping"]["recommend"])         # 250 plain jobs >= threshold 200
         self.assertFalse(b["grouping"]["recommend"])
 
+    def test_replicated_groups_found_with_prefix_and_sample(self):
+        a, b = model.load_all(self.cfg, parallel=False)
+        g = next(x for x in a["replicated"]["groups"] if x["name"] == "app-main")
+        self.assertEqual(g["ns_count"], 40)                 # 40 tenant-NNN namespaces
+        self.assertEqual(g["ns_prefix"], "tenant-")
+        self.assertAlmostEqual(g["pot"], 320.0, places=2)   # 40 x 8.0, full window so unscaled
+        self.assertTrue(g["throttled"])
+        self.assertGreater(g["cpu_p100"], g["cpu_p95"] * 10)    # dormant and bursty
+        self.assertEqual(b["replicated"]["n_groups"], 0)    # dev-b has one copy of each name
+
+    def test_replicated_group_needs_both_spread_and_money(self):
+        self.cfg["thresholds"]["replicated_group_min"] = 41         # 40 namespaces is now one short
+        a, _ = model.load_all(self.cfg, parallel=False)
+        self.assertEqual(a["replicated"]["n_groups"], 0)
+        self.cfg["thresholds"]["replicated_group_min"] = 25
+        self.cfg["thresholds"]["replicated_group_pot_min_usd"] = 321.0   # $320 is now too little to be worth a rule
+        a, _ = model.load_all(self.cfg, parallel=False)
+        self.assertEqual(a["replicated"]["n_groups"], 0)
+
+    def test_replicated_lane_is_controllers_only(self):
+        # held out by name => not an automation-lane candidate, so not a grouping candidate either
+        self.cfg["held_out_from_automation"] = ["^app-main$"]
+        a, _ = model.load_all(self.cfg, parallel=False)
+        self.assertEqual(a["replicated"]["n_groups"], 0)
+
+    def test_common_ns_prefix_cuts_at_a_segment_boundary(self):
+        # the common characters run past the segment boundary ("tenant-3d"); the cut pulls them back
+        self.assertEqual(model.common_ns_prefix({"tenant-3dscan", "tenant-3dprint", "tenant-3dweb"}), "tenant-")
+        self.assertIsNone(model.common_ns_prefix({"payments", "search", "streaming"}))
+        self.assertIsNone(model.common_ns_prefix({"solo-ns"}))       # one namespace is not a group
+        self.assertIsNone(model.common_ns_prefix({"ab-one", "ab-two"}))   # stem too short to filter on
+
     def test_resiliency_ranges_ordered(self):
         a, _ = model.load_all(self.cfg, parallel=False)
         r = a["res_oom"]
@@ -322,6 +354,19 @@ class TestConfigValidation(unittest.TestCase):
         p = self.src / "variant.tenant.json"
         p.write_text(json.dumps(raw))
         return p
+
+    def test_loaded_config_does_not_share_nested_defaults(self):
+        # A shallow merge handed back the DEFAULTS dicts themselves, so adjusting one threshold on a
+        # loaded config rewrote the default for every config loaded afterwards in the same process.
+        from psplan.config import DEFAULTS
+        before = DEFAULTS["thresholds"]["pool_idle_min_usd"]
+        a = Config.load(self.src / "acme.tenant.json")
+        a["thresholds"]["pool_idle_min_usd"] = before + 1234
+        a["stateful_patterns"].append("not-a-real-engine")
+        b = Config.load(self.src / "acme.tenant.json")
+        self.assertEqual(b["thresholds"]["pool_idle_min_usd"], before)
+        self.assertEqual(DEFAULTS["thresholds"]["pool_idle_min_usd"], before)
+        self.assertNotIn("not-a-real-engine", b["stateful_patterns"])
 
     def test_cluster_missing_uid_raises_clear_config_error(self):
         p = self._write_cfg(clusters=[{"name": "prod-a"}])

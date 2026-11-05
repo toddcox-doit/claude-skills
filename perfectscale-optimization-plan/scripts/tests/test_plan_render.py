@@ -37,6 +37,39 @@ class T(unittest.TestCase):
     def test_proof_cluster_is_the_one_with_audit_history(self):
         self.assertEqual(self.by["automation_proof"]["cluster"], "dev-b")
 
+    def test_replicated_grouping_claims_no_dollars_of_its_own(self):
+        a = self.by["replicated_grouping"]
+        self.assertEqual(a["action_type"], "custom_grouping")
+        self.assertEqual(a["savings_monthly_usd"], 0)       # the money is counted in the automation waves
+        self.assertEqual(a["effort_tier"], "S")             # catalog floor, no escalator applies
+        self.assertEqual(a["owner_role"], "ps-csm")
+        self.assertEqual(a["change_risk"], "low")
+        self.assertEqual(a["phase"], 1)
+        self.assertTrue(a["is_unblocker"])
+
+    def test_replicated_grouping_precedes_the_automation_waves(self):
+        A = self.S["actions"]; pos = {x["id"]: i for i, x in enumerate(A)}
+        g = self.by["replicated_grouping"]
+        waves = [self.by[k] for k in ("automation_w2", "automation_w3") if k in self.by]
+        self.assertTrue(waves, "fixture should produce at least one automation wave")
+        for w in waves:
+            self.assertIn(g["id"], w["depends_on"])         # catalog edge: group first, then one policy
+            self.assertLess(pos[g["id"]], pos[w["id"]])
+            self.assertIn("grouping rule first", " ".join(w["steps"]))
+        # the proof action is deliberately left free of it: a few controllers need no grouping
+        self.assertNotIn(g["id"], self.by["automation_proof"]["depends_on"])
+
+    def test_replicated_grouping_names_the_bursty_shape_and_the_real_prefix(self):
+        a = self.by["replicated_grouping"]
+        self.assertIn("inferred - cause not confirmed", a["evidence"])   # the shape claim is labelled
+        self.assertIn("tenant-", " ".join(a["steps"]))                   # filter written on the observed prefix
+        self.assertIn("app-main", a["title"])
+
+    def test_replicated_savings_counted_once(self):
+        # the copies' dollars reach the plan through the automation lane; grouping must not re-add them
+        tot = sum(x["savings_monthly_usd"] or 0 for x in self.S["actions"] if x["savings_basis"] == "achievable_now")
+        self.assertLessEqual(round(tot), self.S["pod"]["potential"])
+
     def test_money_bases_not_mixed(self):
         self.assertEqual(self.by["oom_fix"]["savings_basis"], "resiliency_investment")
         r = self.by["oom_fix"]["range"]

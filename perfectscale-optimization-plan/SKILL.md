@@ -141,6 +141,8 @@ Then set by hand, because guessing them is worse than leaving them null:
 | `adoption_factor` | Default `0.7`. Scales savings in the adoption view; never scales spend. |
 | `status` | e.g. `"Draft for review"` adds a banner and a feedback section. |
 | `thresholds.plain_job_waste_min_usd` | Default `50.0`. Grouping is recommended only when ungrouped jobs are numerous **and** carry this much waste; lower it to surface grouping for high-count, low-cost pods. |
+| `thresholds.replicated_group_min` | Default `25`. Namespaces one controller name must repeat across before a custom grouping rule is proposed. Lower it on a tenant with few but large per-customer namespaces. |
+| `thresholds.replicated_group_pot_min_usd` | Default `100.0`. …and the savings that name carries must be worth a rule. Both must clear, so a name repeated everywhere for pennies produces no action. |
 
 ### 3. Collect
 
@@ -232,6 +234,10 @@ adding one.
   a low/likely/literal range).
 - Lanes: controller, job, managed, stateful, held_out. Auto-provisioned pools
   (e.g. GKE `nap-`) are reviewed, not claimed.
+- One controller name repeated across many namespaces (a per-customer namespace
+  model) becomes a `custom_grouping` action carrying **no dollars of its own** —
+  that money is already in the automation waves — which the waves then depend
+  on, so the ask is one policy decision rather than N.
 - Effort XS/S/M/L with at most two escalators; ROI = savings x confidence /
   effort weight (XS 1, S 2, M 4, L 8), rounded half-up; unblockers are promoted
   one phase.

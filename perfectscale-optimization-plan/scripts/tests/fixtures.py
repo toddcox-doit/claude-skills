@@ -95,6 +95,13 @@ def build_prod_a():
                     labels={"label_airflow_version": "2.8", "label_dag_id": f"dag{i}"}, max_ind="OverProvisionedWorkload"))
     for i in range(250):
         w.append(wl(f"airflow-run-{i:04d}", "airflow", "Job", 2.0, 1.0, 0.0, 3, labels={"label_airflow_version": "2.8"}))
+    # per-tenant copies: one controller name repeated across many namespaces - r_replicated_grouping.
+    # Dormant and bursty (p100 far above p95), the shape a per-customer namespace model produces.
+    for i in range(40):
+        w.append(wl("app-main", f"tenant-{i:03d}", "StatefulSet", 11.0, 9.0, 8.0, 35, cpu=(0.45, 0.02), mem=(2175, 968),
+                    p95=(0.02, 963), p90=(0.015, 958), p100=(2.3, 1017), replicas=1,
+                    cont_inds=[ind("CpuThrottling", "risk", 1), ind("OverProvisionedCpuRequest", "waste", 3)],
+                    max_ind="OverProvisionedWorkload"))
     # managed-runtime (JVM) workload, declared via jvm_patterns - r_jvm
     w.append(wl("jvmsvc-cache", "checkout", "Deployment", 150, 70, 50, 35, cpu=(2, 1)))
     # held out of automation by name, but not stateful - r_stateful's heldout lane should score this

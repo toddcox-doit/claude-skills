@@ -44,6 +44,14 @@ const ROLE = {platform: 'the platform team', 'app-team': 'the application teams'
               'ps-admin': 'a PerfectScale administrator', finops: 'the FinOps lead',
               'ps-csm': 'your PerfectScale contact'};
 const phase1 = S.actions.filter(a => a.phase === 1);
+// The plan already ranks the opening moves (unblockers and critical risk first, then by the value
+// they release). Taking the first three Phase 1 rows instead re-ranks them by nothing in particular
+// and drops the unblockers, so the one-pager would recommend a different first move than the plan.
+const byId = {};
+S.actions.forEach(function (a) { byId[a.id] = a; });
+const firstMoves = (S.first_moves || []).map(function (id) { return byId[id]; })
+  .filter(Boolean);
+const openingMoves = firstMoves.length ? firstMoves : phase1.slice(0, 3);
 const lead = phase1.slice().sort(function (x, y) {
   return (y.savings_monthly_usd || 0) - (x.savings_monthly_usd || 0); })[0] || S.actions[0];
 const EFFORT = {XS: 'a few hours', S: 'a few days', M: 'a few weeks', L: 'about a quarter'};
@@ -54,7 +62,9 @@ function move(a) {
     : (r100(a.savings_monthly_usd) >= 100 ? 'worth ' + usd(r100(a.savings_monthly_usd)) + '/mo'
        : (a.is_unblocker ? 'no saving of its own: it clears the way for the right-sizing below'
           : 'no dollar claim yet'));
-  return [a.title + '. ',
+  // Titles carry Markdown code ticks around resource names for the plan's own rendering. Neither
+  // the .docx nor this HTML interprets them, so they would reach an executive as literal backticks.
+  return [a.title.replace(/`/g, '') + '. ',
           'Led by ' + who + ', ' + (EFFORT[a.effort_tier] || 'a few weeks') + ' of work, ' + cost + '.'];
 }
 
@@ -105,7 +115,7 @@ const C = {
          '% idle share of the node bill keeps being paid.',
 
   sections: [
-    ['What we recommend first', phase1.slice(0, 3).map(move)],
+    ['What we recommend first', openingMoves.map(move)],
     ['What we need from you', S.decision_detail.slice(0, 4).map(function (d) {
       return ['', d.text.replace(/\s+/g, ' ') +
               (r100(d.usd) >= 100 ? ' Unlocks about ' + usd(r100(d.usd)) + ' a month.' : '')]; })],

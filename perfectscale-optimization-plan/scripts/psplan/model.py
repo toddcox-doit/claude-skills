@@ -168,6 +168,27 @@ def owners(ws, key="waste", n=3):
     return [k for k, _ in c.most_common(n) if k]
 
 
+def common_ns_prefix(namespaces, min_len=3):
+    """The namespace prefix a custom grouping filter can match on, or None.
+
+    Cut at the last separator so the prefix is a real segment boundary
+    (`tenant-`, not `tenant-3d`), and require it to cover every namespace in the
+    group. Returns None when the namespaces share no usable stem, which is the
+    honest answer - the filter then has to be written on the workload name.
+    """
+    ns = sorted(namespaces)
+    if len(ns) < 2:
+        return None
+    first, last = ns[0], ns[-1]
+    i = 0
+    while i < min(len(first), len(last)) and first[i] == last[i]:
+        i += 1
+    p = first[:i]
+    cut = max(p.rfind("-"), p.rfind("_"))
+    p = p[:cut + 1] if cut >= 0 else p
+    return p if len(p.rstrip("-_")) >= min_len else None
+
+
 # ------------------------------------------------------------------ node groups
 def load_node_groups(d):
     o = jload(d / "nodegroups.json")
@@ -392,6 +413,44 @@ def _load(cfg, cluster, d):
                        "plain_job_pot": R(sum(x["potential_savings"] for x in plain)), "prefixes": dict(pre.most_common(5)),
                        "code_locations": len(codeloc), "top_plain": [row(x) for x in sorted(plain, key=lambda x: -x["waste"])[:3]],
                        "recommend": len(plain) >= T["plain_job_group_min"] and sum(x["waste"] for x in plain) >= T["plain_job_waste_min_usd"]}
+    # ---- replicated controller groups (one workload name repeated across many namespaces)
+    # A per-tenant / per-customer namespace model produces the same controller name hundreds or
+    # thousands of times. Each copy is its own recommendation surface, so without a custom grouping
+    # rule the automation ask is N decisions instead of one. The dollars already sit in the
+    # controller lane and are claimed by the automation waves - this block never adds a money base,
+    # it only names where that money is concentrated and how many objects it is spread over.
+    rep = collections.defaultdict(list)
+    for x in w:
+        if x["_lane"] == "controller":
+            rep[x["name"]].append(x)
+    rgroups = []
+    for nm, xs in rep.items():
+        nss = {x["namespace"] for x in xs}
+        if len(nss) < T["replicated_group_min"]:
+            continue
+        pot_g = sum(x["potential_savings"] for x in xs)
+        if R(pot_g) < T["replicated_group_pot_min_usd"]:
+            continue
+        sample = max(xs, key=lambda x: x["potential_savings"])
+        sd = sample["derived"]
+        rgroups.append({
+            "name": nm, "n": len(xs), "ns_count": len(nss), "ns_prefix": common_ns_prefix(nss),
+            "types": sorted({x["type"] for x in xs}),
+            "cost": R(sum(x["cost"] for x in xs)), "waste": R(sum(x["waste"] for x in xs)),
+            "pot": R(pot_g), "pot_o": pot_g,
+            "cpu_cur": sd["current_cpu_request_cores_total"], "cpu_rec": sd["recommended_cpu_request_cores_total"],
+            "cpu_p95": sd["cpu_usage_p95_cores_sum"], "cpu_p100": sd["cpu_usage_p100_cores_sum"],
+            "mem_cur_gib": sd["current_memory_request_mib_total"] / 1024,
+            "mem_rec_gib": sd["recommended_memory_request_mib_total"] / 1024,
+            "mem_p95_gib": sd["memory_usage_p95_mib_sum"] / 1024,
+            "throttled": any(i["name"] == "CpuThrottling" for i in allind(sample)),
+        })
+    rgroups.sort(key=lambda g: -g["pot"])
+    out["replicated"] = {"groups": rgroups, "n_groups": len(rgroups),
+                         "instances": sum(g["n"] for g in rgroups), "pot": R(sum(g["pot_o"] for g in rgroups)),
+                         "pot_o": sum(g["pot_o"] for g in rgroups),
+                         "ctl_pot": lanes["controller"]["pot"]}
+
     jv = [x for x in w if x.get("_jvm")]
     out["jvm"] = {"n": len(jv), "pot": R(sum(x["potential_savings"] for x in jv)),
                   "cost": R(sum(x["cost"] for x in jv)),
