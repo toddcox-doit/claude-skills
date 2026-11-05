@@ -1,10 +1,14 @@
+import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -12,7 +16,7 @@ sys.path.insert(0, str(HERE))
 import fixtures  # noqa: E402
 from psplan.config import Config  # noqa: E402
 from psplan import model  # noqa: E402
-from psplan.collect import Collector  # noqa: E402
+from psplan.collect import Collector, SustainedRateLimiting, is_rate_limited  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -71,9 +75,10 @@ class TestModel(Base):
 
     def test_held_out_matches_namespace_as_well_as_name(self):
         a, _ = model.load_all(self.cfg, parallel=False)
-        self.assertEqual(a["lanes"]["held_out"]["n"], 0)    # nothing held out by default
+        self.assertEqual(a["lanes"]["held_out"]["n"], 1)    # fixture's held-out-but-not-stateful workload (manual-hold-svc)
 
-        # "payments" matches no workload name in the fixture, only a namespace.
+        # "payments" matches no workload name in the fixture, only a namespace; this override replaces the
+        # fixture's default held_out_from_automation entirely, so manual-hold-svc (namespace "finance") is not counted here.
         self.cfg["held_out_from_automation"] = ["^payments$"]
         b, _ = model.load_all(self.cfg, parallel=False)
         self.assertEqual(b["lanes"]["held_out"]["n"], 17)   # every workload in that namespace
@@ -101,7 +106,7 @@ class TestModel(Base):
     def test_pool_classes_and_cross_link(self):
         a, _ = model.load_all(self.cfg, parallel=False)
         self.assertEqual(a["pools"]["ap_n"], 0)             # no auto-provisioned patterns configured
-        self.assertEqual(a["pools"]["ll_n"], 3)
+        self.assertEqual(a["pools"]["ll_n"], 4)
         gpu = [p for p in a["pools"]["long_lived"] if p["id"] == "karp-gpu"][0]
         self.assertTrue(gpu["gpu"])
         self.assertGreater(a["pools"]["gpu_idle_share"], 0.2)
@@ -161,6 +166,19 @@ class TestCollector(Base):
         cfg = Config.load(self.src / "acme.tenant.json"); cfg["data_dir"] = str(out)
         self.assertEqual(len(model.load_all(cfg, parallel=False)), 2)
 
+    def test_manifest_write_is_atomic_and_valid_json(self):
+        # item 6 regression guard: the manifest is written via tmp-then-rename like the collector's
+        # other writes, so it is always valid, loadable JSON (no truncated-file risk from a plain
+        # json.dump straight to the final path). A true crash-mid-write simulation is awkward to do
+        # cleanly here and was not separately exercised.
+        out, ok, log = self.run_collect()
+        for n in ("prod-a", "dev-b"):
+            mpath = out / n / "collect-manifest.json"
+            self.assertFalse((out / n / "collect-manifest.json.tmp").exists())
+            manifest = json.loads(mpath.read_text())
+            self.assertIn("workloads", manifest)
+            self.assertTrue(manifest["workloads"]["ok"])
+
     def test_retries_on_429(self):
         out, ok, log = self.run_collect(FAKE_429_FIRST_N="3")
         self.assertTrue(ok, log)
@@ -184,6 +202,169 @@ class TestCollector(Base):
         a = model.load_all(cfg, parallel=False)[0]
         self.assertTrue(a["unevictable"]["partial"])
         self.assertEqual(a["unevictable"]["codes"]["pod_disruption_budget"]["all"], 9)
+        manifest = json.loads((out / "prod-a" / "collect-manifest.json").read_text())
+        self.assertTrue(manifest["unevictable_top"]["ok"])
+
+    def test_unevictable_total_fallback_failure_is_not_ok(self):
+        # cluster-wide AND every per-node-group pull fails: this must NOT be indistinguishable from a
+        # clean "zero unevictable pods" answer - it has to surface as incomplete collection.
+        out, ok, log = self.run_collect(FAKE_UNEV_FAIL_ALL="1")
+        self.assertFalse(ok, log)
+        manifest = json.loads((out / "prod-a" / "collect-manifest.json").read_text())
+        self.assertFalse(manifest["unevictable_top"]["ok"])
+        self.assertEqual(manifest["unevictable_top"]["groups"], manifest["unevictable_top"]["failed_groups"])
+        self.assertGreater(manifest["unevictable_top"]["groups"], 0)
+        self.assertTrue(any("FAIL" in l and "unevictable" in l for l in log), log)
+
+    # ---- item 3: structured 429 detection, never substring-matched free text
+    def test_backoff_is_exponential_with_cap(self):
+        out = self.tmp / "collected2"
+        cfg = Config.load(self.src / "acme.tenant.json")
+        cfg["data_dir"] = str(out)
+        cfg["pscli"] = str(HERE / "fake_pscli.py")
+        os.chmod(cfg["pscli"], 0o755)
+        os.environ["FAKE_PS_SRC"] = str(self.src)
+        os.environ["FAKE_429_FIRST_N"] = "3"
+        try:
+            log = []
+            c = Collector(cfg, log=log.append, only=["prod-a"], min_interval=0, backoff=5, max_retries=5)
+            with patch("psplan.collect.time.sleep"):  # don't actually wait out the computed backoff
+                ok = c.run()
+        finally:
+            os.environ.pop("FAKE_PS_SRC", None)
+            os.environ.pop("FAKE_429_FIRST_N", None)
+        self.assertTrue(ok, log)
+        waits = [int(m.group(1)) for l in log for m in [re.search(r"pause (\d+)s", l)] if m]
+        self.assertEqual(waits, [5, 10, 20], log)  # backoff * 2**(n-1): genuinely exponential, not linear
+
+    def test_backoff_capped_at_max(self):
+        out = self.tmp / "collected3"
+        cfg = Config.load(self.src / "acme.tenant.json")
+        cfg["data_dir"] = str(out)
+        cfg["pscli"] = str(HERE / "fake_pscli.py")
+        os.chmod(cfg["pscli"], 0o755)
+        os.environ["FAKE_PS_SRC"] = str(self.src)
+        os.environ["FAKE_429_FIRST_N"] = "3"
+        try:
+            log = []
+            c = Collector(cfg, log=log.append, only=["prod-a"], min_interval=0, backoff=50, max_retries=5)
+            with patch("psplan.collect.time.sleep"):  # don't actually wait out the computed backoff
+                ok = c.run()
+        finally:
+            os.environ.pop("FAKE_PS_SRC", None)
+            os.environ.pop("FAKE_429_FIRST_N", None)
+        self.assertTrue(ok, log)
+        waits = [int(m.group(1)) for l in log for m in [re.search(r"pause (\d+)s", l)] if m]
+        self.assertEqual(waits, [50, 60, 60], log)  # 50*2, 50*4 both exceed the 60s cap
+
+    def test_circuit_breaker_trips_on_sustained_throttling(self):
+        out = self.tmp / "collected4"
+        cfg = Config.load(self.src / "acme.tenant.json")
+        cfg["data_dir"] = str(out)
+        cfg["pscli"] = str(HERE / "fake_pscli.py")
+        os.chmod(cfg["pscli"], 0o755)
+        os.environ["FAKE_PS_SRC"] = str(self.src)
+        os.environ["FAKE_429_FIRST_N"] = "1000"  # every call is rate-limited, forever
+        try:
+            log = []
+            c = Collector(cfg, log=log.append, only=["prod-a"], min_interval=0, backoff=0, max_retries=1, circuit_breaker=2)
+            ok = c.run()
+        finally:
+            os.environ.pop("FAKE_PS_SRC", None)
+            os.environ.pop("FAKE_429_FIRST_N", None)
+        self.assertFalse(ok, log)
+        self.assertTrue(any("ABORTED" in l and "rate limit" in l for l in log), log)
+        self.assertTrue(any("circuit breaker" in f for f in c.failures), c.failures)
+
+    def test_rate_limit_detection_structured_not_substring(self):
+        # a genuine structured RATE_LIMITED envelope must trigger detection
+        self.assertTrue(is_rate_limited('{"error":{"code":"RATE_LIMITED","message":"status 429"}}'))
+        self.assertTrue(is_rate_limited("some preamble\nRATE_LIMITED\ntrailer"))
+        # a dollar figure containing "429" must never false-trigger it, whether free text or in a
+        # structured envelope describing an unrelated error
+        self.assertFalse(is_rate_limited("budget exceeded: cost is $429.10 this month"))
+        self.assertFalse(is_rate_limited('{"error":{"code":"BUDGET_EXCEEDED","message":"cost is $429.10"}}'))
+        self.assertFalse(is_rate_limited(""))
+        self.assertFalse(is_rate_limited(None))
+
+    def test_rate_limit_not_triggered_by_dollar_figure_end_to_end(self):
+        out = self.tmp / "collected5"
+        cfg = Config.load(self.src / "acme.tenant.json")
+        cfg["data_dir"] = str(out)
+        cfg["pscli"] = str(HERE / "fake_pscli.py")
+        os.chmod(cfg["pscli"], 0o755)
+        os.environ["FAKE_PS_SRC"] = str(self.src)
+        os.environ["FAKE_COST_ERROR"] = "1"
+        try:
+            log = []
+            c = Collector(cfg, log=log.append, only=["prod-a"], min_interval=0, backoff=0, max_retries=5)
+            ok = c.run()
+        finally:
+            os.environ.pop("FAKE_PS_SRC", None)
+            os.environ.pop("FAKE_COST_ERROR", None)
+        self.assertFalse(ok, log)  # fails fast rather than retrying 5 times as if rate-limited
+        self.assertFalse(any("rate-limited" in l for l in log), log)
+        self.assertTrue(any("FAIL" in l and "429.10" in l for l in log), log)
+
+
+class TestConfigValidation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.src = self.tmp / "src"
+        fixtures.make(self.src)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cfg(self, **overrides):
+        raw = json.loads((self.src / "acme.tenant.json").read_text())
+        raw.update(overrides)
+        p = self.src / "variant.tenant.json"
+        p.write_text(json.dumps(raw))
+        return p
+
+    def test_cluster_missing_uid_raises_clear_config_error(self):
+        p = self._write_cfg(clusters=[{"name": "prod-a"}])
+        with self.assertRaises(SystemExit) as cm:
+            Config.load(p)
+        msg = str(cm.exception)
+        self.assertIn("uid", msg)
+        self.assertIn("prod-a", msg)
+
+    def test_cluster_missing_name_raises_clear_config_error(self):
+        p = self._write_cfg(clusters=[{"uid": "11111111-aaaa-4aaa-8aaa-111111111111"}])
+        with self.assertRaises(SystemExit) as cm:
+            Config.load(p)
+        self.assertIn("name", str(cm.exception))
+
+    def test_invalid_regex_pattern_raises_clear_config_error(self):
+        p = self._write_cfg(held_out_from_automation=["foo(bar"])
+        with self.assertRaises(SystemExit) as cm:
+            Config.load(p)
+        msg = str(cm.exception)
+        self.assertIn("held_out_from_automation", msg)
+        self.assertIn("foo(bar", msg)
+
+    def test_unanchored_pattern_triggers_warning_not_failure(self):
+        p = self._write_cfg(held_out_from_automation=["prod"])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cfg = Config.load(p)  # must not raise - this is a warning, not an error
+        self.assertEqual(cfg["held_out_from_automation"], ["prod"])
+        warning = buf.getvalue()
+        self.assertIn("held_out_from_automation", warning)
+        self.assertIn("prod", warning)
+        self.assertIn("unanchored", warning)
+
+    def test_shipped_default_patterns_do_not_warn(self):
+        # stateful_patterns/nonprod_patterns/gpu_pool_patterns ship deliberately unanchored keyword
+        # lists; untouched defaults must not generate noise.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            Config.load(self.src / "acme.tenant.json")
+        self.assertNotIn("stateful_patterns", buf.getvalue())
+        self.assertNotIn("nonprod_patterns", buf.getvalue())
+        self.assertNotIn("gpu_pool_patterns", buf.getvalue())
 
 
 if __name__ == "__main__":

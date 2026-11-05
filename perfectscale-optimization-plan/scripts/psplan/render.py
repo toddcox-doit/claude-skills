@@ -13,6 +13,12 @@ from .util import long_date, pct, slug, usd
 PHASE = {1: "Phase 1 - Foundations and quick wins", 2: "Phase 2 - Capture the savings", 3: "Phase 3 - Keep the gains"}
 BASIS = {"achievable_now": "Savings (achievable)", "blocked_pending": "Savings (pending blockers)", "resiliency_investment": "Spend (resiliency)"}
 LANE = {"toggle": "Toggle", "config": "Config change", "manage": "Managed", "manual": "Manual", "platform": "Platform", "decision": "Decision"}
+# Icon + word, always both -- never color alone, so the plan reads in black and white.
+RISK_ICON = {"low": "● Low", "medium": "▲ Medium", "high": "▲ High", "critical": "■ Critical"}
+
+
+def risk_text(level):
+    return RISK_ICON.get(level, str(level).title())
 
 
 def fname(cfg, stem, ext):
@@ -21,12 +27,34 @@ def fname(cfg, stem, ext):
 
 # ---------------------------------------------------------------- shared text
 def money(a):
+    """Dollar/Value-column text only. An unblocker's released_value is never shown
+    here -- it would read as the row's own saving, the same overstatement as summing
+    achievable-now with blocked-pending. Use unblock_note() for that figure instead,
+    rendered in a separate, clearly non-dollar-column location (see plan-voice.md's
+    'Unblockers' table convention)."""
     if a["savings_basis"] == "resiliency_investment":
         r = a.get("range")
         return f"{usd(r['likely'])} spend (range {usd(r['low'])}-{usd(r['literal'])})" if r else f"{usd(a['savings_monthly_usd'])} spend"
     if a["savings_monthly_usd"]:
         return usd(a["savings_monthly_usd"]) + "/mo"
-    return f"unblocks {usd(a['released_value'])}/mo" if a.get("released_value") else "-"
+    return "—"  # true zero (e.g. an unblocker's own savings) -- never a bare 0
+
+
+def unblock_note(a):
+    """Annotation text for a pure unblocker action (own savings = 0 but it releases
+    value elsewhere). Callers must place this away from the dollar/Value column --
+    e.g. appended to the title cell or as separate prose -- per plan-voice.md."""
+    if not a.get("savings_monthly_usd") and a.get("released_value"):
+        return f"unblocker, releases {usd(a['released_value'])}/mo"
+    return ""
+
+
+def mo_yr(v):
+    """Monthly headline figure with its annual run-rate alongside (never replacing
+    it), per plan-voice.md: '30-day actuals x 12 for annual, always labeled
+    run-rate, illustrative, not a guarantee.' Scoped to plan-level headline totals
+    only -- do not use this per-action."""
+    return f"{usd(v)}/mo (~{usd(v * 12)}/yr run-rate, illustrative)"
 
 
 GROUPING_SOURCES = [("Ephemeral workloads grouping", "https://docs.perfectscale.io/customize-workflow/ephemeral-workloads-grouping"), ("InfraFit: node right-sizing", "https://docs.perfectscale.io/visibility-and-optimization/infrafit-or-node-right-sizing"), ("PodFit: vertical pod right-sizing", "https://docs.perfectscale.io/visibility-and-optimization/podfit-or-vertical-pod-right-sizing"), ("Node group view", "https://docs.perfectscale.io/visibility-and-optimization/infrafit-or-node-right-sizing/node-group-view"), ("Karpenter optimization", "https://docs.perfectscale.io/visibility-and-optimization/karpenter-optimization")]
@@ -132,8 +160,8 @@ def exec_summary(cfg, S):
     L = []
     c = len(S["scope"]["cluster_names"])
     L.append(f"{cfg['customer']}'s {c} cluster{'s' if c > 1 else ''} in scope ({', '.join(S['scope']['cluster_names'])}) were analyzed two ways. "
-             f"Looking at workloads (PodFit), **{usd(t['achievable_now_monthly'])}/mo** of savings can be captured now, and **{usd(t['resiliency_investment_monthly'])}/mo** of resiliency spend should be added to stop workloads failing. "
-             f"Looking at nodes (InfraFit), **{usd(S['idle']['total'])}/mo** of capacity is idle today, a measurement rather than a saving, and **{usd(t['blocked_pending_monthly'])}/mo** of savings is waiting on specific blockers. "
+             f"Looking at workloads (PodFit), **{mo_yr(t['achievable_now_monthly'])}** of savings can be captured now, and **{mo_yr(t['resiliency_investment_monthly'])}** of resiliency spend should be added to stop workloads failing. "
+             f"Looking at nodes (InfraFit), **{usd(S['idle']['total'])}/mo** of capacity is idle today, a measurement rather than a saving, and **{mo_yr(t['blocked_pending_monthly'])}** of savings is waiting on specific blockers. "
              f"Savings and spend are kept apart; see 'How to read the four blocks'.")
     L.append(f"All figures assume every recommendation is adopted. At {S['adoption']['factor'] * 100:.0f}% adoption, achievable falls to about {usd(S['adoption']['achievable_now']['adjusted'])}/mo and pending blockers to about {usd(S['adoption']['blocked_pending']['adjusted'])}/mo, and the idle-ceiling part of that is still an upper bound. Resiliency spend is not reduced.")
     L.append(f"Of the achievable total, **{pct(S['automation_gated']['usd'], t['achievable_now_monthly'], True)}** needs PerfectScale automation switched on; the rest is configuration or manual work that does not.")
@@ -149,7 +177,9 @@ def phase_table(S, ph):
         return []
     out = [f"### {PHASE[ph]}", "", "| ID | Action | Fit | Cluster | Value | Lane | Effort | Confidence | Depends on |", "|---|---|---|---|---|---|---|---|---|"]
     for a in rows:
-        out.append(f"| {a['id']} | {a['title']} | {a['fit']} | {a['cluster']} | {money(a)} | {LANE.get(a['lane'], a['lane'])} | {a['effort_tier']} | {a['confidence']} | {', '.join(a['depends_on']) or '-'} |")
+        note = unblock_note(a)
+        title = f"{a['title']} · **{note}**" if note else a["title"]
+        out.append(f"| {a['id']} | {title} | {a['fit']} | {a['cluster']} | {money(a)} | {LANE.get(a['lane'], a['lane'])} | {a['effort_tier']} | {a['confidence']} | {', '.join(a['depends_on']) or '-'} |")
     return out + [""]
 
 
@@ -191,17 +221,20 @@ def render_plan_md(cfg, S):
     by = {a["id"]: a for a in S["actions"]}
     for i in S["first_moves"]:
         a = by[i]
-        L.append(f"- **{a['id']} - {a['title']}** ({money(a)}; {a['effort_tier']}, {a['confidence']} confidence). {a['evidence'].split('. ')[0].rstrip('.')}.")
+        note = unblock_note(a)
+        value = f"{money(a)}; {note}" if note else money(a)
+        L.append(f"- **{a['id']} - {a['title']}** ({value}; {a['effort_tier']}, {a['confidence']} confidence). {a['evidence'].split('. ')[0].rstrip('.')}.")
     L += ["", "## The plan", ""]
     for ph in (1, 2, 3):
         L += phase_table(S, ph)
     L += ["## Action detail", ""]
     for a in S["actions"]:
+        note = unblock_note(a)
         L += [f"### {a['id']} - {a['title']}", "",
               f"- **Cluster:** {a['cluster']}  |  **Scope:** {a['scope']}",
-              f"- **Value:** {money(a)} ({BASIS[a['savings_basis']]})" + (f"; observed unscaled {usd(a['obs'])}" if a.get("obs") and S["early"] and abs(a["obs"] - a["savings_monthly_usd"]) > 1 else ""),
-              f"- **Effort:** {a['effort_rationale']}  |  **Risk:** {a['change_risk']}  |  **Confidence:** {a['confidence']}  |  **Owner:** {a['owner_role']}" + (f" ({', '.join(a['owner_hint'])})" if a["owner_hint"] else ""),
-              f"- **Lane:** {LANE.get(a['lane'])}" + ("  |  **Gated on automation**" if a["gated_on_automation"] else "") + (f"  |  **Depends on:** {', '.join(a['depends_on'])}" if a["depends_on"] else "") + (f"  |  **Unblocks:** {', '.join(a['unblocks'])}" if a["unblocks"] else ""),
+              f"- **Value:** {money(a)}" + (f" · {note}" if note else "") + f" ({BASIS[a['savings_basis']]})" + (f"; observed unscaled {usd(a['obs'])}" if a.get("obs") and S["early"] and abs(a["obs"] - a["savings_monthly_usd"]) > 1 else ""),
+              f"- **Effort:** {a['effort_rationale']}  |  **Risk:** {risk_text(a['change_risk'])}  |  **Confidence:** {a['confidence']}  |  **Owner:** {a['owner_role']}" + (f" ({', '.join(a['owner_hint'])})" if a["owner_hint"] else ""),
+              f"- **Lane:** {LANE.get(a['lane'])}" + ("  |  **Gated on automation**" if a["gated_on_automation"] else "") + (f"  |  **Depends on:** {', '.join(a['depends_on'])}" if a["depends_on"] else "") + (f"  |  **Unblocks:** {', '.join(f'{d} ({money(by[d])})' if by[d]['savings_monthly_usd'] else d for d in a['unblocks'])}" if a["unblocks"] else ""),
               "", a["evidence"], ""]
         for i, s in enumerate(a["steps"], 1):
             L.append(f"{i}. {s}")
@@ -467,7 +500,10 @@ def e(x):
 
 def dep_svg(S):
     acts = S["actions"]
-    edges = [(d, a["id"]) for a in acts for d in a["depends_on"]]
+    known = {a["id"] for a in acts}
+    # A dangling depends_on (pruned action, cross-cluster id, upstream typo) must not
+    # take down the whole report -- drop just that edge from the diagram.
+    edges = [(d, a["id"]) for a in acts for d in a["depends_on"] if d in known]
     if not edges:
         return ""
     ids = sorted({x for ed in edges for x in ed}, key=lambda i: next(k for k, a in enumerate(acts) if a["id"] == i))
@@ -557,7 +593,9 @@ def render_html(cfg, S, facts):
     P.append("<h2>Actions</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("ID", "Phase", "Action", "Fit", "Cluster", "Value / mo", "Basis", "Lane", "Effort", "Confidence", "ROI")) + "<th>At <span data-calc='pct'>" + pf + "</span></th></tr></thead><tbody>")
     for a in S["actions"]:
         v = a["savings_monthly_usd"] or 0
-        P.append(f"<tr><td data-v='{a['id'][1:]}'>{e(a['id'])}</td><td>{a['phase']}</td><td><a href='#{a['id']}'>{e(a['title'])}</a></td><td>{e(a['fit'])}</td><td>{e(a['cluster'])}</td><td class=num data-v='{v:.0f}'>{e(money(a))}</td>"
+        note = unblock_note(a)
+        title_cell = f"<a href='#{a['id']}'>{e(a['title'])}</a>" + (f" <b>{e(note)}</b>" if note else "")
+        P.append(f"<tr><td data-v='{a['id'][1:]}'>{e(a['id'])}</td><td>{a['phase']}</td><td>{title_cell}</td><td>{e(a['fit'])}</td><td>{e(a['cluster'])}</td><td class=num data-v='{v:.0f}'>{e(money(a))}</td>"
                  f"<td>{e(BASIS[a['savings_basis']])}</td><td>{e(LANE.get(a['lane']))}</td><td>{a['effort_tier']}</td><td>{a['confidence']}</td><td>{a['roi_score'] if a['roi_score'] is not None else '-'}</td><td class=num data-calc-row='{0 if a['savings_basis'] == 'resiliency_investment' else v:.0f}' data-spend='{1 if a['savings_basis'] == 'resiliency_investment' else 0}'>{e(money(a)) if a['savings_basis'] == 'resiliency_investment' else (e(usd(v * ad['factor'])) + '/mo' if v else '-')}</td></tr>")
     P.append("</tbody></table></div>")
     svg = dep_svg(S)
@@ -565,8 +603,10 @@ def render_html(cfg, S, facts):
         P.append("<h2>Dependencies</h2>" + svg)
     P.append("<h2>Action detail</h2>")
     for a in S["actions"]:
-        P.append(f"<details id='{a['id']}'><summary>{e(a['id'])} - {e(a['title'])} <span class=mut>({e(money(a))})</span></summary>"
-                 f"<p><span class=tag>{e(LANE.get(a['lane']))}</span><span class=tag>effort {a['effort_tier']}</span><span class=tag>risk {e(a['change_risk'])}</span><span class=tag>{e(a['confidence'])} confidence</span></p>"
+        note = unblock_note(a)
+        value = f"{money(a)}, {note}" if note else money(a)
+        P.append(f"<details id='{a['id']}'><summary>{e(a['id'])} - {e(a['title'])} <span class=mut>({e(value)})</span></summary>"
+                 f"<p><span class=tag>{e(LANE.get(a['lane']))}</span><span class=tag>effort {a['effort_tier']}</span><span class=tag>risk {e(risk_text(a['change_risk']))}</span><span class=tag>{e(a['confidence'])} confidence</span></p>"
                  f"<p><b>Scope:</b> {e(a['scope'])}</p><p>{e(a['evidence'])}</p><p class=mut>{e(a['effort_rationale'])}</p><ol>" + "".join(f"<li>{e(s)}</li>" for s in a["steps"]) + "</ol></details>")
     P.append("<h2>Clusters</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("Cluster", "Window (d)", "Pod cost", "Waste", "Potential", "Node cost", "Node idle")) + "</tr></thead><tbody>")
     for f in facts:
@@ -577,12 +617,29 @@ def render_html(cfg, S, facts):
 
 
 # ---------------------------------------------------------------- XLSX / CSV
-ACOLS = ["id", "phase", "title", "fit", "value_kind", "cluster", "scope", "savings_basis", "savings_monthly_usd", "obs", "lane", "gated_on_automation", "effort_tier", "confidence", "change_risk", "owner_role", "roi_score", "depends_on", "evidence"]
+# range_low/range_likely/range_literal surface the resiliency-basis low/likely/literal
+# breakdown (model.py's range.low / range.likely / range.literal) that MD/HTML always
+# show via money(); without them a FinOps analyst pivoting the sheet has no way to
+# tell a resiliency-spend row from a savings row beyond the savings_basis text column,
+# and risks summing them together naively. Populated only for resiliency-basis rows.
+ACOLS = ["id", "phase", "title", "fit", "value_kind", "cluster", "scope", "savings_basis", "savings_monthly_usd", "obs",
+         "range_low", "range_likely", "range_literal",
+         "lane", "gated_on_automation", "effort_tier", "confidence", "change_risk", "owner_role", "roi_score", "depends_on", "evidence"]
+# Dollar-valued columns needing currency formatting in the XLSX sheet.
+_DOLLAR_COLS = ("savings_monthly_usd", "obs", "range_low", "range_likely", "range_literal")
+
+
+def _acol_value(a, c):
+    if c.startswith("range_"):
+        r = a.get("range")
+        return r.get(c[len("range_"):]) if r else None
+    v = a.get(c)
+    return ", ".join(v) if isinstance(v, list) else v
 
 
 def render_tables(cfg, S, facts, out_dir):
     out_dir = Path(out_dir)
-    rows = [[a.get(c) if not isinstance(a.get(c), list) else ", ".join(a[c]) for c in ACOLS] for a in S["actions"]]
+    rows = [[_acol_value(a, c) for c in ACOLS] for a in S["actions"]]
     csvp = out_dir / fname(cfg, "optimization-plan", "csv")
     with open(csvp, "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(ACOLS); w.writerows(rows)
@@ -599,11 +656,13 @@ def render_tables(cfg, S, facts, out_dir):
     for c in ws[1]:
         c.font = Font(bold=True)
     ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
-    for col, wd in zip("ABCDEFGHIJKLMNOPQRS", (6, 6, 52, 10, 11, 18, 40, 20, 12, 12, 10, 10, 8, 10, 10, 12, 8, 14, 80)):
+    for col, wd in zip("ABCDEFGHIJKLMNOPQRSTUV", (6, 6, 52, 10, 11, 18, 40, 20, 12, 12, 12, 12, 12, 10, 10, 8, 10, 10, 12, 8, 14, 80)):
         ws.column_dimensions[col].width = wd
-    for r in ws.iter_rows(min_row=2, min_col=7, max_col=8):
+    dollar_cols = [i + 1 for i, c in enumerate(ACOLS) if c in _DOLLAR_COLS]
+    for r in ws.iter_rows(min_row=2, min_col=min(dollar_cols), max_col=max(dollar_cols)):
         for c in r:
-            c.number_format = '"$"#,##0'
+            if c.column in dollar_cols:
+                c.number_format = '"$"#,##0'
     w2 = wb.create_sheet("Clusters")
     w2.append(["cluster", "window_days", "scale_factor", "pod_cost", "pod_waste", "potential", "node_cost", "node_idle", "automation_actions"])
     for f in facts:

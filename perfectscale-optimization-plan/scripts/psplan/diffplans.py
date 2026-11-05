@@ -1,7 +1,10 @@
-"""Change log between two plan JSON files. Actions are matched on action_type (then order), falling back to title."""
+"""Change log between two plan JSON files. Actions are matched by their stable `natural_key`
+(cluster(s) + resource/rule-key + action_type - see actions.py Plan.finish()), not by action_type and
+a descending-$ rank zip: two same-type actions on different clusters (or different node groups) can
+swap relative dollar rank between runs, and rank-based pairing would wrongly report that as a changed
+action instead of recognizing each one by its own stable identity."""
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 
@@ -14,23 +17,20 @@ def _val(a):
     return a.get("savings_monthly_usd", 0) or 0
 
 
-def _t(a):
-    return a.get("action_type") or a.get("title", "")
+def _nk(a):
+    return a.get("natural_key")
 
 
 def pair(old, new):
-    ob, nb = defaultdict(list), defaultdict(list)
-    for a in old:
-        ob[_t(a)].append(a)
-    for a in new:
-        nb[_t(a)].append(a)
-    pairs, added, removed = [], [], []
-    for k in list(dict.fromkeys(list(ob) + list(nb))):
-        o, n = sorted(ob.get(k, []), key=lambda a: -_val(a)), sorted(nb.get(k, []), key=lambda a: -_val(a))
-        for x, y in zip(o, n):
-            pairs.append((x, y))
-        removed += o[len(n):]
-        added += n[len(o):]
+    """Match old vs. new actions by natural_key. A key present in both is "the same action, possibly
+    changed"; present only in old is removed; only in new is added. Actions without a natural_key at
+    all (e.g. a plan rendered before this field existed) can never be matched and are reported as a
+    straight removal/addition rather than silently dropped."""
+    ob = {_nk(a): a for a in old if _nk(a)}
+    nb = {_nk(a): a for a in new if _nk(a)}
+    pairs = [(ob[k], nb[k]) for k in ob if k in nb]
+    removed = [ob[k] for k in ob if k not in nb] + [a for a in old if not _nk(a)]
+    added = [nb[k] for k in nb if k not in ob] + [a for a in new if not _nk(a)]
     return pairs, added, removed
 
 

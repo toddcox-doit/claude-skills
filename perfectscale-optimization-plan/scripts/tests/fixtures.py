@@ -95,6 +95,11 @@ def build_prod_a():
                     labels={"label_airflow_version": "2.8", "label_dag_id": f"dag{i}"}, max_ind="OverProvisionedWorkload"))
     for i in range(250):
         w.append(wl(f"airflow-run-{i:04d}", "airflow", "Job", 2.0, 1.0, 0.0, 3, labels={"label_airflow_version": "2.8"}))
+    # managed-runtime (JVM) workload, declared via jvm_patterns - r_jvm
+    w.append(wl("jvmsvc-cache", "checkout", "Deployment", 150, 70, 50, 35, cpu=(2, 1)))
+    # held out of automation by name, but not stateful - r_stateful's heldout lane should score this
+    # rightsize_manual (S), not rightsize_stateful (M)
+    w.append(wl("manual-hold-svc", "finance", "Deployment", 200, 100, 60, 35, cpu=(2, 1)))
     return w
 
 
@@ -124,10 +129,15 @@ def make(root):
     root = Path(root)
     pools_a = [pool("karp-general", "m6i.2xlarge", (4, 12.0, 30), 1500, 4000, 17000, rec=("m7g.2xlarge", 450, 11)),
                pool("karp-batch", "c6i.4xlarge", (0, 6.0, 40), 900, 1500, 9000, spot=True),
-               pool("karp-gpu", "p3.2xlarge", (0, 2.0, 6), 700, 1000, 3000, cpu_req=30, cpu_used=2)]
+               pool("karp-gpu", "p3.2xlarge", (0, 2.0, 6), 1400, 1000, 3000, cpu_req=30, cpu_used=2),
+               # never flexes (min == max) and reports no autoscaler - r_pool_flex + r_autoscaler_labels
+               pool("karp-unknown-pinned", "m6i.large", (3, 3.0, 3), 80, 200, 6000, autoscaler="unknown")]
     unev_a = ([pod(f"api-pdb-{i}", "payments", "Deployment", "karp-general", "pod_disruption_budget", "Over-restrictive PodDisruptionBudget", fix="Set minAvailable below replicas") for i in range(9)]
               + [pod(f"cache-opt-{i}", "platform", "Deployment", "karp-general", "opt_out_annotation", "Do-not-evict annotation") for i in range(4)]
-              + [pod(f"scratch-{i}", "data", "Deployment", "karp-batch", "local_node_storage", "Local Node Storage") for i in range(3)])
+              + [pod(f"scratch-{i}", "data", "Deployment", "karp-batch", "local_node_storage", "Local Node Storage") for i in range(3)]
+              # strict pod/node affinity, both on karp-general - r_unevictable_affinity
+              + [pod(f"anti-{i}", "payments", "Deployment", "karp-general", "anti_affinity", "Strict anti-affinity", fix="Review HA requirement") for i in range(5)]
+              + [pod(f"nodeaff-{i}", "data", "Deployment", "karp-general", "node_affinity", "Strict node affinity", fix="Loosen node selector") for i in range(2)])
     write_cluster(root, "prod-a", build_prod_a(), pools_a, unev_a, [])
     pools_b = [pool("karp-dev", "m6i.large", (1, 3.0, 8), 80, 200, 4000, rec=("m7g.large", 20, 10))]
     audit_b = [{"execution": "inplace-resize", "cluster_uid": UIDS["dev-b"], "workload": "web-1"} for _ in range(8)] + \
@@ -137,6 +147,8 @@ def make(root):
         "customer": "Acme", "prepared": "2026-10-15", "cloud": "aws", "data_dir": str(root), "out_dir": str(root / "out"),
         "clusters": [{"name": n, "uid": u} for n, u in UIDS.items()],
         "auto_provisioned_pool_patterns": [],
+        "jvm_patterns": ["^jvmsvc"],
+        "held_out_from_automation": ["^manual-hold-svc$"],
     }
     (root / "acme.tenant.json").write_text(json.dumps(cfg, indent=1))
     return root / "acme.tenant.json"

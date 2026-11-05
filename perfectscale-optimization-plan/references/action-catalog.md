@@ -110,9 +110,11 @@ flood Phase 1.
 | `custom_grouping` | Create a custom group so N identical workload copies share one policy | S | `ps-csm` | low |
 | `rightsize_manual` | Apply recommended requests/limits by hand — for `NotSupported` workloads, or where automation is deliberately held | S | `app-team` | medium |
 | `rightsize_stateful` | Manual right-sizing of a StatefulSet, Kafka/Strimzi, or a database | M | `app-team` | high |
+| `rightsize_runtime_managed` | Right-size a workload whose runtime manages its own memory (JVM heap and similar) — the heap flag and the resource request must change together, in the same PR | M | `app-team` | high |
 | `limit_remove_cpu` | Remove a CPU limit where throttling level 3 says the limit is the problem | S | `app-team` | medium |
 | `oom_remediate` | Raise memory to stop OOM kills. `resiliency_investment` — it costs money | S | `app-team` | high |
 | `limitrange_adjust` | A namespace LimitRange or admission floor is blocking recommendations below it | S | `platform` | medium |
+| `memory_limit_set` | Set a missing container memory limit so PerfectScale can act on the memory dimension — a precondition for memory-based right-sizing | S | `app-team` | medium |
 | `daemonset_rightsize` | Right-size a DaemonSet. Held out of the automation ask by convention; multiplies by node count | S | `platform` | medium |
 
 **Note on `automation_enable_policy` risk.** Default `medium`, not `low`, even
@@ -145,6 +147,20 @@ node group definition — with `high` risk, because it drains and replaces nodes
 Almost always escalates to M via the restart-required escalator, and it should:
 the work is not editing the value, it is the change window.
 
+**Note on `unevictable_karpenter_optout`.** Despite the name, this type also covers
+the Cluster Autoscaler equivalent of the same finding — a stale
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` annotation, not just
+Karpenter's `do-not-disrupt`. The catalog does not define a separate CA-specific
+type because the finding, the fix and the effort/owner/risk are identical; only
+the annotation name differs by autoscaler. Treat this row as "stale opt-out
+annotation, whichever autoscaler the cluster uses."
+
+**Note on `unevictable_antiaffinity`.** Also used for a strict *node* affinity
+finding (reason code `node_affinity`), not only anti-affinity. The catalog has
+no separate node-affinity row; the blocking pattern, fix shape, floor, owner and
+risk are the same, so both reason codes are scored and reported under this one
+type. An action built from a mix of the two says so in its evidence.
+
 ---
 
 ## Cross-cutting
@@ -156,7 +172,7 @@ the work is not editing the value, it is the change window.
 | `automation_default_on` | New eligible workloads get automation without a per-workload decision | S | `ps-admin` | medium |
 | `review_cadence` | A recurring InfraFit/PodFit review with a named owner and a date | XS | `platform` | low |
 | `plan_rerun` | Regenerate this plan on a set date and diff it | XS | `ps-csm` | low |
-| `other` | Escape hatch. Justify the tier in `effort_rationale` | — | — | — |
+| `other` | Escape hatch. Justify the tier in `effort_rationale`, and add a `rationale` field explaining what the finding actually is (e.g. a node pool reporting no autoscaler type — a data-visibility defect, not a right-sizing or tuning action) | — | — | — |
 
 ---
 

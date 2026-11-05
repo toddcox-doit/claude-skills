@@ -43,6 +43,19 @@ def verify(cfg, S, facts, files):
     for basis, key in (("achievable_now", "achievable_now_monthly"), ("blocked_pending", "blocked_pending_monthly"), ("resiliency_investment", "resiliency_investment_monthly")):
         s = sum(a["savings_monthly_usd"] or 0 for a in A if a["savings_basis"] == basis)
         chk(abs(s - S["totals"][key]) <= 1, f"totals.{key} equals sum of {basis} actions")
+    # 2b. the check above compares the in-memory S against itself, which can never catch a bug between
+    # Plan.build() and the artifact actually delivered (a render/serialization bug, or post-write
+    # tampering). Re-derive the same headline figures from the rendered plan JSON *on disk* - summing
+    # its own leaf-level action rows is independent of whatever path produced its single cached
+    # totals field, and will catch an aggregation or on-disk corruption bug even without re-deriving
+    # from raw pscli bytes.
+    plan_files = [Path(p) for p in files if Path(p).suffix == ".json" and "optimization-plan" in Path(p).name]
+    if plan_files:
+        rendered = json.loads(plan_files[0].read_text(encoding="utf-8"))
+        rA, rT = rendered.get("actions", []), rendered.get("totals", {})
+        for basis, key in (("achievable_now", "achievable_now_monthly"), ("blocked_pending", "blocked_pending_monthly")):
+            s = sum(a.get("savings_monthly_usd") or 0 for a in rA if a.get("savings_basis") == basis)
+            chk(abs(s - (rT.get(key) or 0)) <= 1, f"rendered plan JSON: totals.{key} equals independently summed {basis} actions")
     ad = S["adoption"]
     chk(abs(ad["achievable_now"]["adjusted"] - S["totals"]["achievable_now_monthly"] * ad["factor"]) <= 1, "adoption: achievable adjusted = full x factor")
     pb = ad["blocked_pending"]
@@ -80,7 +93,10 @@ def verify(cfg, S, facts, files):
             chk(r["low"] <= r["likely"] <= r["literal"], f"{a['id']} range ordered")
     # 7. wording gates and leak scan over every rendered text file
     names = list(PLACEHOLDER_TENANTS) + [str(n) for n in (cfg["foreign_tenants"] or [])]
-    foreign = [n for n in dict.fromkeys(names) if n.lower() not in cfg["customer"].lower()]
+    # Exempt a name only when it IS the current customer's own name (exact, case-insensitive match) -
+    # not whenever it happens to be a substring of it. A past customer "Acme" must still be flagged
+    # for a current customer "Acme Industries"; only "Acme" itself (== "Acme Industries") is exempt.
+    foreign = [n for n in dict.fromkeys(names) if n.lower() != cfg["customer"].lower()]
     for p in files:
         p = Path(p)
         if p.suffix not in (".md", ".html", ".json", ".csv"):
@@ -107,5 +123,8 @@ def verify(cfg, S, facts, files):
                 chk("beforebegin" in t, f"{p.name}: the table control bar sits above its table")
                 chk(not re.search(r"(?:^|[,{;}])\s*th\b[^{};]*\{[^{}]*white-space:\s*nowrap", t),
                     f"{p.name}: header cells wrap instead of overlapping the next column")
-        chk("nan" not in re.findall(r"\$[^\s|]*", t) and "$nan" not in t and "$inf" not in t, f"{p.name}: no NaN/inf dollars")
+        # (A `"nan" not in re.findall(r"\$[^\s|]*", t)` check used to sit here too: findall with that
+        # pattern only ever returns tokens starting with "$", so a bare "nan" could never appear in its
+        # result - provably dead. The "$nan"/"$inf" checks below are the real, live coverage.)
+        chk("$nan" not in t and "$inf" not in t, f"{p.name}: no NaN/inf dollars")
     return ok, errs

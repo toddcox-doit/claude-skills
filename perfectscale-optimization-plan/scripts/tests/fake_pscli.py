@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Stand-in for pscli, serving a collector-output tree (FAKE_PS_SRC). For collector tests only.
-Env knobs: FAKE_429_FIRST_N (first N data calls return 429), FAKE_UNEV_FAIL=1 (cluster-wide unevictable errors)."""
+Env knobs: FAKE_429_FIRST_N (first N data calls return 429), FAKE_UNEV_FAIL=1 (cluster-wide unevictable errors),
+FAKE_UNEV_FAIL_ALL=1 (cluster-wide AND every per-node-group unevictable call errors - total fallback failure),
+FAKE_COST_ERROR=1 (every call fails with a non-rate-limit error whose message happens to contain "$429.10",
+to prove a dollar figure never false-triggers 429 detection)."""
 import json
 import os
 import sys
@@ -26,6 +29,10 @@ def cluster_dir():
 if args[:2] == ["auth", "status"]:
     sys.exit(0)
 
+if os.environ.get("FAKE_COST_ERROR"):
+    sys.stderr.write(json.dumps({"error": {"code": "BUDGET_EXCEEDED", "message": "monthly cost is $429.10, over budget"}}))
+    sys.exit(1)
+
 n429 = int(os.environ.get("FAKE_429_FIRST_N", "0"))
 if n429:
     try:
@@ -50,6 +57,9 @@ elif "nodegroups" in args:
     sys.stdout.write((d / "nodegroups.jsonl").read_text())
 elif "unevictable" in args:
     g = val("-g")
+    if os.environ.get("FAKE_UNEV_FAIL_ALL"):
+        sys.stderr.write("500 internal error")
+        sys.exit(1)
     if g is None and os.environ.get("FAKE_UNEV_FAIL"):
         sys.stderr.write("500 internal error")
         sys.exit(1)

@@ -1,6 +1,14 @@
 """Tenant config. One JSON file describes a run; nothing customer-specific lives in code."""
 import json
+import re
+import sys
 from pathlib import Path
+
+# Config keys whose values are used as regexes downstream (re.compile'd in model.py/actions.py), as
+# opposed to e.g. managed_namespaces which looks pattern-shaped but is actually matched by exact set
+# membership, never compiled as a regex.
+REGEX_KEYS = ("held_out_from_automation", "stateful_patterns", "jvm_patterns",
+              "nonprod_patterns", "auto_provisioned_pool_patterns", "gpu_pool_patterns")
 
 DEFAULTS = {
     "customer": None,
@@ -52,6 +60,48 @@ DEFAULTS = {
 }
 
 
+def _validate_clusters(clusters):
+    """Fail clearly at config-load time, naming the bad entry, instead of a raw KeyError deep inside
+    collect.py the first time that cluster is touched."""
+    for i, c in enumerate(clusters):
+        name = c.get("name") if isinstance(c, dict) else None
+        uid = c.get("uid") if isinstance(c, dict) else None
+        if not isinstance(c, dict) or not name or not uid:
+            missing = [k for k, v in (("name", name), ("uid", uid)) if not v]
+            label = name or f"entry #{i}"
+            raise SystemExit(
+                f"config: clusters[{i}] ({label!r}) is missing required key(s) {missing} - "
+                "every cluster entry needs both 'name' and 'uid' (cluster names are not unique; "
+                "clusters must be addressed by uid, see references/methodology.md)")
+
+
+def _validate_patterns(cfg):
+    """Regex-shaped keys are used as regexes with zero validation downstream. Catch two classes of
+    mistake at load time: (1) a pattern that doesn't even compile as a regex, and (2) a non-fatal but
+    real footgun documented in references/tenant-config.md - an unanchored pattern such as "prod" that
+    also matches "preprod", when the author likely meant an exact match ("^prod$").
+
+    The anchoring warning is deliberately narrow so it doesn't nag about the library's own shipped
+    defaults (e.g. "kafka", "gpu", "stage" in stateful_patterns/gpu_pool_patterns/nonprod_patterns -
+    those are intentional, vetted, loose substring matches). It only fires for a *user-supplied*
+    plain word/name-shaped pattern (no regex metacharacters at all, so it reads like a literal name
+    rather than a deliberately crafted pattern) that carries no anchor on either end.
+    """
+    for key in REGEX_KEYS:
+        defaults_for_key = DEFAULTS.get(key) or []
+        for pat in cfg.get(key) or []:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                raise SystemExit(f"config: '{key}' contains an invalid regex {pat!r}: {e}")
+            if pat in defaults_for_key:
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_-]+", pat) and not pat.startswith("^") and not pat.endswith("$"):
+                print(f"config: warning: '{key}' pattern {pat!r} is unanchored and will match anywhere "
+                      f"in the name (e.g. 'prod' also matches 'preprod'); use '^{pat}$' for an exact match "
+                      "if that's what you meant", file=sys.stderr)
+
+
 def _merge(base, over):
     out = dict(base)
     for k, v in (over or {}).items():
@@ -76,6 +126,8 @@ class Config(dict):
             raise SystemExit("config: 'customer' is required")
         if not cfg["clusters"]:
             raise SystemExit("config: 'clusters' (name + uid) is required")
+        _validate_clusters(cfg["clusters"])
+        _validate_patterns(cfg)
         if not cfg["prepared"]:
             from datetime import date
             cfg["prepared"] = date.today().isoformat()

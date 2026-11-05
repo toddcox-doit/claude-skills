@@ -20,7 +20,7 @@ TIERS = ["XS", "S", "M", "L"]
 # Which PerfectScale product a recommendation comes from. PodFit = workload requests/automation; InfraFit = node pools and what blocks node scale-down.
 FIT = {"automation_proof": "PodFit", "automation_w2": "PodFit", "automation_w3": "PodFit", "memory_limits": "PodFit", "oom_fix": "PodFit", "job_grouping": "PodFit",
        "job_rightsize": "PodFit", "stateful_manual": "PodFit", "heldout_manual": "PodFit", "underprov_other": "PodFit", "headroom_policy": "PodFit", "default_policy": "PodFit",
-       "stale_optout": "InfraFit", "pdb": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
+       "stale_optout": "InfraFit", "pdb": "InfraFit", "unevictable_affinity": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
        "pool_machine_recs": "InfraFit", "autoprov_review": "InfraFit", "gpu_cap": "InfraFit", "commitments": "InfraFit", "review_cadence": "Governance", "rerun": "Governance",
        "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit"}
 # Question groups for the customer conversation, matched on the start of each question.
@@ -103,6 +103,12 @@ class Plan:
         k["value_kind"] = KIND.get(key, "computed")
         if "obs" not in k:
             k["obs"] = k.get("savings_monthly_usd", 0) / (self.F[0]["factor"] or 1) if k.get("savings_monthly_usd") else 0
+        # Natural-key identity for a downstream diff tool to match actions across re-runs by what they
+        # actually are, not by type+rank. `_uids` (cluster uid(s) in scope) and `_resource` (a resource
+        # identifier narrower than "the whole cluster", e.g. a node group id) are transient: a rule passes
+        # whatever identity it already has to hand, and `finish()` turns them into `natural_key` then pops them.
+        k["_nk_uids"] = k.pop("_uids", None)
+        k["_nk_resource"] = k.pop("_resource", None)
         self.A.append(k)
         return k
 
@@ -133,7 +139,7 @@ class Plan:
     # ------------------------------------------------------------------ rules
     def build(self):
         for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_automation, self.r_memory_limits, self.r_oom, self.r_jvm,
-                     self.r_grouping, self.r_stale_optout, self.r_pdb,
+                     self.r_grouping, self.r_stale_optout, self.r_pdb, self.r_unevictable_affinity,
                      self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_autoprov, self.r_gpu, self.r_underprov,
                      self.r_headroom, self.r_local_storage, self.r_governance):
             rule()
@@ -172,7 +178,7 @@ class Plan:
                       scope=f"{proof['lanes']['controller']['n']} long-running controllers; managed add-ons held out",
                       savings_monthly_usd=p_pot, obs=p_obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
                       effort_tier=effort("XS", esc_unconf)[0], effort_rationale=effort("XS", esc_unconf)[1],
-                      change_risk="low", owner_role="ps-admin", phase=1,
+                      change_risk="low", owner_role="ps-admin", phase=1, _uids=[proof["uid"]],
                       owner_hint=[], steps=[
                           f"Open the Automation page for {proof['name']}. If it offers settings, automation is available and this is a toggle; if it offers 'Request Access', that is the first thing to resolve.",
                           hold_txt,
@@ -201,14 +207,15 @@ class Plan:
                 esc = list(esc_unconf)
                 if key == "automation_w3" and len(grp) > 2:
                     esc.append(f"{len(grp)} separate cluster policies with a soak period between them")
+                if self.cfg["intake"].get("change_freeze") and any(re.search("|".join(self.cfg["nonprod_patterns"]), f["name"], re.I) is None for f in grp):
+                    esc.append("change-managed - a change freeze or approval lead time was reported at intake for a production cluster in this wave")
                 t, r = effort("XS", esc)
-                if any(re.search("|".join(self.cfg["nonprod_patterns"]), f["name"], re.I) is None and self.cfg["intake"].get("change_freeze") for f in grp):
-                    pass
                 prio = ", ".join(f"{f['name']} ({usd(self.pot_ctl(f)[0])}/mo)" for f in grp)
                 self.add(key, action_type="automation_enable_policy", title=f"{label} - enable automation on {self.names(grp)}",
                          cluster=self.names(grp), scope=f"{nctl} long-running controllers across {len(grp)} cluster{'s' if multi else ''}; managed add-ons held out",
                          savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
                          effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="ps-admin", phase=ph, depends_on=[prev],
+                         _uids=sorted({f["uid"] for f in grp}),
                          steps=[f"Confirm {self.by[proof['name']]['name']} (or the previous wave) has run clean for at least 48 hours.",
                                 hold_txt,
                                 f"Enable in descending order of value: {prio}.",
@@ -236,10 +243,11 @@ class Plan:
         where, fwname = FW_WHERE.get(self.primary_fw, FW_WHERE["generic"])
         owners = [f["lanes"]["job" if job_led else "controller"]["owners"] for f in fs]
         t, r = effort("S", ["cross-team - the limits are owned by several teams"] if self.cross_team(owners) else [])
-        self.add("memory_limits", action_type="memory_limit_prereq", title=f"Set memory limits on the {n} flagged workloads",
+        self.add("memory_limits", action_type="memory_limit_set", title=f"Set memory limits on the {n} flagged workloads",
                  cluster=self.names(fs), scope=f"{n} workloads with a high-severity missing memory limit",
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", effort_tier=t, effort_rationale=r, change_risk="medium",
                  owner_role="app-team", phase=1, lane="config", owner_hint=sorted({o for l in owners for o in l})[:4],
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the count: {n} workloads report no memory limit at high severity. The largest by waste are {human_list([short_name(x['name']) for x in rows[:4]])}.",
                         (f"For {fwname} workers the limit is set in {where}, not in a Deployment manifest. Find where that is defined and change it in Git through {self.gitops}."
                          if job_led else f"Set the limits in the owning manifests or Helm values through {self.gitops}."),
@@ -273,6 +281,7 @@ class Plan:
                  cluster=self.names(fs), scope=f"{n} workloads flagged for OOM; largest is {short_name(top['name'])}",
                  savings_monthly_usd=lik, obs=lik_o, savings_basis="resiliency_investment", confidence="medium", effort_tier=t, effort_rationale=r,
                  change_risk="critical", owner_role="app-team", phase=1, lane="config", owner_hint=sorted({o for l in owners for o in l})[:4],
+                 _uids=sorted({f["uid"] for f in fs}),
                  range={"low": low, "likely": lik, "literal": lit}, steps=steps,
                  verification="OOM indicators clear; no memory-attributed restarts in 7 days",
                  evidence=(f"OOM is flagged on {n} workloads. " + (f"One group ({short_name(top['name'])}) is {share * 100:.0f}% of the literal figure, which is why the literal number is a ceiling to size down from, not a budget request. " if share > 0.5 else "") +
@@ -296,7 +305,7 @@ class Plan:
         self.add("job_grouping", action_type="custom_grouping", title=f"Group the one-off job workloads on {self.names(fs)}" + (f" the way {tmpl['name']} already does" if tmpl else ""),
                  cluster=self.names(fs), scope=f"{n:,} job workloads" + (f" across {max(f['grouping']['code_locations'] for f in fs)} code locations" if any(f['grouping']['code_locations'] for f in fs) else ""),
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", effort_tier="S", effort_rationale="S (catalog), no escalators - a grouping rule in the PerfectScale console, applied in place",
-                 change_risk="low", owner_role="ps-admin", phase=1, lane="toggle",
+                 change_risk="low", owner_role="ps-admin", phase=1, lane="toggle", _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the shape: {human_list([f'{v:,} {k}' for k, v in pre.most_common(3)])} workloads each appear individually" + (f"; {tmpl['name']} collapses the equivalent pods." if tmpl else "."),
                         where_txt + ", and strip any per-pull-request suffix so every environment of a code location lands in one group.",
                         "Let one full window accumulate under the new groups.",
@@ -320,11 +329,11 @@ class Plan:
         ann_val = '"true"' if karp else '"false"'
         owners = [f["lanes"]["controller"]["owners"] for f in fs]
         t, r = effort("S", [])
-        self.add("stale_optout", action_type="unevictable_optout", title="Remove stale do-not-evict annotations from long-running controllers",
+        self.add("stale_optout", action_type="unevictable_karpenter_optout", title="Remove stale do-not-evict annotations from long-running controllers",
                  cluster=self.names(fs), scope=f"{pods} pods across {len(names)} controllers on long-lived node pools",
                  savings_monthly_usd=0, savings_basis="blocked_pending", confidence="high", effort_tier=t,
                  effort_rationale=r + "; applying it rolls the affected pods once, like any normal deploy", change_risk="low", owner_role="app-team", phase=2, lane="config",
-                 owner_hint=sorted({o for l in owners for o in l})[:3], _pools=pools,
+                 owner_hint=sorted({o for l in owners for o in l})[:3], _pools=pools, _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the blockers: {pods} running controller pods carry `{ann}: {ann_val}` and sit on long-lived pools. PerfectScale rates removal low risk, high confidence.",
                         f"Find where the annotation is set - usually one shared Helm value or base manifest managed through {self.gitops}.",
                         "Remove it for long-running controllers. Leave it on running batch jobs: evicting those kills the run.",
@@ -346,6 +355,7 @@ class Plan:
         self.add("pdb", action_type="unevictable_pdb", title="Relax over-restrictive PodDisruptionBudgets blocking node drain",
                  cluster=self.names(fs), scope=f"{n} pods in {len(ns)} namespaces", savings_monthly_usd=0, savings_basis="blocked_pending",
                  confidence="high", effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="app-team", phase=1, lane="config",
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the blockers: {n} pods report a PodDisruptionBudget as the reason node drain is blocked, mostly in {human_list(list(ns)[:3])}.",
                         "For each budget, check whether minAvailable equals the replica count. That is the common failure and it means no pod may ever be evicted.",
                         "Set minAvailable to replicas-1, or use maxUnavailable: 1, so the autoscaler has room to work while availability is preserved.",
@@ -353,6 +363,39 @@ class Plan:
                         "Verify: the PodDisruptionBudget blocker count falls toward zero on the affected pools."],
                  verification="Unevictable pod count with reason PodDisruptionBudget falls toward zero",
                  evidence=f"{n} pods cannot be drained because of their disruption budget. This does not save money by itself - it is what allows node consolidation to actually execute.")
+
+    # ---- strict pod / node affinity
+    def r_unevictable_affinity(self):
+        """Strict anti-affinity and strict node affinity both block drain the same way a PDB does. The
+        catalog has one type for this (unevictable_antiaffinity) - there is no separate node-affinity entry,
+        so both reason codes are scored and reported under it, and the evidence says so explicitly."""
+        def cnt(f, code):
+            return f["unevictable"]["codes"].get(code, {}).get("all", 0)
+        fs = [f for f in self.F if cnt(f, "anti_affinity") + cnt(f, "node_affinity") > 0]
+        if not fs:
+            return
+        n_anti = sum(cnt(f, "anti_affinity") for f in fs)
+        n_node = sum(cnt(f, "node_affinity") for f in fs)
+        n = n_anti + n_node
+        ns = collections.Counter()
+        for f in fs:
+            for code in ("anti_affinity", "node_affinity"):
+                ns.update(f["unevictable"]["codes"].get(code, {}).get("ns", {}))
+        which = human_list([x for x in ([f"{n_anti} behind a strict anti-affinity rule"] if n_anti else []) +
+                             ([f"{n_node} behind a strict node affinity rule"] if n_node else [])])
+        t, r = effort("M", ["cross-team - the affected pods sit in namespaces owned by several teams"] if len(ns) >= 2 else [])
+        self.add("unevictable_affinity", action_type="unevictable_antiaffinity", title="Relax strict pod affinity rules blocking node drain",
+                 cluster=self.names(fs), scope=f"{n} pods in {len(ns)} namespaces ({which})", savings_monthly_usd=0, savings_basis="blocked_pending",
+                 confidence="high", effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="app-team", phase=2, lane="config",
+                 _uids=sorted({f["uid"] for f in fs}),
+                 steps=[f"Confirm the blockers: {n} pods report a strict pod or node affinity rule as the reason node drain is blocked, mostly in {human_list(list(ns)[:3])}.",
+                        "For anti-affinity, check whether `requiredDuringSchedulingIgnoredDuringExecution` is doing HA work that `preferredDuringSchedulingIgnoredDuringExecution` would do just as well, or widen the topology key.",
+                        "For node affinity, check whether the required node selector can be loosened, or whether a correctly-sized dedicated pool is the better fix.",
+                        "Get sign-off from the owning team before relaxing either rule - anti-affinity in particular is usually a deliberate HA choice, so this is visibility plus a decision, not a unilateral change.",
+                        "Verify: the anti-affinity / node-affinity blocker count on the affected pools falls."],
+                 verification="Unevictable pod count with reason anti-affinity or node affinity falls",
+                 evidence=f"{n} pods cannot be drained because of a strict pod or node affinity rule ({which}). This does not save money by itself - it is what allows node consolidation to actually execute. "
+                          "The catalog defines one action type for strict affinity (unevictable_antiaffinity); node affinity has no separate entry, so both reason codes are carried under it here.")
 
     # ---- jobs (config lane)
     def r_job_rightsize(self):
@@ -374,30 +417,36 @@ class Plan:
         if deps:
             steps.append("Finish the memory actions first: shrinking CPU on a group while its memory is still under-provisioned just moves the problem.")
         steps.append("Verify: potential savings on the group falls, with no new OOM or throttling indicators after two run cycles.")
-        self.add("job_rightsize", action_type="rightsize_jobs", title=f"Apply PerfectScale's {fwname} job recommendations in the run configuration, largest groups first",
+        self.add("job_rightsize", action_type="rightsize_manual", title=f"Apply PerfectScale's {fwname} job recommendations in the run configuration, largest groups first",
                  cluster=self.names(fs), scope=f"{n} job workloads; the top 8 groups hold {pct(top8, pot)} of the opportunity",
                  savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence="medium", effort_tier=effort("S", ["cross-team - per-job resource settings live with several teams (inferred - cause not confirmed)"] if self.cross_team(owners) else [])[0],
                  effort_rationale=r if not self.cross_team(owners) else effort("S", ["cross-team - per-job resource settings live with several teams (inferred - cause not confirmed)"])[1],
                  change_risk="medium", owner_role="app-team", phase=2, depends_on=deps, lane="config",
-                 owner_hint=sorted({o for l in owners for o in l})[:4], steps=steps,
+                 owner_hint=sorted({o for l in owners for o in l})[:4], steps=steps, _uids=sorted({f["uid"] for f in fs}),
                  verification="Potential savings on changed groups falls; no new OOM or throttling indicators",
                  evidence=f"Job pods are {n} workloads and {usd(waste)}/mo of waste. They live for minutes, so the durable fix is in the run configuration rather than a controller toggle. "
                           f"Medium confidence because the figure comes from about {self.window:.0f} days of batch history and load can vary with delivery cycles.")
 
     # ---- stateful / held-out manual right-sizing
     def r_stateful(self):
-        for lane, key, title, why in (("stateful", "stateful_manual", "Right-size stateful search and streaming workloads by hand", "stateful data path - these stay out of automation"),
-                                      ("held_out", "heldout_manual", "Right-size the workloads you asked to keep out of automation, by hand", "held out of automation at your instruction")):
+        # The stateful lane is genuinely stateful (Kafka/Strimzi, search, a database) and floors at the
+        # catalog's rightsize_stateful (M, high risk). The held-out lane is whatever the customer asked to
+        # keep out of automation - often not stateful at all - and belongs to the lighter rightsize_manual
+        # (S, medium risk). Conflating the two inflates effort and depresses ROI on the held-out set for no reason.
+        for lane, key, title, why, atype, floor, risk in (
+                ("stateful", "stateful_manual", "Right-size stateful search and streaming workloads by hand", "stateful data path - these stay out of automation", "rightsize_stateful", "M", "high"),
+                ("held_out", "heldout_manual", "Right-size the workloads you asked to keep out of automation, by hand", "held out of automation at your instruction", "rightsize_manual", "S", "medium")):
             fs = [f for f in self.F if f["lanes"][lane]["pot"] > 0.5]
             if not fs:
                 continue
             pot = sum(f["lanes"][lane]["pot"] for f in fs); obs = sum(f["lanes"][lane]["pot_o"] for f in fs)
             n = sum(f["lanes"][lane]["n"] for f in fs)
             nm = human_list(sorted({x for f in fs for x in f["stateful"]["names"]})[:4]) if lane == "stateful" else "the held-out set"
-            t, r = effort("M", [])
-            self.add(key, action_type="rightsize_stateful", title=title, cluster=self.names(fs), scope=f"{n} workloads ({nm})",
+            t, r = effort(floor, [])
+            self.add(key, action_type=atype, title=title, cluster=self.names(fs), scope=f"{n} workloads ({nm})",
                      savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence="high", effort_tier=t, effort_rationale=r + f" - {why}",
-                     change_risk="high", owner_role="app-team", phase=2, lane="manual", owner_hint=sorted({o for f in fs for o in f["lanes"][lane]["owners"]})[:4],
+                     change_risk=risk, owner_role="app-team", phase=2, lane="manual", owner_hint=sorted({o for f in fs for o in f["lanes"][lane]["owners"]})[:4],
+                     _uids=sorted({f["uid"] for f in fs}),
                      steps=[f"Confirm the set: {n} workloads carrying {usd(pot)}/mo of PerfectScale recommendations.",
                             "Every change here is a manifest or Helm values change reviewed by the owning team; nothing is applied automatically.",
                             "Start with the largest on the biggest clusters, one tier at a time, and let each settle before the next.",
@@ -419,12 +468,16 @@ class Plan:
         cost = sum(f["pools"]["unknown_autoscaler_cost"] for f in fs)
         share = n / tot if tot else 0
         t, r = effort("XS", [])
-        self.add("autoscaler_labels", action_type="fix_visibility",
+        self.add("autoscaler_labels", action_type="other",
+                 rationale="Not a PodFit/InfraFit finding from the catalog: the autoscaler type is unreadable, which is a data-visibility "
+                           "defect on the customer's collection setup, not a capacity or right-sizing action. Scored like a labelling fix "
+                           "(XS, platform-owned) because that is the actual remediation.",
                  title=f"Label the {n} node pools reporting no autoscaler",
                  cluster=self.names(fs), scope=f"{n} of {tot} pools, carrying {usd(cost)}/mo of node cost",
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="high",
                  effort_tier=t, effort_rationale=r + " - a labelling fix, not a capacity change",
                  change_risk="low", owner_role="platform", phase=1, lane="config", is_unblocker=True,
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the gap: {n} of {tot} node pools report their autoscaler as unknown, covering {usd(cost)}/mo of node spend.",
                         "This is a discovery problem, not a capacity one: without the autoscaler type PerfectScale cannot tell whether a pool is able to consolidate, so idle on these pools cannot be acted on with confidence.",
                         "Check that the cluster's autoscaler is deployed with the labels PerfectScale reads, and that the agent can see the node group or NodePool objects.",
@@ -449,12 +502,14 @@ class Plan:
         worst = sorted([p for f in fs for p in f["pools"]["pinned"]], key=lambda p: -p["idle"])[:4]
         where = human_list([f"`{p['id']}` ({p['nodes_min']:.0f} nodes, {usd(p['idle'])}/mo idle)" for p in worst])
         t, r = effort("S", [])
-        self.add("pool_flex", action_type="nodepool_policy",
+        atype = "autoscaler_tune_karpenter" if self.cloud == "aws" else "autoscaler_tune_ca"
+        self.add("pool_flex", action_type=atype,
                  title=f"Confirm whether {n} never-flexing node pools are allowed to consolidate",
                  cluster=self.names(fs), scope=f"{n} of {tot} pools holding {usd(idle)}/mo of idle",
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="high",
-                 effort_tier=t, effort_rationale=r + " - a configuration question, answered before any resizing",
+                 effort_tier=t, effort_rationale=r + " - a configuration question, answered before any resizing (below the catalog's M floor for the tuning action itself, which this precedes)",
                  change_risk="low", owner_role="platform", phase=1, lane="config", is_unblocker=True,
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the observation: {n} pools held the same node count for the whole window - {where}.",
                         "Check each one's minimum size and its consolidation setting. A pool pinned at its minimum, or set to consolidate only when a node is completely empty, will not give a node back when pods shrink.",
                         "Where the pin is deliberate (licensing, quorum, warm capacity), record it and stop claiming workload savings against that pool.",
@@ -479,11 +534,12 @@ class Plan:
         oom = sum(f["jvm"]["oom"] for f in fs)
         names = human_list(sorted({x for f in fs for x in f["jvm"]["names"]})[:4])
         t, r = effort("M", ["raised one tier because the runtime sets its own memory, so each change is two changes"])
-        self.add("jvm_rightsize", action_type="rightsize_runtime",
+        self.add("jvm_rightsize", action_type="rightsize_runtime_managed",
                  title=f"Right-size the {n} managed-runtime workloads with their heap settings, not alone",
                  cluster=self.names(fs), scope=f"{n} workloads ({names})",
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="medium",
                  effort_tier=t, effort_rationale=r, change_risk="high", owner_role="app-team", phase=2, lane="manual",
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the set: {n} workloads you identified as running on a managed runtime, carrying {usd(pot)}/mo of PerfectScale recommendations"
                         + (f", of which {usd(inaut)}/mo sits in the automation ask" if inaut else "") + ".",
                         "Lower the memory request and the runtime's own heap setting in the same change. A container limit the runtime does not read is not a limit it will respect, and a request cut on its own ends in an OOMKill rather than a saving.",
@@ -498,78 +554,88 @@ class Plan:
 
     # ---- node pools
     def r_pool_actions(self):
+        """One action per node group, not one pooled tenant-wide action. `by_pool` already carries
+        each node group's own blocker-code breakdown (model.py keys unevictable pods by their node group),
+        so each pool action's `depends_on` is wired to the unevictable action(s) that actually touch *that*
+        node group - the catalog's dependency-edges rule ('unevictable_* on a node group unblocks
+        autoscaler_tune_*/nodegroup_consolidate on that group'), not a blanket edge to every blocker tenant-wide.
+        The upstream unevictable_pdb/stale_optout/unevictable_antiaffinity actions themselves remain tenant-wide
+        aggregates - model.py's reason-code grouping for those rules does not carry node-group identity forward
+        into the action record, only `by_pool` (used here) does - so the edge is per-group but its target is not."""
         thr = self.T["pool_idle_min_usd"]
         rec_rows, blocked_rows, free_rows = [], [], []
         for f in self.F:
             by_pool = f["unevictable"]["by_pool"]
             for p in f["pools"]["long_lived"]:
-                n_blk = sum(by_pool.get(p["id"], {}).values())
-                row = dict(p, cluster=f["name"], blockers=n_blk, cloud=f["cloud"])
+                codes = by_pool.get(p["id"], {})
+                n_blk = sum(codes.values())
+                row = dict(p, cluster=f["name"], uid=f["uid"], blockers=n_blk, codes=codes, cloud=f["cloud"])
                 if p["rec"] and p["rec"]["save"] >= thr / 4:
                     rec_rows.append(row)
                 elif p["idle"] >= thr:
                     (blocked_rows if n_blk >= 5 else free_rows).append(row)
         opt = next((a for a in self.A if a["key"] == "stale_optout"), None)
         optpools = set(opt["_pools"]) if opt else set()
-        pdb = self.has("pdb")
 
-        def pooltxt(rows, n=4):
-            return human_list([f"{r['cluster']} `{r['id']}`" for r in rows[:n]]) + (f" and {len(rows) - n} more" if len(rows) > n else "")
+        def group_deps(row):
+            codes = row.get("codes", {})
+            deps = []
+            if codes.get("pod_disruption_budget") and self.has("pdb"):
+                deps.append("pdb")
+            if codes.get("opt_out_annotation") and self.has("stale_optout"):
+                deps.append("stale_optout")
+            if (codes.get("anti_affinity") or codes.get("node_affinity")) and self.has("unevictable_affinity"):
+                deps.append("unevictable_affinity")
+            # local_storage is deliberately not wired in here: it is a Phase 3 migration (effort L), and a
+            # Phase 2 pool action cannot depend on a later-phase prerequisite - see the phase invariant in finish().
+            return deps
 
-        if blocked_rows:
-            blocked_rows.sort(key=lambda r: -r["idle"])
-            idle = sum(r["idle"] for r in blocked_rows); obs = sum(r["idle_o"] for r in blocked_rows)
-            cs = sorted({r["cluster"] for r in blocked_rows})
-            deps = [k for k in ("stale_optout", "pdb") if self.has(k)]
-            lead = blocked_rows[0]
-            self.add("pool_shrink_blocked", action_type="nodepool_shrink", title=(f"Let the {human_list([chr(96) + r['id'] + chr(96) for r in blocked_rows])} node pool{'s' if len(blocked_rows) > 1 else ''} shrink" if len(blocked_rows) <= 2 else f"Let {len(blocked_rows)} blocked long-lived node pools shrink"),
-                     cluster=self.names([self.by[c] for c in cs]), scope=f"{pooltxt(blocked_rows)} - {sum(r['blockers'] for r in blocked_rows)} blocking pods",
-                     savings_monthly_usd=idle, obs=obs, savings_basis="blocked_pending", confidence="high", effort_tier="M",
+        blocked_rows.sort(key=lambda r: -r["idle"])
+        for r in blocked_rows:
+            self.add("pool_shrink_blocked", action_type="nodepool_shrink", title=f"Let the `{r['id']}` node pool shrink",
+                     cluster=r["cluster"], scope=f"{r['cluster']} `{r['id']}` - {r['blockers']} blocking pods",
+                     savings_monthly_usd=r["idle"], obs=r["idle_o"], savings_basis="blocked_pending", confidence="high", effort_tier="M",
                      effort_rationale="M (catalog), no escalators - a node pool change owned by the platform team" + ("; no freeze or approval lead time reported" if not self.cfg["intake"].get("change_freeze") else ""),
-                     change_risk="high", owner_role="platform", phase=2, depends_on=deps, lane="platform",
-                     steps=[f"Confirm the picture: pods on `{lead['id']}` request ~{lead['cpu_req']:.0f} cores on average and use ~{lead['cpu_used']:.0f}, on a pool that never drops below {lead['nodes_min']:.0f} nodes of {lead['machine']}.",
-                            "Finish the blocker actions first. Of what remains, system pods (DNS, event exporters, static pods) are expected; leave those.",
-                            "Right-size the requests on these pools, then lower the pool minimum or move to a smaller machine shape.",
+                     change_risk="high", owner_role="platform", phase=2, depends_on=group_deps(r), lane="platform", _uids=[r["uid"]], _resource=r["id"],
+                     steps=[f"Confirm the picture: pods on `{r['id']}` request ~{r['cpu_req']:.0f} cores on average and use ~{r['cpu_used']:.0f}, on a pool that never drops below {r['nodes_min']:.0f} nodes of {r['machine']}.",
+                            f"Finish the blocker actions on `{r['id']}` first. Of what remains, system pods (DNS, event exporters, static pods) are expected; leave those.",
+                            "Right-size the requests on this pool, then lower the pool minimum or move to a smaller machine shape.",
                             f"Check {self.CL['autoscaler_review']} - these decide how fast empty nodes leave.",
-                            "Verify: node count tracks demand and idle cost on these pools falls."],
-                     verification="Node count tracks demand; idle $ on these pools falls",
-                     evidence=f"{pooltxt(blocked_rows)} {'carry' if len(blocked_rows) > 1 else 'carries'} {usd(idle)}/mo of idle against {usd(sum(r['cost'] for r in blocked_rows))}/mo of node cost. Idle pool - the upper bound of what shrinking can reclaim - not a computed saving.", _rows=blocked_rows)
-            for r in blocked_rows:
-                self.claimed_pools.add((r["cluster"], r["id"]))
-        if rec_rows:
-            rec_rows.sort(key=lambda r: -r["rec"]["save"])
-            sv = sum(r["rec"]["save"] for r in rec_rows); obs = sum(r["rec"]["save_o"] for r in rec_rows)
-            cs = sorted({r["cluster"] for r in rec_rows})
-            deps = ["stale_optout"] if opt and any((r["cluster"], r["id"]) in optpools for r in rec_rows) else []
-            self.add("pool_machine_recs", action_type="nodepool_machine_type", title=f"Apply PerfectScale's machine-type recommendations on {len(rec_rows)} long-lived node pool{'s' if len(rec_rows) > 1 else ''}",
-                     cluster=self.names([self.by[c] for c in cs]), scope=human_list([f"{r['cluster']} `{r['id']}` ({r['machine']} to {r['rec']['to']})" for r in rec_rows[:4]]) + (f" and {len(rec_rows) - 4} more" if len(rec_rows) > 4 else ""),
-                     savings_monthly_usd=sv, obs=obs, savings_basis="blocked_pending", confidence="high", effort_tier="S", effort_rationale="S (catalog), no escalators - a machine-type field on existing pools",
-                     change_risk="high", owner_role="platform", phase=2, depends_on=deps, lane="platform",
-                     steps=["Confirm the recommendations: " + ", ".join(f"{r['cluster']} `{r['id']}` {usd(r['rec']['save'])}/mo ({r['rec']['pct']:.0f}%)" for r in rec_rows[:4]) + ".",
-                            "Read the rationale attached to each recommendation in the InfraFit view before applying it, and confirm the target family fits the workloads on that pool.",
-                            "Apply on the lowest-risk cluster first. A change that replaces nodes should land after the blocker actions and in a quiet window.",
-                            "Verify: idle cost falls on each pool after its change date."],
-                     verification="Per-pool idle $ falls after each change date",
-                     evidence=f"These are the long-lived pools PerfectScale has a machine-type recommendation for. Together {usd(sv)}/mo of estimated savings - PerfectScale's own estimate, scaled to a 30-day run-rate" + (f"; {rec_rows[0]['cluster']} `{rec_rows[0]['id']}` is {pct(rec_rows[0]['rec']['save'], sv)} of it." if len(rec_rows) > 1 else "."), _rows=rec_rows)
-            for r in rec_rows:
-                self.claimed_pools.add((r["cluster"], r["id"]))
-        if free_rows:
-            free_rows.sort(key=lambda r: -r["idle"])
-            idle = sum(r["idle"] for r in free_rows); obs = sum(r["idle_o"] for r in free_rows)
-            cs = sorted({r["cluster"] for r in free_rows})
-            bursty = [r for r in free_rows if (r["nodes_max"] or 0) >= 3 * max(r["nodes_avg"] or 1, 1)]
-            self.add("pool_shrink_free", action_type="nodepool_shrink", title=f"Scale down {len(free_rows)} idle long-lived node pool{'s' if len(free_rows) > 1 else ''}",
-                     cluster=self.names([self.by[c] for c in cs]), scope=pooltxt(free_rows), savings_monthly_usd=idle, obs=obs, savings_basis="blocked_pending",
+                            "Verify: node count tracks demand and idle cost on this pool falls."],
+                     verification="Node count tracks demand; idle $ on this pool falls",
+                     evidence=f"{r['cluster']} `{r['id']}` carries {usd(r['idle'])}/mo of idle against {usd(r['cost'])}/mo of node cost, blocked by {r['blockers']} pods. Idle pool - the upper bound of what shrinking can reclaim - not a computed saving.")
+            self.claimed_pools.add((r["cluster"], r["id"]))
+
+        rec_rows.sort(key=lambda r: -r["rec"]["save"])
+        for r in rec_rows:
+            deps = ["stale_optout"] if opt and (r["cluster"], r["id"]) in optpools else []
+            self.add("pool_machine_recs", action_type="nodepool_machine_type", title=f"Apply PerfectScale's machine-type recommendation on {r['cluster']} `{r['id']}`",
+                     cluster=r["cluster"], scope=f"{r['cluster']} `{r['id']}` ({r['machine']} to {r['rec']['to']})",
+                     savings_monthly_usd=r["rec"]["save"], obs=r["rec"]["save_o"], savings_basis="blocked_pending", confidence="high", effort_tier="S",
+                     effort_rationale="S (catalog), no escalators - a machine-type field on existing pools",
+                     change_risk="high", owner_role="platform", phase=2, depends_on=deps, lane="platform", _uids=[r["uid"]], _resource=r["id"],
+                     steps=[f"Confirm the recommendation: {r['cluster']} `{r['id']}` {usd(r['rec']['save'])}/mo ({r['rec']['pct']:.0f}%).",
+                            "Read the rationale attached to the recommendation in the InfraFit view before applying it, and confirm the target family fits the workloads on this pool.",
+                            "Apply in a quiet window. A change that replaces nodes should land after the blocker actions on this node group.",
+                            "Verify: idle cost falls on this pool after the change date."],
+                     verification="Per-pool idle $ falls after the change date",
+                     evidence=f"{r['cluster']} `{r['id']}`: {usd(r['rec']['save'])}/mo of estimated savings moving {r['machine']} to {r['rec']['to']} - PerfectScale's own estimate, scaled to a 30-day run-rate.")
+            self.claimed_pools.add((r["cluster"], r["id"]))
+
+        free_rows.sort(key=lambda r: -r["idle"])
+        for r in free_rows:
+            bursty = (r["nodes_max"] or 0) >= 3 * max(r["nodes_avg"] or 1, 1)
+            self.add("pool_shrink_free", action_type="nodepool_shrink", title=f"Scale down idle long-lived node pool `{r['id']}`",
+                     cluster=r["cluster"], scope=f"{r['cluster']} `{r['id']}`", savings_monthly_usd=r["idle"], obs=r["idle_o"], savings_basis="blocked_pending",
                      confidence="medium", effort_tier="S", effort_rationale="S (catalog), no escalators - pool minimum and maximum settings",
-                     change_risk="medium", owner_role="platform", phase=2, lane="platform",
-                     steps=["Confirm the usage: " + "; ".join(f"`{r['id']}` pods request ~{r['cpu_req']:.0f} cores and use ~{r['cpu_used']:.1f}" for r in free_rows[:3]) + ".",
-                            ("Check what each pool is for. " + ("Several scale up in bursts (peaks of " + ", ".join(f"{r['nodes_max']:.0f}" for r in bursty[:3]) + " nodes) and sit idle between them, so the question is how quickly empty nodes leave and what the floor should be." if bursty else "Check the floor each pool is held at.")),
+                     change_risk="medium", owner_role="platform", phase=2, depends_on=group_deps(r), lane="platform", _uids=[r["uid"]], _resource=r["id"],
+                     steps=[f"Confirm the usage: `{r['id']}` pods request ~{r['cpu_req']:.0f} cores and use ~{r['cpu_used']:.1f}.",
+                            (f"Check what this pool is for. It scales up in bursts (peaks of {r['nodes_max']:.0f} nodes) and sits idle between them, so the question is how quickly empty nodes leave and what the floor should be." if bursty else "Check the floor this pool is held at."),
                             "Lower the minimum node count and tighten the scale-down delay.",
                             "Verify: node count falls back to the floor between bursts and idle cost falls."],
                      verification="Node count returns to the lowered floor between bursts; idle $ falls",
-                     evidence=f"{pooltxt(free_rows)}: {usd(idle)}/mo of idle on pools with few or no blocking pods and no machine-type recommendation. Idle pool, not a computed saving. Medium confidence: bursty pools make a short window over- or under-state them.", _rows=free_rows)
-            for r in free_rows:
-                self.claimed_pools.add((r["cluster"], r["id"]))
+                     evidence=f"{r['cluster']} `{r['id']}`: {usd(r['idle'])}/mo of idle with {r['blockers']} blocking pod{'s' if r['blockers'] != 1 else ''} and no machine-type recommendation. Idle pool, not a computed saving. Medium confidence: a bursty pool makes a short window over- or under-state it.")
+            self.claimed_pools.add((r["cluster"], r["id"]))
 
     # ---- auto-provisioned pools
     def r_autoprov(self):
@@ -596,7 +662,7 @@ class Plan:
         self.add("autoprov_review", action_type="autoprov_review", title="Review node auto-provisioning settings for the batch platform",
                  cluster=self.names(fs), scope=f"{sum(f['pools']['ap_n'] for f in fs):,} short-lived auto-provisioned pools",
                  savings_monthly_usd=0, savings_basis="blocked_pending", confidence="medium", effort_tier="M", effort_rationale="M (catalog), no escalators - cluster-level autoscaler configuration owned by the platform team",
-                 change_risk="high", owner_role="platform", phase=2, depends_on=deps, lane="platform",
+                 change_risk="high", owner_role="platform", phase=2, depends_on=deps, lane="platform", _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the shape of the problem: auto-provisioned pools carry {usd(ap_idle)}/mo of idle, {pct(ap_idle, self.total_idle)} of all idle in scope. The median pool runs about {med:.0f} minutes of wall-clock time.",
                         "Look at the machine shapes chosen: " + ", ".join(f"{s['machine']} ({s['groups']} pools, {usd(s['idle'])}/mo)" for s in shapes) + f" lead on {lead['name']}. " + cause,
                         "Find out, before changing anything: how many jobs share a node, how long a node lives compared with the job it was created for, and the memory-to-CPU ratio of the shapes chosen. Those three facts decide whether the answer is shared pools, a dedicated high-memory pool, or lower memory peaks in the jobs themselves.",
@@ -616,7 +682,7 @@ class Plan:
         self.add("gpu_cap", action_type="gpu_cap", title=f"Cap provisioning of {self.CL['gpu_note']} on {self.names(fs)}",
                  cluster=self.names(fs), scope=f"{sum(f['pools']['gpu_n'] for f in fs)} GPU-attached node pool instances",
                  savings_monthly_usd=0, savings_basis="blocked_pending", confidence="medium", effort_tier="M", effort_rationale="M (catalog), no escalators - a provisioning limit plus a decision with the ML teams",
-                 change_risk="medium", owner_role="platform", phase=2, lane="decision",
+                 change_risk="medium", owner_role="platform", phase=2, lane="decision", _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the split: GPU-attached pools hold {usd(gi)}/mo of {self.names(fs)}'s {usd(gi_all)}/mo idle ({pct(gi, gi_all)}).",
                         "Establish which workloads actually need a GPU" + (", and which pull-request environments" if pr else "") + ".",
                         "Set a GPU limit on node provisioning" + (" and shorten the environment TTL where a GPU is not needed." if pr else "."),
@@ -639,6 +705,7 @@ class Plan:
                  cluster=self.names(fs), scope=f"{n} workloads with high-severity under-provisioning" + (f"; {nods} DaemonSets have no requests set" if nods else ""),
                  savings_monthly_usd=lik, obs=obs, savings_basis="resiliency_investment", confidence="medium", effort_tier=t, effort_rationale=r,
                  change_risk="medium", owner_role="app-team", phase=2, depends_on=["oom_fix"] if self.has("oom_fix") else [], lane="config", range={"low": low, "likely": lik, "literal": lit},
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=(["Do the OOM action first; this is the same exercise on workloads that are not yet being killed."] if self.has("oom_fix") else []) +
                        ["Start with the largest: " + "; ".join(f"{short_name(x['name'])} ({x['cpu_cur']:.0f} to {x['cpu_rec']:.0f} cores)" for x in rows[:3]) + ".",
                         "Size from observed usage plus a deliberate margin, not from the printed recommendation.",
@@ -658,6 +725,7 @@ class Plan:
         self.add("headroom_policy", action_type="policy_headroom_tune", title=f"Review the {pol} policy on {self.names(fs)}", cluster=self.names(fs),
                  scope=f"policy: {pol} - {sum(f['policies'][pol] for f in fs):,} workloads", savings_monthly_usd=0, savings_basis="achievable_now", confidence="medium",
                  effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="ps-admin", phase=1, lane="decision",
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the current setting: {self.names(fs)} " + ("is" if len(fs) == 1 else "are") + f" on {pol}" + (f"; the other {len(others)} cluster{'s' if len(others) != 1 else ''} run something else." if others else "."),
                         "Decide whether that is deliberate. If it was chosen for a reason (a large production cluster, strict latency needs), keep it.",
                         f"Understand the cost both ways: {pol} lowers the savings ceiling on over-provisioned workloads and inflates recommended requests on under-provisioned ones.",
@@ -675,6 +743,7 @@ class Plan:
         self.add("local_storage", action_type="unevictable_localpv", title="Migrate local-storage pods off nodes the autoscaler needs to drain",
                  cluster=self.names(fs), scope=f"{n} pods outside platform namespaces", savings_monthly_usd=0, savings_basis="blocked_pending", confidence="high",
                  effort_tier="L", effort_rationale="L (catalog), no escalators - a storage migration, already the catalog floor", change_risk="critical", owner_role="platform", phase=3, lane="config",
+                 _uids=sorted({f["uid"] for f in fs}),
                  steps=[f"Confirm the blockers: {n} pods outside platform namespaces report local node storage as the reason drain is blocked.",
                         "Separate scratch from durable. A pod using emptyDir for cache can usually be marked safe to evict; one holding state on a local volume cannot.",
                         "For the durable cases, plan a move to network storage. That is a design change, which is why this is Phase 3.",
@@ -728,9 +797,19 @@ class Plan:
     # ------------------------------------------------------------------ finish: graph, scoring, order
     def finish(self):
         A = self.A
-        by_key = {a["key"]: a for a in A}
         for a in A:
-            a["depends_on"] = [by_key[k]["id"] for k in a["depends_on"] if k in by_key]
+            uids = a.pop("_nk_uids", None) or []
+            resource = a.pop("_nk_resource", None) or a["key"]
+            cluster_part = "+".join(sorted(uids)) if uids else "tenant"
+            a["natural_key"] = f"{cluster_part}:{resource}:{a['action_type']}"
+        # A rule key is usually one action, but r_pool_actions now emits one action per node group under a
+        # shared key (pool_shrink_blocked/pool_shrink_free/pool_machine_recs), so a dependency named by key
+        # must expand to every action carrying that key, not just one of them.
+        by_key_all = collections.defaultdict(list)
+        for a in A:
+            by_key_all[a["key"]].append(a)
+        for a in A:
+            a["depends_on"] = [x["id"] for k in a["depends_on"] for x in by_key_all.get(k, [])]
         by = {a["id"]: a for a in A}
         for a in A:
             for p in a["depends_on"]:
@@ -869,13 +948,12 @@ class Plan:
     # ------------------------------------------------------------------ decisions (computed from what fired)
     def decisions(self):
         """Decisions to settle, each valued by the dollars it unblocks and ranked by that value."""
-        by_key = {a["key"]: a for a in self.A}
+        by_key = {a["key"]: a for a in self.A}  # presence checks only - a key may now cover several actions (per node group)
 
         def val(keys, released=False):
             tot = 0.0
-            for k in keys:
-                a = by_key.get(k)
-                if a and a["savings_basis"] != "resiliency_investment":
+            for a in self.A:
+                if a["key"] in keys and a["savings_basis"] != "resiliency_investment":
                     tot += (a["released_value"] if released and a["released_value"] else a["savings_monthly_usd"]) or 0
             return tot
         D = []
