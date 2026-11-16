@@ -14,7 +14,7 @@ import re
 from datetime import date, timedelta
 
 from .model import short_name
-from .util import human_list, pct, roi_score, usd
+from .util import cores, gib, human_list, pct, roi_score, usd
 
 TIERS = ["XS", "S", "M", "L"]
 # Which PerfectScale product a recommendation comes from. PodFit = workload requests/automation; InfraFit = node pools and what blocks node scale-down.
@@ -281,9 +281,9 @@ class Plan:
         owners = [f["res_oom_owners"] for f in fs]
         t, r = effort("S", ["cross-team - the workloads belong to several teams"] if self.cross_team(owners) else [])
         steps = [f"Confirm it is still happening: PerfectScale flags OOM on {n} workloads. Start with {human_list([short_name(x['name']) for x in lead['res_oom_list'][:4]])}.",
-                 f"Note the shape of the problem: {short_name(top['name'])} requests {top['mem_cur_gib']:.0f} GiB while observed memory reaches {top['mem_p100_gib']:.0f} GiB at peak ({top['mem_p95_gib']:.0f} GiB at p95). "
+                 f"Note the shape of the problem: {short_name(top['name'])} requests {gib(top['mem_cur_gib'])} GiB while observed memory reaches {gib(top['mem_p100_gib'])} GiB at peak ({gib(top['mem_p95_gib'])} GiB at p95). "
                  "A request this far below peak means the scheduler packs these pods as if they were small." + (" Grouped job data aggregates concurrent pods, so read these as the shape of the problem rather than a per-pod figure." if job_led else ""),
-                 f"Size to p95 plus 20% margin first - that is the {usd(lik)}/mo 'likely' figure. PerfectScale's literal recommendation ({top['mem_rec_gib']:.0f} GiB for the largest) covers peak and is the {usd(lit)}/mo ceiling. Give work that truly needs peak memory a dedicated high-memory tag, then re-measure.",
+                 f"Size to p95 plus 20% margin first - that is the {usd(lik)}/mo 'likely' figure. PerfectScale's literal recommendation ({gib(top['mem_rec_gib'])} GiB for the largest) covers peak and is the {usd(lit)}/mo ceiling. Give work that truly needs peak memory a dedicated high-memory tag, then re-measure.",
                  "This is spend, not saving. It appears in the resiliency column and must not be netted against the savings elsewhere in this plan.",
                  "Verify: the OOM indicator clears and no memory-attributed restarts appear within 7 days."]
         self.add("oom_fix", action_type="oom_remediate", title="Raise memory requests on the workloads being OOM-killed",
@@ -371,7 +371,7 @@ class Plan:
               f"of computed savings - {pct(pot, ctl)} of the automation lane. No dollar claim of its own: that money is already counted in the automation actions. "
               f"What grouping changes is the number of decisions it takes to capture it, from {inst:,} to {len(G)}.")
         if bursty:
-            ev += (f" The copies are mostly dormant and burst when used - the largest reaches {s['cpu_p100']:.1f} cores against {s['cpu_p95']:.2f} at p95"
+            ev += (f" The copies are mostly dormant and burst when used - the largest reaches {cores(s['cpu_p100'])} cores against {cores(s['cpu_p95'])} at p95"
                    + (" and already shows CPU throttling" if s["throttled"] else "") +
                    " - so automation with in-place resizing fits them better than one static cut (inferred - cause not confirmed).")
         t, r = effort("S", [])
@@ -486,7 +486,7 @@ class Plan:
         deps = [k for k in ("oom_fix", "memory_limits") if self.has(k)]
         waste = sum(f["lanes"]["job"]["waste"] for f in fs)
         steps = [f"Confirm the set: {n} job workloads carrying {usd(pot)}/mo of computed savings, {pct(pot, self.pod_pot)} of everything PerfectScale found in scope.",
-                 "Work largest first - " + "; ".join(f"{short_name(x['name'])} ({x['cpu_cur']:.0f} to {x['cpu_rec']:.1f} cores, {usd(x['pot'])}/mo)" for x in top[:4]) + ".",
+                 "Work largest first - " + "; ".join(f"{short_name(x['name'])} ({cores(x['cpu_cur'])} to {cores(x['cpu_rec'])} cores, {usd(x['pot'])}/mo)" for x in top[:4]) + ".",
                  f"Change one job's resource settings at a time ({where}) through {self.gitops} and watch one full run cycle before the next."]
         if deps:
             steps.append("Finish the memory actions first: shrinking CPU on a group while its memory is still under-provisioned just moves the problem.")
@@ -671,7 +671,7 @@ class Plan:
                      savings_monthly_usd=r["idle"], obs=r["idle_o"], savings_basis="blocked_pending", confidence="high", effort_tier="M",
                      effort_rationale="M (catalog), no escalators - a node pool change owned by the platform team" + ("; no freeze or approval lead time reported" if not self.cfg["intake"].get("change_freeze") else ""),
                      change_risk="high", owner_role="platform", phase=2, depends_on=group_deps(r), lane="platform", _uids=[r["uid"]], _resource=r["id"],
-                     steps=[f"Confirm the picture: pods on `{r['id']}` request ~{r['cpu_req']:.0f} cores on average and use ~{r['cpu_used']:.0f}, on a pool that never drops below {r['nodes_min']:.0f} nodes of {r['machine']}.",
+                     steps=[f"Confirm the picture: pods on `{r['id']}` request ~{cores(r['cpu_req'])} cores on average and use ~{cores(r['cpu_used'])}, on a pool that never drops below {r['nodes_min']:.0f} nodes of {r['machine']}.",
                             f"Finish the blocker actions on `{r['id']}` first. Of what remains, system pods (DNS, event exporters, static pods) are expected; leave those.",
                             "Right-size the requests on this pool, then lower the pool minimum or move to a smaller machine shape.",
                             f"Check {self.CL['autoscaler_review']} - these decide how fast empty nodes leave.",
@@ -703,7 +703,7 @@ class Plan:
                      cluster=r["cluster"], scope=f"{r['cluster']} `{r['id']}`", savings_monthly_usd=r["idle"], obs=r["idle_o"], savings_basis="blocked_pending",
                      confidence="medium", effort_tier="S", effort_rationale="S (catalog), no escalators - pool minimum and maximum settings",
                      change_risk="medium", owner_role="platform", phase=2, depends_on=group_deps(r), lane="platform", _uids=[r["uid"]], _resource=r["id"],
-                     steps=[f"Confirm the usage: `{r['id']}` pods request ~{r['cpu_req']:.0f} cores and use ~{r['cpu_used']:.1f}.",
+                     steps=[f"Confirm the usage: `{r['id']}` pods request ~{cores(r['cpu_req'])} cores and use ~{cores(r['cpu_used'])}.",
                             (f"Check what this pool is for. It scales up in bursts (peaks of {r['nodes_max']:.0f} nodes) and sits idle between them, so the question is how quickly empty nodes leave and what the floor should be." if bursty else "Check the floor this pool is held at."),
                             "Lower the minimum node count and tighten the scale-down delay.",
                             "Verify: node count falls back to the floor between bursts and idle cost falls."],
@@ -730,9 +730,9 @@ class Plan:
         jr = {k: sum(f["job_req_vs_rec"][k] for f in fs) for k in ("cpu_cur", "cpu_rec", "mem_cur_gib", "mem_rec_gib")}
         recs_up = jr["cpu_rec"] > jr["cpu_cur"] or jr["mem_rec_gib"] > jr["mem_cur_gib"]
         cause = (f"Measured: on these pools, pods request on average {cr:.1f}x the CPU and {mr:.1f}x the memory they use (time-averaged), and {pct(infl, 1)} of the idle sits on shapes where CPU requests are 5x or more of use. "
-                 + (f"Not shown by the data: that lowering requests would shrink the shapes. PerfectScale's own recommendations for job workloads (grouped and ungrouped), taken together, would move CPU from {jr['cpu_cur']:,.0f} to {jr['cpu_rec']:,.0f} cores and memory from {jr['mem_cur_gib']:,.0f} to {jr['mem_rec_gib']:,.0f} GiB, because they protect peaks. "
+                 + (f"Not shown by the data: that lowering requests would shrink the shapes. PerfectScale's own recommendations for job workloads (grouped and ungrouped), taken together, would move CPU from {cores(jr['cpu_cur'])} to {cores(jr['cpu_rec'])} cores and memory from {gib(jr['mem_cur_gib'])} to {gib(jr['mem_rec_gib'])} GiB, because they protect peaks. "
                     "Inferred, not confirmed: nodes are sized for job peaks and hold far less most of the time." if recs_up else
-                    f"If requests were lowered to PerfectScale's recommendations, CPU would move from {jr['cpu_cur']:,.0f} to {jr['cpu_rec']:,.0f} cores and memory from {jr['mem_cur_gib']:,.0f} to {jr['mem_rec_gib']:,.0f} GiB, so smaller shapes are plausible (inferred, not confirmed)."))
+                    f"If requests were lowered to PerfectScale's recommendations, CPU would move from {cores(jr['cpu_cur'])} to {cores(jr['cpu_rec'])} cores and memory from {gib(jr['mem_cur_gib'])} to {gib(jr['mem_rec_gib'])} GiB, so smaller shapes are plausible (inferred, not confirmed)."))
         self.add("autoprov_review", action_type="autoprov_review", title="Review node auto-provisioning settings for the batch platform",
                  cluster=self.names(fs), scope=f"{sum(f['pools']['ap_n'] for f in fs):,} short-lived auto-provisioned pools",
                  savings_monthly_usd=0, savings_basis="blocked_pending", confidence="medium", effort_tier="M", effort_rationale="M (catalog), no escalators - cluster-level autoscaler configuration owned by the platform team",
@@ -781,7 +781,7 @@ class Plan:
                  change_risk="medium", owner_role="app-team", phase=2, depends_on=["oom_fix"] if self.has("oom_fix") else [], lane="config", range={"low": low, "likely": lik, "literal": lit},
                  _uids=sorted({f["uid"] for f in fs}),
                  steps=(["Do the OOM action first; this is the same exercise on workloads that are not yet being killed."] if self.has("oom_fix") else []) +
-                       ["Start with the largest: " + "; ".join(f"{short_name(x['name'])} ({x['cpu_cur']:.0f} to {x['cpu_rec']:.0f} cores)" for x in rows[:3]) + ".",
+                       ["Start with the largest: " + "; ".join(f"{short_name(x['name'])} ({cores(x['cpu_cur'])} to {cores(x['cpu_rec'])} cores)" for x in rows[:3]) + ".",
                         "Size from observed usage plus a deliberate margin, not from the printed recommendation.",
                         "This is spend, not saving. It belongs in the resiliency column and is never netted against savings.",
                         "Verify: the under-provisioning indicators clear without new throttling."],
@@ -1084,7 +1084,7 @@ class Plan:
                 add("measured", f"On those pools, pods request on average {tot['cpu_req'] / tot['cpu_used']:.1f}x the CPU and {tot['mem_req'] / tot['mem_used']:.1f}x the memory they use (time-averaged).", "Requested versus used, averaged over each pool's life.", "InfraFit view, pool detail.")
             jr = {k: sum(f["job_req_vs_rec"][k] for f in fs) for k in ("cpu_cur", "cpu_rec", "mem_cur_gib", "mem_rec_gib")}
             if jr["cpu_cur"]:
-                add("measured", f"PerfectScale's recommendations for job workloads (grouped and ungrouped), taken together, move CPU from {jr['cpu_cur']:,.0f} to {jr['cpu_rec']:,.0f} cores and memory from {jr['mem_cur_gib']:,.0f} to {jr['mem_rec_gib']:,.0f} GiB. The savings come from a few oversized groups; others need more.", "Sum of current versus recommended requests across job workloads.", "PodFit view, job workloads.")
+                add("measured", f"PerfectScale's recommendations for job workloads (grouped and ungrouped), taken together, move CPU from {cores(jr['cpu_cur'])} to {cores(jr['cpu_rec'])} cores and memory from {gib(jr['mem_cur_gib'])} to {gib(jr['mem_rec_gib'])} GiB. The savings come from a few oversized groups; others need more.", "Sum of current versus recommended requests across job workloads.", "PodFit view, job workloads.")
             add("inferred", "The idle on these pools most likely reflects the gap between peak and average use: nodes are sized for job peaks and hold far less most of the time. Cause not confirmed.", "Requests far above average use, large memory-heavy machine shapes, and recommendations that protect peaks rather than lower requests.", "Compare each shape's memory-to-CPU ratio, pods per node, and node lifetime against job runtime.")
             add("inferred", "Lowering requests alone is unlikely to shrink these shapes. Cause not confirmed.", "PerfectScale's recommendations do not lower aggregate requests for these jobs.", "Apply recommendations to one job family and watch which machine shape is chosen next.")
         add("measured", f"{usd(self.pod_pot)}/mo is PerfectScale's total computed workload saving in scope; {usd(self.pod_waste)}/mo is workload waste.", "Workload list, scaled to a 30-day run-rate.", "PodFit view totals.")

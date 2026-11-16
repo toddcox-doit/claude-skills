@@ -63,6 +63,34 @@ def usd_signed(v):
     return f"${v:,.0f}" if v >= 0 else f"$({abs(v):,.0f})"
 
 
+def _quantity(v, unit_floor):
+    """Adaptive precision so a small non-zero quantity never prints as '0'.
+
+    Printing a 0.2-core request as '0' reads as 'requests nothing', which is a
+    different and wrong finding. Mirrors pct()'s '<1%' convention: below the
+    floor the value is shown as a bound rather than rounded away.
+    """
+    v = float(v or 0)
+    a = abs(v)
+    if a == 0:
+        return "0"
+    if a < unit_floor:
+        return ("-" if v < 0 else "") + f"<{unit_floor:g}"
+    if a < 1:
+        return f"{v:.2f}"
+    if a < 10:
+        return f"{v:.1f}"
+    return f"{v:,.0f}"
+
+
+def cores(v):
+    return _quantity(v, 0.01)
+
+
+def gib(v):
+    return _quantity(v, 0.01)
+
+
 def pct(a, b, lt1=True):
     if not b:
         return "0%"

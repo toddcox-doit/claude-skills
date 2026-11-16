@@ -17,6 +17,7 @@ import fixtures  # noqa: E402
 from psplan.config import Config  # noqa: E402
 from psplan import model  # noqa: E402
 from psplan.collect import Collector, SustainedRateLimiting, is_rate_limited  # noqa: E402
+from psplan.util import cores, gib  # noqa: E402
 
 
 class Base(unittest.TestCase):
@@ -410,6 +411,39 @@ class TestConfigValidation(unittest.TestCase):
         self.assertNotIn("stateful_patterns", buf.getvalue())
         self.assertNotIn("nonprod_patterns", buf.getvalue())
         self.assertNotIn("gpu_pool_patterns", buf.getvalue())
+
+
+class TestQuantityFormatting(unittest.TestCase):
+    """A small non-zero request must never render as '0'.
+
+    Printing a 0.2-core request as '0 cores' states that the workload requests
+    nothing, which is a different finding from the one the data supports.
+    """
+
+    def test_small_non_zero_never_renders_as_zero(self):
+        for v in (0.2, 0.05, 0.011, 0.5, 0.99):
+            for fn in (cores, gib):
+                self.assertNotEqual(fn(v), "0", f"{fn.__name__}({v})")
+
+    def test_exact_zero_is_zero(self):
+        self.assertEqual(cores(0), "0")
+        self.assertEqual(cores(0.0), "0")
+        self.assertEqual(cores(None), "0")
+        self.assertEqual(gib(0), "0")
+
+    def test_below_floor_shows_a_bound(self):
+        self.assertEqual(cores(0.004), "<0.01")
+        self.assertEqual(cores(-0.004), "-<0.01")
+
+    def test_precision_falls_away_as_the_value_grows(self):
+        self.assertEqual(cores(0.25), "0.25")
+        self.assertEqual(cores(2.5), "2.5")
+        self.assertEqual(cores(42.4), "42")
+        self.assertEqual(cores(1536.7), "1,537")
+
+    def test_rounding_cannot_cross_into_zero(self):
+        # 0.49 rounds to 0 at .0f; the helper must keep it visible
+        self.assertEqual(cores(0.49), "0.49")
 
 
 if __name__ == "__main__":
