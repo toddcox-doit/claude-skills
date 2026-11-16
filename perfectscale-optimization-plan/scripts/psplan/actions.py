@@ -13,7 +13,7 @@ import math
 import re
 from datetime import date, timedelta
 
-from .model import short_name
+from .model import managed_ns, short_name
 from .util import cores, gib, human_list, pct, roi_score, usd
 
 TIERS = ["XS", "S", "M", "L"]
@@ -876,6 +876,10 @@ class Plan:
             resource = a.pop("_nk_resource", None) or a["key"]
             cluster_part = "+".join(sorted(uids)) if uids else "tenant"
             a["natural_key"] = f"{cluster_part}:{resource}:{a['action_type']}"
+            # retained, not just folded into natural_key: the idle table answers "what fixes
+            # this cluster's idle" by looking actions up per cluster, and parsing them back
+            # out of a composite string would be a trap the first time a uid format changes
+            a["cluster_uids"] = sorted(uids)
         # A rule key is usually one action, but r_pool_actions now emits one action per node group under a
         # shared key (pool_shrink_blocked/pool_shrink_free/pool_machine_recs), so a dependency named by key
         # must expand to every action carrying that key, not just one of them.
@@ -986,8 +990,63 @@ class Plan:
             "pod": {"cost": round(self.pod_cost), "waste": round(self.pod_waste), "potential": round(self.pod_pot), "managed_held_out": round(held)},
             "confidence_counts": dict(confs), "first_moves": [a["id"] for a in first_moves],
             "rerun_date": getattr(self, "rerun_date", date.fromisoformat(self.cfg["prepared"]) + timedelta(days=self.cfg["rerun_days"])).isoformat(),
-            "decisions": self.decisions(), "decision_detail": self.decision_detail, "evidence": self.evidence(), "confidence": self.confidence_summary(), "cluster_idle": self.cluster_idle(),
+            "decisions": self.decisions(), "decision_detail": self.decision_detail, "evidence": self.evidence(), "confidence": self.confidence_summary(), "cluster_idle": self.cluster_idle(A),
             "scale_context": self.scale_context(), "outlook": self.outlook(A, tot), "actions": A,
+            "namespace_rollup": self.namespace_rollup(),
+        }
+
+    # Namespaces are the unit a platform team actually assigns work in: one owner holds
+    # `payments` wherever it runs, not "payments on target-prod". Rolling the same name up
+    # across clusters answers "who do we go to, and for how much", which the per-cluster
+    # findings docs cannot - they each see one slice of the same namespace.
+    def namespace_rollup(self, top=40):
+        agg = collections.defaultdict(lambda: {
+            "clusters": set(), "n": 0, "cost": 0.0, "waste": 0.0, "pot": 0.0,
+            "risk_n": 0, "oom_n": 0, "res_likely": 0.0, "res_literal": 0.0})
+        for f in self.F:
+            for r in f.get("namespaces", []):
+                a = agg[r["ns"]]
+                a["clusters"].add(f["name"])
+                a["n"] += r["n"]
+                a["cost"] += r.get("cost", 0.0)
+                a["waste"] += r.get("waste_o", r.get("waste", 0.0))
+                a["pot"] += r.get("pot", 0.0)
+                a["risk_n"] += r.get("risk_n", 0)
+                a["oom_n"] += r.get("oom_n", 0)
+                a["res_likely"] += r.get("res_likely_o", r.get("res_likely", 0.0))
+                a["res_literal"] += r.get("res_literal", 0.0)
+
+        rows = [{"ns": k,
+                 "n_clusters": len(v["clusters"]),
+                 "clusters": sorted(v["clusters"]),
+                 "n": v["n"],
+                 "cost": round(v["cost"]), "waste": round(v["waste"]), "pot": round(v["pot"]),
+                 "risk_n": v["risk_n"], "oom_n": v["oom_n"],
+                 "res_likely": round(v["res_likely"]), "res_literal": round(v["res_literal"]),
+                 "managed": managed_ns(k, self.cloud, set(self.cfg["managed_namespaces"])),
+                 # rank on what a namespace owner is being asked to act on: money they can
+                 # save plus money they must spend to stop pods dying. Waste alone buries a
+                 # namespace whose whole problem is that it is under-provisioned.
+                 "_sort": v["pot"] + v["res_likely"]}
+                for k, v in agg.items()]
+        rows.sort(key=lambda r: -r["_sort"])
+        for r in rows:
+            r.pop("_sort")
+        # every namespace is returned; `n_shown` is how many the prose documents print.
+        # The spreadsheet takes the lot - a capped table is right for a conversation and
+        # wrong for the sheet someone pivots to find their own namespace.
+        rest = rows[top:]
+        return {
+            "rows": rows,
+            "n_total": len(rows),
+            "n_shown": min(top, len(rows)),
+            "truncated": {"n": len(rest),
+                          "pot": round(sum(r["pot"] for r in rest)),
+                          "res_likely": round(sum(r["res_likely"] for r in rest))} if rest else None,
+            "totals": {"pot": round(sum(r["pot"] for r in rows)),
+                       "waste": round(sum(r["waste"] for r in rows)),
+                       "cost": round(sum(r["cost"] for r in rows)),
+                       "res_likely": round(sum(r["res_likely"] for r in rows))},
         }
 
     def fit_split(self, A):
@@ -1131,8 +1190,18 @@ class Plan:
                         + "Automation on a grouped workload only reduces resources after enough data has been collected.")
         return {"takeaway": take, "know": know, "think": think, "need": need, "grouping": grouping}
 
-    def cluster_idle(self):
-        """Why each cluster's node idle is what it is, from the data (largest driver wins)."""
+    def cluster_idle(self, A=None):
+        """Why each cluster's node idle is what it is, from the data (largest driver wins).
+
+        Each row also carries the InfraFit actions that act on that cluster, so the table
+        can say what closes the gap rather than only naming it. Naming the driver without
+        naming the fix leaves the reader to cross-reference the action list by hand.
+        """
+        by_uid = collections.defaultdict(list)
+        for a in (A or []):
+            if a.get("fit") == "InfraFit":
+                for u in a.get("cluster_uids") or []:
+                    by_uid[u].append(a)
         rows = []
         for f in self.F:
             P = f["pools"]
@@ -1141,7 +1210,11 @@ class Plan:
                      "auto-provisioned pools on other shapes": P["ap_idle"] * (1 - infl),
                      "long-lived node pools": P["ll_idle"]}
             driver = max(parts, key=parts.get)
-            rows.append({"cluster": f["name"], "idle": round(P["idle"]), "idle_pct": P["idle_pct"], "node_cost": round(P["cost"]),
+            fixes = sorted(by_uid.get(f["uid"], []), key=lambda a: -(a.get("savings_monthly_usd") or 0))[:3]
+            rows.append({"cluster": f["name"],
+                         "fix_ids": [a["id"] for a in fixes],
+                         "fix_usd": round(sum(a.get("savings_monthly_usd") or 0 for a in fixes)),
+                         "idle": round(P["idle"]), "idle_pct": P["idle_pct"], "node_cost": round(P["cost"]),
                          "auto_provisioned": round(P["ap_idle"]), "ap_inflated_share": infl, "long_lived": round(P["ll_idle"]),
                          "gpu": round(P["gpu_idle"]), "gpu_share": P["gpu_idle_share"], "driver": driver + (f"; GPU-attached pools hold {P['gpu_idle_share'] * 100:.0f}% of idle" if P["gpu_idle_share"] >= 0.5 else ""),
                          "driver_usd": round(parts[driver]), "driver_share": parts[driver] / P["idle"] if P["idle"] else 0})

@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from .model import short_name
-from .util import long_date, pct, slug, usd
+from .util import human_list, long_date, pct, slug, usd
 
 PHASE = {1: "Phase 1 - Foundations and quick wins", 2: "Phase 2 - Capture the savings", 3: "Phase 3 - Keep the gains"}
 BASIS = {"achievable_now": "Savings (achievable)", "blocked_pending": "Savings (pending blockers)", "resiliency_investment": "Spend (resiliency)"}
@@ -112,12 +112,93 @@ def outlook_rows(S):
     return [("Low", o["low"]["label"], usd(o["low"]["usd"])), ("Planning", o["planning"]["label"], usd(o["planning"]["usd"])), ("Maximum", o["maximum"]["label"], usd(o["maximum"]["usd"]))]
 
 
+IDLE_LEAD = ("Idle is node capacity paid for and not used. The breakdown says which kind of pool it sits "
+             "on, because the fix differs: auto-provisioned pools are a provisioning-config question, "
+             "GPU pools a scheduling one, long-lived pools a minimum-size and consolidation one.")
+
+
+def idle_cols(S):
+    """Which breakdown columns carry information for this tenant.
+
+    The decomposition only earns a column when it splits something. On a tenant whose
+    idle is entirely on long-lived pools, 'Long-lived pool idle' repeats 'Idle' in every
+    row and the auto-provisioned and GPU columns are all zero - three columns of nothing,
+    which make a reader hunt for a distinction that is not there. Dropped, and said once
+    underneath instead.
+    """
+    C = S["cluster_idle"]
+    return {
+        "ap": any(c["auto_provisioned"] for c in C),
+        "infl": any(c["ap_inflated_share"] for c in C),
+        "ll": any(c["long_lived"] != c["idle"] for c in C),
+        "gpu": any(c["gpu"] for c in C),
+        # the driver column earns its place only when clusters actually differ: one
+        # pool kind at ~100% everywhere is a single sentence, not fifteen rows
+        "driver": not (len({c["driver"] for c in C}) <= 1 and all(c["driver_share"] >= 0.99 for c in C)),
+    }
+
+
+def idle_headers(S):
+    show = idle_cols(S)
+    h = ["Cluster", "Idle"]
+    if show["ap"]:
+        h.append("Auto-provisioned idle")
+    if show["infl"]:
+        h.append("Of which on shapes where CPU requests are 5x or more of use")
+    if show["ll"]:
+        h.append("Long-lived pool idle")
+    if show["gpu"]:
+        h.append("GPU pool idle")
+    if show["driver"]:
+        h.append("Largest driver")
+    return h + ["What closes it"]
+
+
 def idle_rows(S):
+    show = idle_cols(S)
     rows = []
     for c in S["cluster_idle"]:
-        rows.append((c["cluster"], f"{usd(c['idle'])} ({c['idle_pct'] * 100:.0f}%)", usd(c["auto_provisioned"]), f"{c['ap_inflated_share'] * 100:.0f}%", usd(c["long_lived"]),
-                     f"{usd(c['gpu'])} ({c['gpu_share'] * 100:.0f}%)", f"{c['driver']} ({usd(c['driver_usd'])}, {c['driver_share'] * 100:.0f}%)"))
+        r = [c["cluster"], f"{usd(c['idle'])} ({c['idle_pct'] * 100:.0f}%)"]
+        if show["ap"]:
+            r.append(usd(c["auto_provisioned"]))
+        if show["infl"]:
+            r.append(f"{c['ap_inflated_share'] * 100:.0f}%")
+        if show["ll"]:
+            r.append(usd(c["long_lived"]))
+        if show["gpu"]:
+            r.append(f"{usd(c['gpu'])} ({c['gpu_share'] * 100:.0f}%)")
+        if show["driver"]:
+            r.append(f"{c['driver']} ({usd(c['driver_usd'])}, {c['driver_share'] * 100:.0f}%)")
+        # ids only, deliberately no dollars: these are pending-blocker estimates, and
+        # printing one beside an idle measurement invites a subtraction between two
+        # different money bases that the plan spends a whole section keeping apart
+        ids = c.get("fix_ids") or []
+        r.append(", ".join(ids) if ids else "no node-level action - see the pool-consolidation question")
+        rows.append(tuple(r))
     return rows
+
+
+def idle_note(S):
+    """Why the breakdown columns are missing, when they are."""
+    show = idle_cols(S)
+    if all(show.values()):
+        return ""
+    C = S["cluster_idle"]
+    gone = []
+    if not show["ap"]:
+        gone.append("auto-provisioned pool idle")
+    if not show["gpu"]:
+        gone.append("GPU pool idle")
+    if not show["ll"]:
+        gone.append("long-lived pool idle")
+    if not show["driver"]:
+        gone.append("largest driver")
+    tot = sum(c["idle"] for c in C)
+    tail = (f" Every dollar of the {usd(tot)}/mo sits on long-lived node pools, so the question for each "
+            f"cluster is whether its pools are allowed to give a node back, not which kind of pool to look at. "
+            f"'What closes it' names the actions that do that, listed in full in the plan above."
+            if not show["ll"] else "")
+    return f"Columns not shown because they are zero or identical for every cluster in scope: {human_list(gone)}.{tail}"
 
 
 GROUP_ORDER = [("Ownership", "who can act on it"), ("Intent", "whether it was deliberate"), ("Access and constraints", "what we need to be able to proceed")]
@@ -127,6 +208,63 @@ DECISIONS_LEAD = ("These are questions for the customer, not choices for us to m
 
 
 BASIS_LABEL = {"measured": "Measured", "inferred": "Inferred", "unknown": "Not known"}
+
+
+NS_TITLE = "Appendix: analysis by namespace"
+NS_LEAD = ("The plan above is ordered by what you do; this is the same money ordered by who owns it. "
+           "One row per namespace name, summed across every cluster it runs in, so a namespace with one "
+           "owner is one conversation rather than fifteen. Ranked by potential savings plus resiliency "
+           "spend, because a namespace whose whole problem is under-provisioning is still work to schedule.")
+NS_FOOT = ("Potential savings here is PodFit-computed, the same money the actions above draw on - this "
+           "table re-cuts it by owner, it does not add to it. Resiliency spend is money to add, never "
+           "netted against savings.")
+NS_COLS = ["Namespace", "Clusters", "Workloads", "Cost", "Waste", "Potential savings", "At risk", "OOM", "Resiliency spend (likely)"]
+NS_MANAGED_MARK = "platform-managed"
+NS_LEGEND = (f"Marked {NS_MANAGED_MARK}: a platform add-on namespace. The platform reconciles its "
+             "manifests, so it is held out of the automation ask and its savings are not claimed.")
+
+
+def namespace_rows(S):
+    """Rows for the by-namespace appendix, as display strings, capped for prose."""
+    nr = S.get("namespace_rollup") or {}
+    out = []
+    for r in nr.get("rows", [])[:nr.get("n_shown", 0)]:
+        out.append([
+            r["ns"] + (f" ({NS_MANAGED_MARK})" if r["managed"] else ""),
+            str(r["n_clusters"]),
+            str(r["n"]),
+            usd(r["cost"]),
+            usd(r["waste"]),
+            usd(r["pot"]),
+            str(r["risk_n"]) if r["risk_n"] else "-",
+            str(r["oom_n"]) if r["oom_n"] else "-",
+            usd(r["res_likely"]) if r["res_likely"] else "-",
+        ])
+    return out
+
+
+def namespace_note(S):
+    """The 'and N more' line, plus why this table's total is not the headline figure.
+
+    Summed, this column comes to the full PodFit potential, which is larger than the
+    plan's achievable figure because achievable excludes the platform-managed
+    namespaces. Someone checking the two against each other deserves that stated
+    rather than left as an apparent error.
+    """
+    nr = S.get("namespace_rollup") or {}
+    t = nr.get("truncated")
+    cap = (f"Showing the top {nr['n_shown']} of {nr['n_total']} namespaces, ranked by potential savings plus "
+           f"resiliency spend. The remaining {t['n']} hold {usd(t['pot'])}/mo of potential savings and "
+           f"{usd(t['res_likely'])}/mo of resiliency spend between them; the spreadsheet lists every namespace."
+           if t else f"All {nr.get('n_total', 0)} namespaces in scope are listed.")
+    held = S.get("pod", {}).get("managed_held_out") or 0
+    tot = (nr.get("totals") or {}).get("pot") or 0
+    ach = S.get("totals", {}).get("achievable_now_monthly") or 0
+    if held and tot:
+        cap += (f" Potential savings across all {nr['n_total']} namespaces comes to {usd(tot)}/mo, above the "
+                f"plan's {usd(ach)}/mo achievable figure: the difference is {usd(held)}/mo in platform-managed "
+                f"namespaces, which this table shows but the automation ask deliberately leaves out.")
+    return cap
 
 
 def evidence_rows(S):
@@ -204,8 +342,11 @@ def render_plan_md(cfg, S):
             L += [f"**{title}**", ""] + [f"- {x}" for x in cf[key]] + [""]
     if cf.get("grouping"):
         L += ["**How grouping connects to node sizing**", "", cf["grouping"], "", "Sources (PerfectScale public documentation): " + "; ".join(f"[{n}]({u})" for n, u in GROUPING_SOURCES) + ".", ""]
-    L += ["### Why each cluster's idle is what it is", "", "| Cluster | Idle | Auto-provisioned idle | Of which on shapes where CPU requests are 5x or more of use | Long-lived pool idle | GPU pool idle | Largest driver |", "|---|---|---|---|---|---|---|"]
-    L += ["| " + " | ".join(row) + " |" for row in idle_rows(S)] + [""]
+    ih = idle_headers(S)
+    L += ["### Why each cluster's idle is what it is", "", IDLE_LEAD, "",
+          "| " + " | ".join(ih) + " |", "|" + "---|" * len(ih)]
+    L += ["| " + " | ".join(row) + " |" for row in idle_rows(S)]
+    L += ([""] + [idle_note(S)] if idle_note(S) else []) + [""]
     L += ["### The four blocks", "", "| Block | Monthly | Comes from | What it is | How it relates |", "|---|---|---|---|---|",
           f"| Achievable now | {usd(S['totals']['achievable_now_monthly'])} | PodFit (workloads) | A saving: PerfectScale-computed reduction on workload requests, reachable by a toggle, a config change or manual right-sizing | Separate from node idle |",
           f"| Resiliency spend | {usd(S['totals']['resiliency_investment_monthly'])} | PodFit (workloads) | Money to add to fix under-provisioned workloads (likely case; range {usd(S['totals']['resiliency_range'].get('low', 0))} to {usd(S['totals']['resiliency_range'].get('literal', 0))}) | Opposite sign; never netted against savings |",
@@ -239,6 +380,20 @@ def render_plan_md(cfg, S):
         for i, s in enumerate(a["steps"], 1):
             L.append(f"{i}. {s}")
         L.append("")
+    nrows = namespace_rows(S)
+    if nrows:
+        L += [f"## {NS_TITLE}", "", NS_LEAD, "",
+              "| " + " | ".join(NS_COLS) + " |",
+              "|" + "---|" * len(NS_COLS)]
+        L += ["| " + " | ".join(r) + " |" for r in nrows]
+        L += ["", namespace_note(S), "", NS_LEGEND + " " + NS_FOOT, ""]
+        # Markdown has no click target, so the cluster lists go in a details block the
+        # reader can open: collapsible where the viewer supports it, plain text where
+        # it does not, and present on paper either way.
+        L += ["<details>", "<summary>Which clusters each namespace runs in</summary>", ""]
+        for rec in S["namespace_rollup"]["rows"][:len(nrows)]:
+            L.append(f"- `{rec['ns']}` - {', '.join(rec['clusters'])}")
+        L += ["", "</details>", ""]
     L += ["## Appendix: evidence detail", "", "The statements above, with their basis and how to check each one in PerfectScale.", "", "| Status | Statement | Basis | How to check |", "|---|---|---|---|"] + [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in evidence_rows(S)] + [""]
     L += (["## Feedback requested", ""] + [f"{i}. {x}" for i, x in enumerate(FEEDBACK_PROMPTS, 1)] + [""]) if cfg.get("status") else []
     L += [f"## {DECISIONS_TITLE}", "", DECISIONS_LEAD, ""]
@@ -267,6 +422,13 @@ def render_cluster_md(cfg, S, f):
     for k in ("controller", "job", "stateful", "held_out", "managed"):
         x = f["lanes"][k]
         L.append(f"| {k.replace('_', ' ')} | {x['n']:,} | {usd(x['waste'])} | {usd(x['pot'])} |")
+    top_ns = sorted(f["namespaces"], key=lambda r: -(r["waste_o"] + r["res_likely_o"]))[:10]
+    if top_ns:
+        L += ["", "## Top namespaces", "", "| Namespace | Workloads | Cost | Waste | Potential savings | At risk | Resiliency spend (likely) |", "|---|---|---|---|---|---|---|"]
+        for r in top_ns:
+            at_risk = f"{r['risk_n']:,} ({r['oom_n']} OOM)" if r["oom_n"] else (f"{r['risk_n']:,}" if r["risk_n"] else "-")
+            L.append(f"| {r['ns']} | {r['n']:,} | {usd(r['cost'])} | {usd(r['waste'])} | {usd(r['pot'])} | {at_risk} | {usd(r['res_likely']) if r['res_likely'] else '-'} |")
+        L += ["", "Resiliency spend is money to add to stop workloads failing, not a saving - see the optimization plan's resiliency row.", ""]
     L += ["", "## Largest opportunities", "", "| Workload | Namespace | Lane | CPU now to rec | Waste | Potential |", "|---|---|---|---|---|---|"]
     for r in f["top"][:12]:
         L.append(f"| {short_name(r['name'])} | {r['ns']} | {r['lane']} | {r['cpu_cur']:.1f} to {r['cpu_rec']:.1f} | {usd(r['waste'])} | {usd(r['pot'])} |")
@@ -318,12 +480,53 @@ table.rsz{user-select:none}
 summary{cursor:pointer;font-weight:600}.tag{display:inline-block;border:1px solid var(--line);border-radius:10px;padding:0 8px;font-size:12px;margin-right:4px}
 .trio{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.trio .card .h{display:block;font-size:16px;margin-bottom:6px}.trio ul{margin:0;padding-left:18px;font-size:14px}.trio li{margin:4px 0}.fn{font-size:12px;line-height:1.5;color:var(--mut);margin:6px 0 10px}.ctl{position:sticky;top:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:8px 0 14px;z-index:5}.ctl input[type=number]{width:60px}
 .card .sub,.card .adj,.card .tagline{display:block;margin-top:4px}.card .adj{margin-top:6px}.card .sub,.card .tagline,.card .adj{font-size:14px}.card .adj b{display:inline;font-size:inherit;font-weight:inherit}.card .adj{font-variant-numeric:tabular-nums}.tagline .tag{border:0;padding:0;margin:0;border-radius:0;color:var(--mut)}.num{font-variant-numeric:tabular-nums;text-align:left;font-weight:400;font-size:14px}
-svg text{fill:var(--fg);font-size:12px}svg rect{fill:var(--card);stroke:var(--line)}svg path{stroke:var(--mut);fill:none}"""
+svg text{fill:var(--fg);font-size:12px}svg rect{fill:var(--card);stroke:var(--line)}svg path{stroke:var(--mut);fill:none}
+/* namespace rows expand to a full-width row listing their clusters */
+button.nstog{font:inherit;color:var(--acc);background:none;border:0;padding:0;cursor:pointer;text-align:left}
+button.nstog::before{content:"\\25B8 ";color:var(--mut)}
+button.nstog[aria-expanded=true]::before{content:"\\25BE "}
+button.nstog:hover{text-decoration:underline}
+tr.nsdet>td{padding-top:0;font-size:13px}
+tr.nsdet[hidden]{display:none}
+@media print{tr.nsdet[hidden]{display:table-row!important}button.nstog::before{content:""}}
+/* collapsible sections: every h2 becomes the toggle for the block beneath it */
+/* the adoption control is sticky, so anything scrolled to must clear it - otherwise a
+   jumped-to heading lands underneath it and cannot be clicked to expand */
+.sechd,details[id]{scroll-margin-top:104px}
+.sechd{cursor:pointer;user-select:none;display:flex;align-items:center;gap:9px}
+.sechd::before{content:"";flex:none;border:solid var(--mut);border-width:0 2px 2px 0;padding:3px;margin-bottom:3px;transform:rotate(45deg);transition:transform .15s}
+.sechd[aria-expanded=false]::before{transform:rotate(-45deg)}
+.sechd:hover{color:var(--acc)}.sechd:hover::before{border-color:var(--acc)}
+.sechd:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.secbar{display:flex;gap:12px;justify-content:flex-end;margin:16px 0 -10px}
+.secbar button{font:inherit;font-size:12px;color:var(--acc);background:none;border:0;padding:0;cursor:pointer;text-decoration:underline}
+/* a printed plan is read on paper: no one can expand it, so print it whole */
+@media print{.sec[hidden]{display:block!important}.sechd::before{display:none}.secbar{display:none}}"""
+# Sorting keeps a detail row glued to the row it belongs to: the namespace appendix puts
+# each namespace's cluster list in a full-width <tr class=nsdet> beneath its row, and a
+# plain sort would scatter those across the table.
 JS = """document.querySelectorAll('table.sort').forEach(function(t){t.querySelectorAll('th').forEach(function(th,i){th.addEventListener('click',function(){
 if(t.dataset.dragged==='1'){t.dataset.dragged='';return}
-var b=t.tBodies[0],r=Array.prototype.slice.call(b.rows),d=th.dataset.d==='1'?-1:1;th.dataset.d=d===1?'1':'0';
+var b=t.tBodies[0],all=Array.prototype.slice.call(b.rows),d=th.dataset.d==='1'?-1:1;th.dataset.d=d===1?'1':'0';
+var det={};all.forEach(function(x){if(x.classList.contains('nsdet'))det[x.getAttribute('data-for')]=x});
+var r=all.filter(function(x){return !x.classList.contains('nsdet')});
 r.sort(function(x,y){var a=x.cells[i].dataset.v||x.cells[i].textContent,c=y.cells[i].dataset.v||y.cells[i].textContent,na=parseFloat(a),nc=parseFloat(c);
-return(isNaN(na)||isNaN(nc)?a.localeCompare(c):na-nc)*d});r.forEach(function(x){b.appendChild(x)})})})})"""
+return(isNaN(na)||isNaN(nc)?a.localeCompare(c):na-nc)*d});
+r.forEach(function(x){b.appendChild(x);var k=x.getAttribute('data-ns');if(k&&det[k])b.appendChild(det[k])})})})})"""
+
+# Namespace rows expand to the clusters they run in. A full-width row rather than content
+# inside the first cell: that column autofits to the bare namespace name, so a list of a
+# dozen cluster names crammed into it wraps one word per line.
+JS_NSROW = """(function(){
+document.querySelectorAll('button.nstog').forEach(function(b){
+ b.addEventListener('click',function(){
+  var row=b.closest('tr'),k=row&&row.getAttribute('data-ns');if(!k)return;
+  var d=row.parentNode.querySelector('tr.nsdet[data-for="'+(window.CSS&&CSS.escape?CSS.escape(k):k)+'"]');
+  if(!d)return;
+  var open=d.hasAttribute('hidden');
+  if(open){d.removeAttribute('hidden')}else{d.setAttribute('hidden','')}
+  b.setAttribute('aria-expanded',open?'true':'false')})})
+})()"""
 
 
 # Drag-to-resize columns. The table keeps its overall width: every pixel a column
@@ -482,6 +685,51 @@ document.querySelectorAll('table').forEach(function(t,ti){
 });})();"""
 
 
+# Runs LAST, after JS_RESIZE: column widths are measured with getBoundingClientRect,
+# which reads 0 inside a hidden section, so every table must still be visible when
+# the resizer initialises. Collapse happens only once that has finished.
+JS_COLLAPSE = """(function(){
+var main=document.querySelector('main');if(!main)return;
+var CLOSED=/^(Appendix|Feedback requested)/i;
+var hs=[].slice.call(main.children).filter(function(n){return n.tagName==='H2'});
+if(!hs.length)return;
+var secs=[];
+hs.forEach(function(h,i){
+ var box=document.createElement('div');box.className='sec';box.id='sec-'+i;
+ var n=h.nextSibling;
+ while(n&&!(n.nodeType===1&&n.tagName==='H2')){var nx=n.nextSibling;box.appendChild(n);n=nx;}
+ h.parentNode.insertBefore(box,h.nextSibling);
+ h.className=(h.className?h.className+' ':'')+'sechd';
+ h.setAttribute('role','button');h.tabIndex=0;h.setAttribute('aria-controls',box.id);
+ function set(o){h.setAttribute('aria-expanded',o?'true':'false');box.hidden=!o;}
+ set(!CLOSED.test(h.textContent.trim()));
+ h.addEventListener('click',function(){set(box.hidden)});
+ h.addEventListener('keydown',function(ev){if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();set(box.hidden)}});
+ secs.push({box:box,set:set});
+});
+var bar=document.createElement('div');bar.className='secbar';
+function mk(t,o){var b=document.createElement('button');b.type='button';b.textContent=t;
+ b.addEventListener('click',function(){secs.forEach(function(s){s.set(o)})});return b}
+bar.appendChild(mk('Expand all',true));bar.appendChild(mk('Collapse all',false));
+hs[0].parentNode.insertBefore(bar,hs[0]);
+// A link into a collapsed section (the Actions table points at Action detail) must open
+// it. Driven off the anchor's own href rather than location.hash: the click path then
+// works even where the hash never updates, and it runs before the browser's own scroll,
+// so the target is already visible when that scroll lands.
+function revealId(id,scroll){if(!id)return false;
+ var t=document.getElementById(id);if(!t)return false;
+ secs.forEach(function(s){if(s.box.contains(t))s.set(true)});
+ if(t.tagName==='DETAILS')t.open=true;
+ if(scroll)t.scrollIntoView();
+ return true}
+addEventListener('hashchange',function(){revealId(location.hash.slice(1),true)});
+main.addEventListener('click',function(ev){
+ var a=ev.target&&ev.target.closest&&ev.target.closest('a[href^="#"]');
+ if(!a)return;
+ revealId(a.getAttribute('href').slice(1),false)});
+revealId(location.hash.slice(1),true);
+})()"""
+
 JS_CALC = """(function(){var D=JSON.parse(document.getElementById('plan').textContent);
 function m(v){return '$'+Math.round(v).toLocaleString('en-US')}
 function set(k,t){document.querySelectorAll('[data-calc="'+k+'"]').forEach(function(n){n.textContent=t})}
@@ -589,7 +837,10 @@ def render_html(cfg, S, facts):
         f"<div class=card><b class=h>{t}</b><ul>" + "".join(f"<li>{e(x)}</li>" for x in cf[k]) + "</ul></div>" for t, k in (("What we know", "know"), ("What we think", "think"), ("What we need from you", "need")) if cf[k]) + "</div>")
     if cf.get("grouping"):
         P.append("<h3>How grouping connects to node sizing</h3><p>" + e(cf["grouping"]) + "</p><p class=fn>Sources (PerfectScale public documentation): " + "; ".join(f'<a href="{u}">{e(n)}</a>' for n, u in GROUPING_SOURCES) + ".</p>")
-    P.append("<h2>Why each cluster's idle is what it is</h2><div class=wrap><table><thead><tr><th>Cluster</th><th>Idle</th><th>Auto-provisioned idle</th><th>On shapes where CPU requests are 5x or more of use</th><th>Long-lived pool idle</th><th>GPU pool idle</th><th>Largest driver</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in idle_rows(S)) + "</tbody></table></div>")
+    P.append("<h2>Why each cluster's idle is what it is</h2><p>" + e(IDLE_LEAD) + "</p><div class=wrap><table class=sort><thead><tr>"
+             + "".join(f"<th>{e(h)}</th>" for h in idle_headers(S)) + "</tr></thead><tbody>"
+             + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in idle_rows(S))
+             + "</tbody></table></div>" + (f"<p class=mut>{e(idle_note(S))}</p>" if idle_note(S) else ""))
     P.append("<h2>Actions</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("ID", "Phase", "Action", "Fit", "Cluster", "Value / mo", "Basis", "Lane", "Effort", "Confidence", "ROI")) + "<th>At <span data-calc='pct'>" + pf + "</span></th></tr></thead><tbody>")
     for a in S["actions"]:
         v = a["savings_monthly_usd"] or 0
@@ -611,9 +862,32 @@ def render_html(cfg, S, facts):
     P.append("<h2>Clusters</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("Cluster", "Window (d)", "Pod cost", "Waste", "Potential", "Node cost", "Node idle")) + "</tr></thead><tbody>")
     for f in facts:
         P.append(f"<tr><td>{e(f['name'])}</td><td>{f['window_days']:.0f}</td><td data-v='{f['cost']:.0f}'>{usd(f['cost'])}</td><td data-v='{f['waste']:.0f}'>{usd(f['waste'])}</td><td data-v='{f['pot']:.0f}'>{usd(f['pot'])}</td><td data-v='{f['pools']['cost']:.0f}'>{usd(f['pools']['cost'])}</td><td data-v='{f['pools']['idle']:.0f}'>{usd(f['pools']['idle'])}</td></tr>")
-    P.append("</tbody></table></div><h2>" + DECISIONS_TITLE + "</h2><p>" + e(DECISIONS_LEAD) + "</p>" + "".join(f"<h3>{e(g)}: {e(cap)}</h3><ol>" + "".join(f"<li>{e(x)}</li>" for x in lines) + "</ol>" for g, cap, lines in decision_groups(S)) + ("<h2>Appendix: evidence detail</h2><p class=mut>The statements above, with their basis and how to check each one in PerfectScale.</p><div class=wrap><table><thead><tr><th>Status</th><th>Statement</th><th>Basis</th><th>How to check</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in evidence_rows(S)) + "</tbody></table></div>") + (("<h2>Feedback requested</h2><ol>" + "".join(f"<li>{e(x)}</li>" for x in FEEDBACK_PROMPTS) + "</ol>") if cfg.get("status") else "") + "</main>")
+    nrows = namespace_rows(S)
+    ns_html = ""
+    if nrows:
+        nrec = (S["namespace_rollup"]["rows"])[:len(nrows)]
+        body = ""
+        for row, rec in zip(nrows, nrec):
+            # The cluster list gets a full-width row of its own, tied to its namespace by
+            # data-ns / data-for. The sort script re-pairs them, so reordering the table
+            # cannot separate a namespace from its clusters. data-v keeps the sort keyed on
+            # the bare name rather than anything rendered around it.
+            tag = f" <span class=tag>{e(NS_MANAGED_MARK)}</span>" if rec["managed"] else ""
+            body += (f"<tr data-ns='{e(rec['ns'])}'><td data-v='{e(rec['ns'])}'>"
+                     f"<button type=button class=nstog aria-expanded=false>{e(rec['ns'])}</button>{tag}</td>"
+                     + "".join(f"<td class=num>{e(c)}</td>" for c in row[1:]) + "</tr>")
+            body += (f"<tr class=nsdet data-for='{e(rec['ns'])}' hidden><td colspan={len(NS_COLS)}>"
+                     f"<span class=mut>Runs in {rec['n_clusters']} cluster"
+                     f"{'' if rec['n_clusters'] == 1 else 's'}: {e(', '.join(rec['clusters']))}</span></td></tr>")
+        ns_html = ("<h2>" + e(NS_TITLE) + "</h2><p>" + e(NS_LEAD) + "</p>"
+                   + "<p class=mut>Click a namespace to see which clusters it runs in.</p>"
+                   + "<div class=wrap><table class=sort><thead><tr>"
+                   + "".join(f"<th>{e(h)}</th>" for h in NS_COLS) + "</tr></thead><tbody>"
+                   + body + "</tbody></table></div><p class=mut>" + e(namespace_note(S))
+                   + "</p><p class=fn>" + e(NS_LEGEND) + " " + e(NS_FOOT) + "</p>")
+    P.append("</tbody></table></div>" + "<h2>" + DECISIONS_TITLE + "</h2><p>" + e(DECISIONS_LEAD) + "</p>" + "".join(f"<h3>{e(g)}: {e(cap)}</h3><ol>" + "".join(f"<li>{e(x)}</li>" for x in lines) + "</ol>" for g, cap, lines in decision_groups(S)) + ns_html + ("<h2>Appendix: evidence detail</h2><p class=mut>The statements above, with their basis and how to check each one in PerfectScale.</p><div class=wrap><table><thead><tr><th>Status</th><th>Statement</th><th>Basis</th><th>How to check</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in evidence_rows(S)) + "</tbody></table></div>") + (("<h2>Feedback requested</h2><ol>" + "".join(f"<li>{e(x)}</li>" for x in FEEDBACK_PROMPTS) + "</ol>") if cfg.get("status") else "") + "</main>")
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{e(cfg['customer'])} Optimization Plan</title>"
-            f"<style>{CSS}</style></head><body>{''.join(P)}<script type=application/json id=plan>{json.dumps(CALC)}</script><script>{JS};{JS_CALC};{JS_RESIZE}</script></body></html>")
+            f"<style>{CSS}</style></head><body>{''.join(P)}<script type=application/json id=plan>{json.dumps(CALC)}</script><script>{JS};{JS_CALC};{JS_RESIZE};{JS_NSROW};{JS_COLLAPSE}</script></body></html>")
 
 
 # ---------------------------------------------------------------- XLSX / CSV
@@ -667,6 +941,30 @@ def render_tables(cfg, S, facts, out_dir):
     w2.append(["cluster", "window_days", "scale_factor", "pod_cost", "pod_waste", "potential", "node_cost", "node_idle", "automation_actions"])
     for f in facts:
         w2.append([f["name"], round(f["window_days"], 1), round(f["factor"], 3), round(f["cost"]), round(f["waste"]), round(f["pot"]), round(f["pools"]["cost"]), round(f["pools"]["idle"]), f["audit"]["n"]])
+    # Namespaces: the plan re-cut by who owns it. Unlike the prose appendix this is not
+    # capped - the sheet is where someone pivots to find their own namespace, and a row
+    # missing because it ranked 41st is the one failure that makes the sheet untrustworthy.
+    nr = S.get("namespace_rollup") or {}
+    if nr.get("rows"):
+        NSCOLS = ["namespace", "platform_managed", "clusters", "cluster_names", "workloads",
+                  "cost", "waste", "potential_savings", "at_risk", "oom", "resiliency_likely", "resiliency_literal"]
+        wn = wb.create_sheet("Namespaces")
+        wn.append(NSCOLS)
+        for r in nr["rows"]:
+            wn.append([r["ns"], "yes" if r["managed"] else "", r["n_clusters"], ", ".join(r["clusters"]),
+                       r["n"], r["cost"], r["waste"], r["pot"], r["risk_n"], r["oom_n"],
+                       r["res_likely"], r["res_literal"]])
+        for c in wn[1]:
+            c.font = Font(bold=True)
+        wn.freeze_panes = "A2"; wn.auto_filter.ref = wn.dimensions
+        for col, wd in zip("ABCDEFGHIJKL", (30, 16, 9, 46, 10, 10, 10, 16, 8, 6, 16, 16)):
+            wn.column_dimensions[col].width = wd
+        ns_dollars = [i + 1 for i, c in enumerate(NSCOLS)
+                      if c in ("cost", "waste", "potential_savings", "resiliency_likely", "resiliency_literal")]
+        for row in wn.iter_rows(min_row=2, min_col=min(ns_dollars), max_col=max(ns_dollars)):
+            for c in row:
+                if c.column in ns_dollars:
+                    c.number_format = '"$"#,##0'
     w3 = wb.create_sheet("Top workloads")
     w3.append(["cluster", "workload", "namespace", "lane", "cpu_now", "cpu_rec", "waste", "potential"])
     for f in facts:

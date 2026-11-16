@@ -38,6 +38,11 @@ def verify(cfg, S, facts, files):
         else:
             chk(cost + 1 >= f["cost_o"], f"{f['name']}: model cost does not exceed raw cost")
         chk(abs(f["cost"] - f["cost_o"] * f["factor"]) < 1, f"{f['name']}: scaling = observed x factor")
+        ns_waste = sum(n["waste"] for n in f["namespaces"])
+        chk(abs(ns_waste - f["waste"]) <= max(1, 0.01 * f["waste"]), f"{f['name']}: namespace waste sums to cluster waste")
+        ns_res = sum(n["res_likely"] for n in f["namespaces"])
+        res_total = f["res_oom"]["likely"] + f["res_other"]["likely"]
+        chk(abs(ns_res - res_total) <= max(1, 0.01 * res_total), f"{f['name']}: namespace resiliency likely sums to res_oom + res_other")
     # 2. money bases add up from actions, and are not mixed
     A = S["actions"]
     for basis, key in (("achievable_now", "achievable_now_monthly"), ("blocked_pending", "blocked_pending_monthly"), ("resiliency_investment", "resiliency_investment_monthly")):
@@ -123,6 +128,23 @@ def verify(cfg, S, facts, files):
                 chk("beforebegin" in t, f"{p.name}: the table control bar sits above its table")
                 chk(not re.search(r"(?:^|[,{;}])\s*th\b[^{};]*\{[^{}]*white-space:\s*nowrap", t),
                     f"{p.name}: header cells wrap instead of overlapping the next column")
+            if "optimization-plan" in p.name:
+                # Collapsible sections, same contract as the table controls: each line is
+                # something that silently stops working if the markup, CSS or script drifts.
+                # Scoped to the plan: the executive summary is a deliberate one-pager and
+                # has nothing to collapse.
+                chk("sechd" in t and "aria-expanded" in t,
+                    f"{p.name}: h2 sections are collapsible toggles")
+                chk("Expand all" in t and "Collapse all" in t,
+                    f"{p.name}: sections carry expand-all and collapse-all")
+                chk("hashchange" in t,
+                    f"{p.name}: a link into a collapsed section opens it")
+                chk(re.search(r"@media print\{[^}]*\.sec\[hidden\]\{display:block", t),
+                    f"{p.name}: collapsed sections print expanded")
+                # the resizer measures with getBoundingClientRect, which reads 0 inside a
+                # hidden section, so collapse must initialise after it
+                chk(t.find("JS_COLLAPSE") == -1 and t.rfind("var CLOSED=") > t.rfind("var MIN=44"),
+                    f"{p.name}: sections collapse after column widths are measured")
         # (A `"nan" not in re.findall(r"\$[^\s|]*", t)` check used to sit here too: findall with that
         # pattern only ever returns tokens starting with "$", so a bare "nan" could never appear in its
         # result - provably dead. The "$nan"/"$inf" checks below are the real, live coverage.)

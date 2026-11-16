@@ -104,6 +104,20 @@ class T(unittest.TestCase):
         ok, errs = verify.verify(self.cfg, self.S, self.F, files)
         self.assertEqual(errs, [])
 
+    def test_findings_top_namespaces_table(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        finding = [f for f in files if f.suffix == ".md" and f.name.startswith("acme-prod-a-findings")][0]
+        t = finding.read_text(encoding="utf-8")
+        self.assertIn("## Top namespaces", t)
+        self.assertIn("At risk", t)
+        self.assertIn("Resiliency spend (likely)", t)
+        self.assertIn("data", t)                                    # the namespace carrying the OOM workload
+        table = t.split("## Top namespaces")[1].split("## Largest opportunities")[0]
+        rows = [L for L in table.splitlines() if L.startswith("| ") and "---" not in L and "Namespace" not in L]
+        self.assertLessEqual(len(rows), 10)
+        ok, errs = verify.verify(self.cfg, self.S, self.F, files)
+        self.assertEqual(errs, [])
+
     def test_executive_summary_is_a_standard_output(self):
         files = render.write_all(self.cfg, self.S, self.F)
         if shutil.which("node") is None:
@@ -463,6 +477,223 @@ class T(unittest.TestCase):
         c = self.by["commitments"]
         self.assertEqual(c["action_type"], "commitment_realignment")
         self.assertTrue(c["depends_on"])
+
+    # ---------------------------------------------------------- collapsible sections
+    def _plan_html(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        return [f for f in files if f.suffix == ".html" and "optimization-plan" in f.name][0]
+
+    def test_html_sections_are_collapsible(self):
+        t = self._plan_html().read_text(encoding="utf-8")
+        for needle in ("sechd", "aria-expanded", "aria-controls", "Expand all", "Collapse all", "hashchange"):
+            self.assertIn(needle, t, needle)
+
+    def test_collapse_initialises_after_the_column_resizer(self):
+        # the resizer measures with getBoundingClientRect, which reads 0 inside a hidden
+        # section; collapsing first would bake in useless equal-width columns
+        t = self._plan_html().read_text(encoding="utf-8")
+        self.assertGreater(t.rfind("var CLOSED="), t.rfind("var MIN=44"))
+
+    def test_collapsed_sections_print_expanded(self):
+        t = self._plan_html().read_text(encoding="utf-8")
+        self.assertRegex(t, r"@media print\{[^}]*\.sec\[hidden\]\{display:block")
+
+    def test_verifier_catches_collapse_regression(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        plan = [f for f in files if f.suffix == ".html" and "optimization-plan" in f.name][0]
+        ok, errs = verify.verify(self.cfg, self.S, self.F, files)
+        self.assertEqual(errs, [])
+        plan.write_text(plan.read_text(encoding="utf-8").replace("Collapse all", "x"), encoding="utf-8")
+        ok, errs = verify.verify(self.cfg, self.S, self.F, files)
+        self.assertTrue(any("expand-all" in e for e in errs), errs)
+
+    def test_executive_summary_is_not_required_to_collapse(self):
+        # it is a deliberate one-pager; the collapse contract must not leak onto it
+        files = render.write_all(self.cfg, self.S, self.F)
+        ok, errs = verify.verify(self.cfg, self.S, self.F, files)
+        self.assertFalse([e for e in errs if "executive-summary" in e], errs)
+
+    # ---------------------------------------------------------- idle breakdown
+    def test_idle_table_drops_columns_that_split_nothing(self):
+        S = copy.deepcopy(self.S)
+        for c in S["cluster_idle"]:                     # a tenant with only long-lived idle
+            c["auto_provisioned"] = 0; c["ap_inflated_share"] = 0
+            c["gpu"] = 0; c["long_lived"] = c["idle"]
+        for c in S["cluster_idle"]:                     # ...and one driver everywhere
+            c["driver"] = "long-lived node pools"; c["driver_share"] = 1.0
+        h = render.idle_headers(S)
+        for col in ("Long-lived pool idle", "Auto-provisioned idle", "GPU pool idle", "Largest driver"):
+            self.assertNotIn(col, h)
+        self.assertEqual(h, ["Cluster", "Idle", "What closes it"])
+        self.assertEqual(len(render.idle_rows(S)[0]), len(h))
+        self.assertIn("not shown", render.idle_note(S))
+
+    def test_idle_table_keeps_the_breakdown_when_it_informs(self):
+        S = copy.deepcopy(self.S)
+        c = S["cluster_idle"][0]
+        c["auto_provisioned"] = 10; c["long_lived"] = max(c["idle"] - 10, 0); c["gpu"] = 5
+        h = render.idle_headers(S)
+        for col in ("Auto-provisioned idle", "Long-lived pool idle", "GPU pool idle"):
+            self.assertIn(col, h)
+        self.assertEqual(len(render.idle_rows(S)[0]), len(h))
+
+    def test_idle_rows_name_what_closes_the_gap(self):
+        self.assertIn("What closes it", render.idle_headers(self.S))
+        ids = {a["id"] for a in self.S["actions"]}
+        named = False
+        for row, c in zip(render.idle_rows(self.S), self.S["cluster_idle"]):
+            cell = row[-1]
+            for i in c.get("fix_ids") or []:
+                self.assertIn(i, ids, "idle table must point at actions that exist")
+                self.assertIn(i, cell)
+                named = True
+            # no dollars here: an estimate printed beside an idle measurement invites
+            # subtracting two money bases the plan works hard to keep apart
+            self.assertNotIn("$", cell)
+        self.assertTrue(named, "at least one cluster should name a fix")
+
+    def test_idle_fixes_are_infrafit_actions_for_that_cluster(self):
+        by_id = {a["id"]: a for a in self.S["actions"]}
+        for c in self.S["cluster_idle"]:
+            uid = next(f["uid"] for f in self.F if f["name"] == c["cluster"])
+            for i in c.get("fix_ids") or []:
+                self.assertEqual(by_id[i]["fit"], "InfraFit")
+                self.assertIn(uid, by_id[i]["cluster_uids"])
+
+    # ---------------------------------------------------------- namespace appendix
+    def test_namespace_rollup_aggregates_one_row_per_name(self):
+        nr = self.S["namespace_rollup"]
+        self.assertTrue(nr["rows"])
+        names = [r["ns"] for r in nr["rows"]]
+        self.assertEqual(len(names), len(set(names)), "a namespace name must appear once")
+        # rows holds every namespace; n_shown is only how many the prose documents print
+        self.assertEqual(nr["n_total"], len(nr["rows"]))
+        self.assertLessEqual(nr["n_shown"], nr["n_total"])
+
+    def test_namespace_rollup_reconciles_to_the_cluster_facts(self):
+        # the appendix re-cuts the same money by owner; it must not invent or lose any
+        want = sum(r["pot"] for f in self.F for r in f["namespaces"])
+        got = self.S["namespace_rollup"]["totals"]["pot"]
+        self.assertLessEqual(abs(got - want), len(self.F) + 2, f"{got} vs {want}")
+
+    def test_namespace_rollup_counts_clusters_not_rows(self):
+        for r in self.S["namespace_rollup"]["rows"]:
+            self.assertGreaterEqual(r["n_clusters"], 1)
+            self.assertEqual(r["n_clusters"], len(r["clusters"]))
+            self.assertLessEqual(r["n_clusters"], len(self.F))
+
+    def test_namespace_rollup_ranked_by_potential_plus_resiliency(self):
+        rows = self.S["namespace_rollup"]["rows"]
+        keys = [r["pot"] + r["res_likely"] for r in rows]
+        self.assertEqual(keys, sorted(keys, reverse=True))
+
+    def test_namespace_appendix_rendered_in_md_and_html(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        md = [f for f in files if f.suffix == ".md" and "optimization-plan" in f.name][0]
+        mt = md.read_text(encoding="utf-8")
+        self.assertIn(render.NS_TITLE, mt)
+        top = self.S["namespace_rollup"]["rows"][0]["ns"]
+        self.assertIn(top, mt)
+        self.assertIn(render.NS_TITLE, self._plan_html().read_text(encoding="utf-8"))
+
+    def test_namespace_appendix_states_it_does_not_add_to_the_actions(self):
+        # re-cutting the same dollars by owner invites double counting; say so in the doc
+        self.assertIn("does not add to it", self._plan_html().read_text(encoding="utf-8"))
+
+    def test_namespace_row_expands_to_its_clusters(self):
+        t = self._plan_html().read_text(encoding="utf-8")
+        self.assertIn("button type=button class=nstog", t)
+        self.assertIn("Click a namespace to see which clusters", t)
+        rec = self.S["namespace_rollup"]["rows"][0]
+        self.assertIn(f"data-ns='{rec['ns']}'", t)
+        self.assertIn(f"class=nsdet data-for='{rec['ns']}' hidden", t)
+        self.assertIn(", ".join(rec["clusters"]), t)
+        # sorting reads data-v; it must be the bare name
+        self.assertIn(f"data-v='{rec['ns']}'", t)
+
+    def test_sort_keeps_detail_rows_with_their_namespace(self):
+        # a plain sort would scatter the nsdet rows across the table
+        t = self._plan_html().read_text(encoding="utf-8")
+        self.assertIn("nsdet", t.split("querySelectorAll('table.sort')", 1)[1][:800])
+        self.assertIn("data-for", t.split("querySelectorAll('table.sort')", 1)[1][:800])
+
+    def test_namespace_detail_rows_span_the_table(self):
+        # the point of a detail row: the first column autofits to the bare name, so a
+        # dozen cluster names crammed into it would wrap one word per line
+        t = self._plan_html().read_text(encoding="utf-8")
+        self.assertIn(f"colspan={len(render.NS_COLS)}", t)
+
+    def test_markdown_lists_clusters_per_namespace(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        md = [f for f in files if f.suffix == ".md" and "optimization-plan" in f.name][0]
+        mt = md.read_text(encoding="utf-8")
+        self.assertIn("Which clusters each namespace runs in", mt)
+        rec = self.S["namespace_rollup"]["rows"][0]
+        self.assertIn(f"`{rec['ns']}` - {', '.join(rec['clusters'])}", mt)
+
+    def test_managed_marker_is_named_not_a_bare_asterisk(self):
+        # an unexplained "*" in a table is a question the reader cannot answer
+        files = render.write_all(self.cfg, self.S, self.F)
+        md = [f for f in files if f.suffix == ".md" and "optimization-plan" in f.name][0]
+        mt = md.read_text(encoding="utf-8")
+        body = mt.split(render.NS_TITLE, 1)[1].split("## Appendix: evidence", 1)[0]
+        self.assertNotIn(" *", body.replace(render.NS_LEGEND, ""))
+        if any(r["managed"] for r in self.S["namespace_rollup"]["rows"][:self.S["namespace_rollup"]["n_shown"]]):
+            self.assertIn(render.NS_MANAGED_MARK, body)
+        self.assertIn(render.NS_MANAGED_MARK, render.NS_LEGEND)
+
+    def test_namespace_total_reconciles_to_achievable_plus_held_out(self):
+        # the table sums to full pod potential, not to the headline achievable figure;
+        # the gap is the platform-managed namespaces, and the doc must say so
+        nr, S = self.S["namespace_rollup"], self.S
+        gap = nr["totals"]["pot"] - S["totals"]["achievable_now_monthly"]
+        self.assertLessEqual(abs(gap - S["pod"]["managed_held_out"]), nr["n_total"] + 2)
+        note = render.namespace_note(S)
+        self.assertIn(usd(nr["totals"]["pot"]), note)
+        self.assertIn(usd(S["pod"]["managed_held_out"]), note)
+
+    def test_prose_appendix_is_capped_but_the_sheet_is_not(self):
+        nr = self.S["namespace_rollup"]
+        self.assertGreater(nr["n_total"], nr["n_shown"], "fixture should exercise the cap")
+        self.assertEqual(len(render.namespace_rows(self.S)), nr["n_shown"])
+        self.assertIsNotNone(nr["truncated"])
+        self.assertEqual(nr["truncated"]["n"], nr["n_total"] - nr["n_shown"])
+
+    def test_namespaces_sheet_holds_every_namespace(self):
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            self.skipTest("openpyxl not installed")
+        files = render.write_all(self.cfg, self.S, self.F)
+        xp = [f for f in files if f.suffix == ".xlsx"][0]
+        wb = load_workbook(xp)
+        self.assertIn("Namespaces", wb.sheetnames)
+        ws = wb["Namespaces"]
+        nr = self.S["namespace_rollup"]
+        # every namespace, not just the ones the prose appendix prints
+        self.assertEqual(ws.max_row - 1, nr["n_total"])
+        self.assertGreater(ws.max_row - 1, nr["n_shown"])
+        header = [c.value for c in ws[1]]
+        for col in ("namespace", "clusters", "potential_savings", "resiliency_likely", "platform_managed"):
+            self.assertIn(col, header)
+        # the sheet must carry numbers, not the doc's "$1,234" / "-" display strings
+        pot = ws.cell(row=2, column=header.index("potential_savings") + 1).value
+        self.assertIsInstance(pot, (int, float))
+        risk = ws.cell(row=2, column=header.index("at_risk") + 1).value
+        self.assertIsInstance(risk, int)
+
+    def test_namespaces_sheet_reconciles_with_the_appendix(self):
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            self.skipTest("openpyxl not installed")
+        files = render.write_all(self.cfg, self.S, self.F)
+        wb = load_workbook([f for f in files if f.suffix == ".xlsx"][0])
+        ws = wb["Namespaces"]
+        header = [c.value for c in ws[1]]
+        ci = header.index("potential_savings") + 1
+        total = sum(ws.cell(row=r, column=ci).value or 0 for r in range(2, ws.max_row + 1))
+        self.assertLessEqual(abs(total - self.S["namespace_rollup"]["totals"]["pot"]), 2)
 
 
 if __name__ == "__main__":

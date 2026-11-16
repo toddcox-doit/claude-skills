@@ -136,6 +136,17 @@ class TestModel(Base):
         self.assertGreater(r["literal"], 0)
         self.assertGreater(a["res_oom_top_share"], 0.9)     # one workload dominates
 
+    def test_namespace_resiliency_rollup(self):
+        a, _ = model.load_all(self.cfg, parallel=False)
+        data_ns = next(n for n in a["namespaces"] if n["ns"] == "data")
+        self.assertEqual(data_ns["risk_n"], 2)   # ingest (OOM) + worker-low, both cost_increase > 0
+        self.assertEqual(data_ns["oom_n"], 1)
+        self.assertGreater(data_ns["res_likely"], 0)
+        self.assertLessEqual(data_ns["res_likely"], data_ns["res_literal"])
+        # reconciles to the same population as the cluster-wide resiliency figures
+        self.assertEqual(sum(n["risk_n"] for n in a["namespaces"]), a["res_oom"]["n"] + a["res_other"]["n"])
+        self.assertAlmostEqual(sum(n["res_likely"] for n in a["namespaces"]), a["res_oom"]["likely"] + a["res_other"]["likely"], delta=1)
+
     def test_pool_classes_and_cross_link(self):
         a, _ = model.load_all(self.cfg, parallel=False)
         self.assertEqual(a["pools"]["ap_n"], 0)             # no auto-provisioned patterns configured

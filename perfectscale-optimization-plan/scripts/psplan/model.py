@@ -344,12 +344,12 @@ def _load(cfg, cluster, d):
     # ---- policy / type / namespace
     out["policies"] = dict(collections.Counter(x.get("optimization_policy") or "unset" for x in w))
     out["types"] = dict(collections.Counter(x["type"] for x in w))
-    ns = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "waste": 0.0, "pot": 0.0})
+    ns = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "waste": 0.0, "pot": 0.0, "risk_n": 0, "oom_n": 0, "res_likely": 0.0, "res_literal": 0.0})
     for x in w:
         a = ns[x["namespace"]]
         a["n"] += 1; a["cost"] += x["cost"]; a["waste"] += x["waste"]; a["pot"] += x["potential_savings"]
-    out["namespaces"] = sorted(({"ns": k, "n": v["n"], "cost": R(v["cost"]), "waste": R(v["waste"]), "pot": R(v["pot"]),
-                                 "waste_o": v["waste"]} for k, v in ns.items()), key=lambda r: -r["waste"])
+    # out["namespaces"] is finalized after the resiliency section below, once `ns` also
+    # carries each namespace's risk_n/oom_n/res_likely/res_literal.
 
     # ---- risk
     out["high_sev"] = sum(1 for x in w if high_sev(x))
@@ -481,6 +481,18 @@ def _load(cfg, cluster, d):
     oom = [x for x in res if has_oom(x)]
     oth = [x for x in res if not has_oom(x)]
     out["res_oom"] = rsum(oom); out["res_other"] = rsum(oth)
+
+    # fold resiliency into the same per-namespace accumulator used for cost/waste/pot above,
+    # so a namespace table can show cost, waste and resiliency side by side without a second pass
+    for x in res:
+        a = ns[x["namespace"]]
+        a["risk_n"] += 1
+        a["oom_n"] += 1 if has_oom(x) else 0
+        a["res_likely"] += x["cost_increase"] * sizing_fraction(x, T["oom_margin"], "p95")
+        a["res_literal"] += x["cost_increase"]
+    out["namespaces"] = sorted(({"ns": k, "n": v["n"], "cost": R(v["cost"]), "waste": R(v["waste"]), "pot": R(v["pot"]),
+                                 "risk_n": v["risk_n"], "oom_n": v["oom_n"], "res_likely": R(v["res_likely"]), "res_literal": R(v["res_literal"]),
+                                 "waste_o": v["waste"], "res_likely_o": v["res_likely"]} for k, v in ns.items()), key=lambda r: -r["waste"])
 
     def rrow(x):
         dd = x["derived"]

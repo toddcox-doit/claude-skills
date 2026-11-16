@@ -10,6 +10,7 @@
 - Request inflation: pools where requested/used CPU >= 5x drive machine shape; fix requests before autoscaler settings.
 - Stale opt-out annotation: Karpenter `karpenter.sh/do-not-disrupt`, CAS `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. Keep on running batch jobs.
 - Grouping is recommended only when ungrouped jobs are numerous AND carry meaningful waste (`plain_job_group_min` and `plain_job_waste_min_usd`). High-count, near-zero-cost pods such as CI build agents will not trigger it on the count alone; lower `plain_job_waste_min_usd` if you want the recommendation anyway.
+- The per-cluster findings doc's "Top namespaces" table ranks by waste + resiliency likely, not waste alone, so a namespace that is mostly an OOM-risk problem still surfaces. Its risk count and `res_likely`/`res_literal` figures are scoped to the same population as the cluster-wide `res_oom`/`res_other` figures (high-severity-or-OOM workloads with `cost_increase > 0`), using the same p95/p90 sizing-fraction formula, so the two reconcile.
 
 ## Reading the cluster list (verify before you scope)
 - `clusters list` can return records with an **empty `uid`**. These are registrations that never completed: they cannot be queried and must be excluded from the ranking. Report the count rather than quietly dropping them - a tenant that believes it has N clusters deserves to know why the tool sees fewer.

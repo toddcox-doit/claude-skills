@@ -202,6 +202,50 @@ node scripts/exec_summary.js <plan.json> <out.docx>
 node scripts/exec_summary.js <plan.json> <out.html>
 ```
 
+## Sections in the HTML
+
+Every `##` section of the plan is collapsible, so a working session can hide what
+it is not discussing. Asserted by the verifier, like the table controls:
+
+- **Click any section heading to collapse it** — or focus it and press Enter or
+  Space; it is a real `role=button` with `aria-expanded`.
+- **Expand all / Collapse all** sit above the first section.
+- Body sections start open; the two appendices and **Feedback requested** start
+  collapsed, so scrolling still reads the way the plan reads on paper.
+- A link into a collapsed section opens it, so the Actions table's links to
+  Action detail keep working, and so does a pasted `#A7` URL.
+- Printing ignores all of it: `@media print` forces every section open, since no
+  one can expand a PDF.
+
+Collapse initialises **after** the column resizer, and the verifier asserts that
+ordering. The resizer measures with `getBoundingClientRect`, which reads 0 inside
+a hidden section — collapse first and every table in an appendix freezes at
+useless equal-width columns.
+
+The executive summary is exempt: it is a deliberate one-pager with nothing to
+collapse, and the verifier scopes the contract to `*-optimization-plan-*.html`.
+
+## Analysis by namespace
+
+The plan is ordered by what you do. `Appendix: analysis by namespace` is the same
+money ordered by **who owns it** — one row per namespace name, summed across every
+cluster it runs in, so a namespace with one owner is one conversation rather than
+fifteen. Built by `Plan.namespace_rollup()`; rendered in the plan `.md`, the `.html`
+and the plan JSON as `namespace_rollup`.
+
+- Ranked by potential savings **plus** resiliency spend, so a namespace whose whole
+  problem is under-provisioning still surfaces. Waste alone would bury it.
+- Columns: clusters, workloads, cost, waste, potential savings, at-risk count, OOM
+  count, resiliency spend (likely). Platform-managed namespaces are marked `*`.
+- The prose appendix is capped at the top 40, with a line stating what the
+  remainder holds. The XLSX **Namespaces** sheet carries every namespace, with
+  raw numbers rather than display strings, plus the cluster names each one runs
+  in — a row missing because it ranked 41st is what would make the sheet
+  untrustworthy to someone looking up their own namespace.
+- **It re-cuts the actions' dollars, it does not add to them.** The appendix says so
+  in its own footnote, and a test asserts that sentence is present — a reader who
+  sums this table and the action table has double-counted.
+
 ## Tables in the HTML
 
 Standard in every rendered HTML table, and asserted by the verifier so they
