@@ -11,6 +11,16 @@
 - Stale opt-out annotation: Karpenter `karpenter.sh/do-not-disrupt`, CAS `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`. Keep on running batch jobs.
 - Grouping is recommended only when ungrouped jobs are numerous AND carry meaningful waste (`plain_job_group_min` and `plain_job_waste_min_usd`). High-count, near-zero-cost pods such as CI build agents will not trigger it on the count alone; lower `plain_job_waste_min_usd` if you want the recommendation anyway.
 - The per-cluster findings doc's "Top namespaces" table ranks by waste + resiliency likely, not waste alone, so a namespace that is mostly an OOM-risk problem still surfaces. Its risk count and `res_likely`/`res_literal` figures are scoped to the same population as the cluster-wide `res_oom`/`res_other` figures (high-severity-or-OOM workloads with `cost_increase > 0`), using the same p95/p90 sizing-fraction formula, so the two reconcile.
+- PerfectScale's automation applies resize/restart/cleanup on an ongoing basis, policy-gated, not a one-time static change — documented product behavior, safe to state plainly rather than hedge. Custom grouping is likewise a real, first-class mechanism (a stored grouping profile, or customer-set workload labels), not a workaround this plan invents — see `action-catalog.md`'s note on `custom_grouping`.
+
+## Calibrating "inferred" against documented behavior
+
+A hedge belongs only on a claim this tool genuinely can't verify — not on PerfectScale's own documented mechanics. The two bullets above were upgraded after checking an internal corpus of PerfectScale's own system architecture docs and service code (kept separate from any tenant's data; never a source for dollar figures, which still come only from `pscli`). Checked against that corpus and found to be correctly hedged as-is, not upgraded:
+
+- **Node-pool consolidation policy** (`r_pool_actions`'s pinned-pool rationale): PerfectScale does not own or expose the customer's cluster-autoscaler consolidation setting — that is the customer's own Karpenter/CA configuration, outside PerfectScale's system entirely. "The public API does not expose a consolidation policy, so the cause is inferred" is accurate, not a data gap PerfectScale could close.
+- **Why idle persists on auto-provisioned pools, and whether lowering job requests would shrink the machine shape** (the `autoprov_review` rationale and its two `inferred` evidence rows): the actual PodFit/InfraFit sizing math for job/batch workloads lives in `psc-data-provider`'s calculation code, not in the system-level architecture docs checked here. Confirming or refuting the "sized for peaks, not average" explanation would need a dedicated read of that service's recommendation logic — out of scope for this pass. Left hedged rather than guessed.
+
+Re-run this calibration when the automation or grouping mechanism changes, or when a new "inferred" claim is added that plausibly maps to documented product behavior rather than genuine data uncertainty.
 
 ## Reading the cluster list (verify before you scope)
 - `clusters list` can return records with an **empty `uid`**. These are registrations that never completed: they cannot be queried and must be excluded from the ranking. Report the count rather than quietly dropping them - a tenant that believes it has N clusters deserves to know why the tool sees fewer.

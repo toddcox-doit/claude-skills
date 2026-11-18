@@ -61,7 +61,11 @@ class T(unittest.TestCase):
 
     def test_replicated_grouping_names_the_bursty_shape_and_the_real_prefix(self):
         a = self.by["replicated_grouping"]
-        self.assertIn("inferred - cause not confirmed", a["evidence"])   # the shape claim is labelled
+        # The automation mechanism (resize/restart/cleanup, applied repeatedly) is documented
+        # PerfectScale behavior, not a guess, so this no longer carries an "inferred, cause not
+        # confirmed" tag - only the fit to this bursty pattern is the engine's own reasoning.
+        self.assertIn("resource changes on an ongoing basis", a["evidence"])
+        self.assertNotIn("inferred - cause not confirmed", a["evidence"])
         self.assertIn("tenant-", " ".join(a["steps"]))                   # filter written on the observed prefix
         self.assertIn("app-main", a["title"])
 

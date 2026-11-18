@@ -176,6 +176,21 @@ The verifier exits 1 on any failure and reports each one. Fix the cause, not the
 output. Then read the executive summary and the plan yourself before sending —
 the gates catch leaks and arithmetic, not a wrong story.
 
+**Optional: cross-check against PerfectScale's own system knowledge.** If you
+have an internal corpus of PerfectScale's architecture docs and service code
+available (never tenant data — it holds none), this is a manual reading pass,
+not an automated pipeline step: no AI runs during generation, and none of the
+dollar figures change. Read the plan's `inferred`/`not known` claims and
+remediation steps against that corpus before sending. Where a claim turns out
+to be documented product behavior rather than genuine data uncertainty, that is
+a signal to fix the *engine's* rationale text (see `methodology.md`'s
+"Calibrating 'inferred' against documented behavior" for the worked example),
+not something to patch per-run — a one-time engine fix benefits every future
+plan, a per-run edit benefits only this one and drifts from the next run's
+output. Keep the plan's own wording gate in mind: code-level findings inform
+engine rationale text, they never appear in the customer-facing plan as
+filesystem paths or internal service names.
+
 ## What a run produces
 
 Step 3 writes all of this. None of it needs a second command:

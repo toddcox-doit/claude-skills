@@ -123,6 +123,15 @@ prod cluster where PerfectScale reports eviction rather than in-place resize.
 Effort stays XS — one click is one click — and that gap is exactly why risk and
 effort are separate columns.
 
+**Note on `custom_grouping`.** This is a real, first-class product mechanism —
+not a workaround this plan invented. PerfectScale supports grouping to keep
+workload history stable across ephemeral pods or per-tenant/namespace naming
+patterns, driven either by a stored grouping profile or by customer-set
+workload labels (target workload / target workload type). Write the action's
+customer-facing step as "create a custom grouping rule," not as a vague
+"ask PerfectScale to merge these" — the mechanism exists and is configurable
+by the customer or `ps-csm` today.
+
 ---
 
 ## InfraFit — node groups, autoscaler, unevictable pods

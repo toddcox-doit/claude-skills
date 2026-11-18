@@ -356,7 +356,11 @@ class Plan:
                  else "a filter on the workload name, since the namespaces share no common stem")
         # Dormant-and-bursty is the characteristic shape of a per-tenant copy, and the reason
         # grouping plus automation beats a single static cut: only one of the two re-sizes when
-        # a tenant wakes up. Stated only when the sample actually shows it.
+        # a tenant wakes up. Stated only when the sample actually shows it. The automation
+        # mechanism itself (resize/restart/cleanup, applied repeatedly, policy-gated) is
+        # documented product behavior, not a guess - only the fit to *this* bursty pattern is
+        # this engine's own inference, so only that part is left unhedged-but-reasoned rather
+        # than carrying an "inferred, cause not confirmed" tag that would overstate the doubt.
         bursty = s["cpu_p100"] > max(s["cpu_p95"] * 10, 0.5)
         steps = [f"Confirm the shape: `{top['name']}` runs in {top['ns']:,} namespaces across {human_list(sorted(set(top['clusters'])))} "
                  f"and carries {usd(top['pot'])}/mo of PerfectScale's computed savings - {pct(top['pot'], ctl)} of everything in the automation lane.",
@@ -373,7 +377,8 @@ class Plan:
         if bursty:
             ev += (f" The copies are mostly dormant and burst when used - the largest reaches {cores(s['cpu_p100'])} cores against {cores(s['cpu_p95'])} at p95"
                    + (" and already shows CPU throttling" if s["throttled"] else "") +
-                   " - so automation with in-place resizing fits them better than one static cut (inferred - cause not confirmed).")
+                   " - automation applies resource changes on an ongoing basis rather than once, so it suits a workload"
+                   " that wakes and resizes repeatedly better than a single static cut.")
         t, r = effort("S", [])
         self.add("replicated_grouping", action_type="custom_grouping",
                  title=f"Group the {top['ns']:,} copies of `{top['name']}` into one policy" + (f", and {len(G) - 1} more repeated workload{'s' if len(G) > 2 else ''}" if len(G) > 1 else ""),
