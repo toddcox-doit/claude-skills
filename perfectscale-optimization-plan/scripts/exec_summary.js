@@ -49,12 +49,25 @@ const phase1 = S.actions.filter(a => a.phase === 1);
 // and drops the unblockers, so the one-pager would recommend a different first move than the plan.
 const byId = {};
 S.actions.forEach(function (a) { byId[a.id] = a; });
+// A plan JSON without a first_moves field at all was rendered by an older version of this skill -
+// fall back, but say so, rather than silently reproducing the exact "re-ranks by nothing in
+// particular and drops the unblockers" bug this field exists to fix. A first_moves field that is
+// *present but empty* (a tenant with zero Phase 1 actions) is not this case and needs no warning.
+const hasFirstMoves = Array.isArray(S.first_moves);
+if (!hasFirstMoves) {
+  console.error('warning: plan JSON has no first_moves field (rendered by an older version of this ' +
+    'skill) - falling back to the first three Phase 1 actions by insertion order, which can drop ' +
+    'unblockers. Re-render the plan JSON with the current engine for an accurate "What we recommend ' +
+    'first" section.');
+}
 const firstMoves = (S.first_moves || []).map(function (id) { return byId[id]; })
   .filter(Boolean);
-const openingMoves = firstMoves.length ? firstMoves : phase1.slice(0, 3);
-const lead = phase1.slice().sort(function (x, y) {
-  return (y.savings_monthly_usd || 0) - (x.savings_monthly_usd || 0); })[0] || S.actions[0];
+const openingMoves = hasFirstMoves ? firstMoves : phase1.slice(0, 3);
 const EFFORT = {XS: 'a few hours', S: 'a few days', M: 'a few weeks', L: 'about a quarter'};
+// Titles and decision text both carry Markdown code ticks around resource names for the plan's own
+// rendering. Neither the .docx nor this HTML interprets them, so they would reach an executive as
+// literal backticks if not stripped here.
+const stripTicks = s => s.replace(/`/g, '');
 function move(a) {
   var who = ROLE[a.owner_role] || 'the owning team';
   var cost = a.savings_basis === 'resiliency_investment'
@@ -62,9 +75,7 @@ function move(a) {
     : (r100(a.savings_monthly_usd) >= 100 ? 'worth ' + usd(r100(a.savings_monthly_usd)) + '/mo'
        : (a.is_unblocker ? 'no saving of its own: it clears the way for the right-sizing below'
           : 'no dollar claim yet'));
-  // Titles carry Markdown code ticks around resource names for the plan's own rendering. Neither
-  // the .docx nor this HTML interprets them, so they would reach an executive as literal backticks.
-  return [a.title.replace(/`/g, '') + '. ',
+  return [stripTicks(a.title) + '. ',
           'Led by ' + who + ', ' + (EFFORT[a.effort_tier] || 'a few weeks') + ' of work, ' + cost + '.'];
 }
 
@@ -117,7 +128,7 @@ const C = {
   sections: [
     ['What we recommend first', openingMoves.map(move)],
     ['What we need from you', S.decision_detail.slice(0, 4).map(function (d) {
-      return ['', d.text.replace(/\s+/g, ' ') +
+      return ['', stripTicks(d.text.replace(/\s+/g, ' ')) +
               (r100(d.usd) >= 100 ? ' Unlocks about ' + usd(r100(d.usd)) + ' a month.' : '')]; })],
     ['What the numbers rest on', [
       ['', 'Figures come from ' + days + ' days of measured data across ' + nClusters +

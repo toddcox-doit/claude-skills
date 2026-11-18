@@ -695,6 +695,49 @@ class T(unittest.TestCase):
         total = sum(ws.cell(row=r, column=ci).value or 0 for r in range(2, ws.max_row + 1))
         self.assertLessEqual(abs(total - self.S["namespace_rollup"]["totals"]["pot"]), 2)
 
+    # ---------------------------------------------------------- exec_summary.js
+    def _exec_summary_html(self, plan_dict):
+        import subprocess
+        plan_path = self.tmp / "es-plan.json"
+        plan_path.write_text(json.dumps(plan_dict), encoding="utf-8")
+        out_path = self.tmp / "es-out.html"
+        js = HERE.parent / "exec_summary.js"
+        r = subprocess.run(["node", str(js), str(plan_path), str(out_path)], capture_output=True, text=True)
+        return r, out_path.read_text(encoding="utf-8") if out_path.exists() else ""
+
+    def test_exec_summary_warns_when_first_moves_field_is_missing(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        plan = copy.deepcopy(self.S)
+        del plan["first_moves"]
+        r, html = self._exec_summary_html(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warning:", r.stderr)
+        self.assertIn("first_moves", r.stderr)
+
+    def test_exec_summary_silent_when_first_moves_present_including_empty(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        r, html = self._exec_summary_html(self.S)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("warning:", r.stderr)
+        plan = copy.deepcopy(self.S)
+        plan["first_moves"] = []  # a tenant with zero Phase 1 actions - legitimately empty, not missing
+        r, html = self._exec_summary_html(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("warning:", r.stderr)
+
+    def test_exec_summary_strips_backticks_from_decision_text_too(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        plan = copy.deepcopy(self.S)
+        self.assertTrue(plan["decision_detail"], "fixture must have at least one decision to mutate")
+        plan["decision_detail"][0]["text"] = "Confirm the `example-ns` namespace is in scope."
+        r, html = self._exec_summary_html(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("`", html)
+        self.assertIn("example-ns", html)
+
 
 if __name__ == "__main__":
     unittest.main()

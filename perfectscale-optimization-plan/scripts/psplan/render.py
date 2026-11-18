@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from .model import short_name
-from .util import human_list, long_date, pct, slug, usd
+from .util import cores, human_list, long_date, pct, slug, usd
 
 PHASE = {1: "Phase 1 - Foundations and quick wins", 2: "Phase 2 - Capture the savings", 3: "Phase 3 - Keep the gains"}
 BASIS = {"achievable_now": "Savings (achievable)", "blocked_pending": "Savings (pending blockers)", "resiliency_investment": "Spend (resiliency)"}
@@ -431,7 +431,7 @@ def render_cluster_md(cfg, S, f):
         L += ["", "Resiliency spend is money to add to stop workloads failing, not a saving - see the optimization plan's resiliency row.", ""]
     L += ["", "## Largest opportunities", "", "| Workload | Namespace | Lane | CPU now to rec | Waste | Potential |", "|---|---|---|---|---|---|"]
     for r in f["top"][:12]:
-        L.append(f"| {short_name(r['name'])} | {r['ns']} | {r['lane']} | {r['cpu_cur']:.1f} to {r['cpu_rec']:.1f} | {usd(r['waste'])} | {usd(r['pot'])} |")
+        L.append(f"| {short_name(r['name'])} | {r['ns']} | {r['lane']} | {cores(r['cpu_cur'])} to {cores(r['cpu_rec'])} | {usd(r['waste'])} | {usd(r['pot'])} |")
     L += ["", "## Node pools", "", "| Pool | Kind | Machine | Nodes min/avg/max | Idle | Cost | Recommendation |", "|---|---|---|---|---|---|---|"]
     for p in sorted(P["long_lived"], key=lambda p: -p["idle"])[:10]:
         rec = f"{p['rec']['to']} ({usd(p['rec']['save'])}/mo)" if p["rec"] else "-"

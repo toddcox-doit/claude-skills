@@ -1,5 +1,18 @@
 # Voice and Markdown template
 
+> **Note on drift:** the Markdown template below (section-by-section, including
+> `## Appendix A` / `## Appendix B` naming) predates several renderer additions
+> and no longer matches `render.py` section-for-section. The voice rules, table
+> conventions, and worksheet-column conventions below are current and enforced
+> by the verifier; treat the template body as illustrative of *tone*, not a
+> literal section map. Known differences as of this note: the actual appendix
+> headings are `## Appendix: evidence detail` and (new) `## Appendix: analysis
+> by namespace`, not `A`/`B`; the HTML plan's `<h2>` sections are collapsible
+> (expand/collapse-all, deep-linkable by hash, printed expanded) with no
+> template section describing that; a per-cluster findings doc now also
+> includes a `## Top namespaces` table. Reconciling the template fully is a
+> separate task, not folded into whatever change prompted this note.
+
 The audience is the customer's **platform/K8s engineers and FinOps lead**, in a
 room, with you screen-sharing. They are technically fluent, they are the people
 who will do the work, and they are slightly skeptical — they have seen a vendor
