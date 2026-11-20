@@ -191,6 +191,15 @@ the cost baseline is agreed. Per-kind cautions from PerfectScale's docs travel
 as comments with the config (StatefulSet restarts and dedicated nodes, DaemonSet
 decrease-only, Jobs and CronJobs picking the change up on the next pod).
 
+Every file passes yamllint's default rules, the ones a GitOps pre-commit gate
+usually runs: lines stay within 80 columns, each document starts with `---`,
+and inline comments get two spaces before `#`. A field comment sits inline when
+the whole line fits in 80 columns and moves, wrapped, to the line above when it
+does not. Values that vary per file (namespace, workload, kinds, rank) sit on
+their own short labelled header lines, so a long name cannot push the wrapped
+text over. The only line that can still exceed 80 columns is one carrying a
+Kubernetes name longer than the room left for it.
+
 Names are always double-quoted so a namespace like `123` or a workload named
 `true` stays a string. Workload config names are `<kind>-<name>` as a DNS-1123
 subdomain, so a Deployment and a StatefulSet sharing a name do not collide.
@@ -202,6 +211,8 @@ subdomain, so a Deployment and a StatefulSet sharing a name do not collide.
   node and compare their output byte-for-byte with `pov.bundle()` and
   `pov.bundle_ns()` for several selections. Another test unzips the browser ZIP
   and compares it with the same files.
+- A test runs yamllint's default config over every file both generators can
+  write, including namespace exclusions.
 - `verify.py` checks every kickoff page: its rows match the model's ranking,
   nothing managed or held out is ranked, every config sets `keepLimit: false`
   with the inline REVIEW comment, every config carries the full operational block, no config enables an increase, the namespace

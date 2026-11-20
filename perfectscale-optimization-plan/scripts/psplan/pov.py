@@ -28,6 +28,7 @@ Nothing is applied. The page writes text files; the customer reviews and applies
 """
 import json
 import re
+import textwrap
 from datetime import date
 
 from .model import POLICY_UNDER, POV_CR_TYPES
@@ -41,23 +42,45 @@ API = "perfectscale.io/v1"
 # change from a cost-only config, so it starts unticked; the risk is fixed on its own.
 AUTOMATION_MIN_USD = 5
 
-# The one line the user asked to carry a review comment. A full comment block above the key, plus
-# a short inline marker (two spaces before '#', per YAML convention) so it is seen in a diff too.
-KEEP_LIMIT_NOTE = (
-    "REVIEW: keepLimit is false so PerfectScale can remove the CPU limit; a right-sized CPU",
-    "request is then not throttled by a leftover limit. Set it to true if a ResourceQuota on",
-    "limits.cpu, a LimitRange, or an internal policy requires every container to keep a CPU limit.",
-)
+# Every generated line fits in WIDTH columns, yamllint's default line-length, so the files pass a
+# stock yamllint/pre-commit gate in a customer's GitOps pipeline. The only lines that can exceed it
+# are ones that carry a Kubernetes name longer than the room left for it.
+WIDTH = 80
+
+
+def _cm(ind, text):
+    """A comment paragraph wrapped to WIDTH at this indent."""
+    return "".join(" " * ind + "# " + x + "\n"
+                   for x in textwrap.wrap(text, WIDTH - ind - 2, break_long_words=False, break_on_hyphens=False))
+
+
+def _kv(ind, text, comment=None):
+    """One YAML line. Its comment goes inline (two spaces before '#', per YAML convention) when the
+    whole line fits in WIDTH, otherwise on the line(s) directly above it."""
+    line = " " * ind + text
+    if not comment:
+        return line + "\n"
+    if len(line) + 4 + len(comment) <= WIDTH:
+        return f"{line}  # {comment}\n"
+    return _cm(ind, comment) + line + "\n"
+
+
+# The one line the user asked to carry a review comment: the full note wrapped directly above the
+# key, plus a short inline marker that stays on the line itself so it is seen in a diff too.
+KEEP_LIMIT_NOTE = ("REVIEW: keepLimit is false so PerfectScale can remove the CPU limit; a right-sized "
+                   "CPU request is then not throttled by a leftover limit. Set it to true if a "
+                   "ResourceQuota on limits.cpu, a LimitRange, or an internal policy requires every "
+                   "container to keep a CPU limit.")
 KEEP_LIMIT_LINE = "keepLimit: false  # REVIEW: see the note above before applying"
 
 # Per-kind cautions, taken from PerfectScale's own docs and example files for that kind.
 TYPE_NOTE = {
-    "StatefulSet": ("StatefulSet: agree who watches restarts of production databases first - pods",
-                    "with persistent volumes are more fragile - and if it runs on dedicated nodes,",
-                    "smaller requests will not lower the node bill."),
-    "DaemonSet": ("DaemonSet: automated decrease-only - requests go down, never up.",),
-    "CronJob": ("CronJob: running pods are not restarted; the next run picks up the change.",),
-    "Job": ("Job: running pods are not restarted; only new pods pick up the change.",),
+    "StatefulSet": ("StatefulSet: agree who watches restarts of production databases first - pods with "
+                    "persistent volumes are more fragile - and if it runs on dedicated nodes, smaller "
+                    "requests will not lower the node bill."),
+    "DaemonSet": "DaemonSet: automated decrease-only - requests go down, never up.",
+    "CronJob": "CronJob: running pods are not restarted; the next run picks up the change.",
+    "Job": "Job: running pods are not restarted; only new pods pick up the change.",
 }
 
 
@@ -86,55 +109,61 @@ def _operational(kind, ind):
     keepLimit: false. Field placement is checked against the chart's CRD schemas
     (charts/psc-autoscaler/crds). Deprecated fields (maintenanceWindowIgnoredForResiliency,
     maxAutomationFrequency) are left out, as the docs direct."""
-    lines = [
-        'automationMode: "Enabled"  # automate this scope',
-        'automationStrategy: "inPlace"  # resize pods in place; "evictMutate" recreates them instead',
-        'podResizePendingStrategy: "rollingRestart"  # if an in-place resize cannot fit: rolling restart; or "deleteRecreatePendingPod"',
-        "duringRolloutInProgress: pause  # hold new recommendations while concurrent ReplicaSets exist",
-        "timeConstraints:",
-        f'  wasteMaxAutomationFrequency: "{WASTE_FREQ.get(kind, "30m")}"  # apply resource decreases at most this often',
-        '  fixResiliencyMaxAutomationFrequency: "30m"  # apply resource increases at most this often',
-        "  maintenanceWindow:  # when automation may act; narrow to the customer's change window if required",
-        *(x for d in DAYS for x in (f"    {d}:", '      - "00:00-23:59"')),
-        "  maintenanceWindowIgnoredMinResiliencyLevel: None  # lowest risk level allowed to act outside the window",
-        "restrictions:",
-        "  workloadMinWasteUSDPerMonth: 5  # act only when monthly waste exceeds $5",
-        "  cpuManagement:",
-        "    request:",
-        "      increaseEnabled: false  # cost optimization: never raise CPU requests",
-        "      decreaseEnabled: true  # lower CPU requests to remove waste",
-        "      minimumCores: -1  # floor for a recommendation; -1 = none",
-        "      maximumCores: -1  # ceiling for a recommendation; -1 = none",
-        "      cpuRunawayDetection:",
-        "        maxCpuRequestIncreaseIterations:",
-        "          daily: 3  # at most 3 CPU request increases per day",
-        "          weekly: 6  # at most 6 per week",
-        "    limit:",
-        *("      # " + x for x in KEEP_LIMIT_NOTE),
-        "      " + KEEP_LIMIT_LINE,
-        "  memoryManagement:",
-        "    request:",
-        "      increaseEnabled: false  # cost optimization: never raise memory requests",
-        "      decreaseEnabled: true  # lower memory requests to remove waste",
-        "      minimumGiB: -1  # floor for a recommendation; -1 = none",
-        "      maximumGiB: -1  # ceiling for a recommendation; -1 = none",
-        "    limit:",
-        "      increaseEnabled: false  # leave memory limits as they are",
-        "      decreaseEnabled: false",
-        "      minimumGiB: -1",
-        "      maximumGiB: -1",
-        "      memoryLeakDetection:",
-        "        maxMemoryIncreaseIterations:",
-        "          daily: 3  # at most 3 memory limit increases per day",
-        "          weekly: 6  # at most 6 per week",
+    rows = [
+        (0, 'automationMode: "Enabled"', "automate this scope"),
+        (0, 'automationStrategy: "inPlace"', 'resize pods in place; "evictMutate" recreates them'),
+        (0, 'podResizePendingStrategy: "rollingRestart"',
+         'when an in-place resize cannot fit: rolling restart, or "deleteRecreatePendingPod"'),
+        (0, "duringRolloutInProgress: pause", "hold new recommendations while concurrent ReplicaSets exist"),
+        (0, "timeConstraints:", None),
+        (2, f'wasteMaxAutomationFrequency: "{WASTE_FREQ.get(kind, "30m")}"', "apply decreases at most this often"),
+        (2, 'fixResiliencyMaxAutomationFrequency: "30m"', "apply increases at most this often"),
+        (2, "maintenanceWindow:", "when automation may act; narrow to the customer's change window if required"),
+        *(x for d in DAYS for x in ((4, f"{d}:", None), (6, '- "00:00-23:59"', None))),
+        (2, "maintenanceWindowIgnoredMinResiliencyLevel: None", "lowest risk level allowed to act outside the window"),
+        (0, "restrictions:", None),
+        (2, "workloadMinWasteUSDPerMonth: 5", "act only when monthly waste exceeds $5"),
+        (2, "cpuManagement:", None),
+        (4, "request:", None),
+        (6, "increaseEnabled: false", "cost optimization: never raise CPU requests"),
+        (6, "decreaseEnabled: true", "lower CPU requests to remove waste"),
+        (6, "minimumCores: -1", "floor for a recommendation; -1 = none"),
+        (6, "maximumCores: -1", "ceiling for a recommendation; -1 = none"),
+        (6, "cpuRunawayDetection:", None),
+        (8, "maxCpuRequestIncreaseIterations:", None),
+        (10, "daily: 3", "at most 3 CPU request increases per day"),
+        (10, "weekly: 6", "at most 6 per week"),
+        (4, "limit:", None),
+        (6, None, None),                                   # keepLimit, with its review note
+        (2, "memoryManagement:", None),
+        (4, "request:", None),
+        (6, "increaseEnabled: false", "cost optimization: never raise memory requests"),
+        (6, "decreaseEnabled: true", "lower memory requests to remove waste"),
+        (6, "minimumGiB: -1", "floor for a recommendation; -1 = none"),
+        (6, "maximumGiB: -1", "ceiling for a recommendation; -1 = none"),
+        (4, "limit:", None),
+        (6, "increaseEnabled: false", "leave memory limits as they are"),
+        (6, "decreaseEnabled: false", None),
+        (6, "minimumGiB: -1", None),
+        (6, "maximumGiB: -1", None),
+        (6, "memoryLeakDetection:", None),
+        (8, "maxMemoryIncreaseIterations:", None),
+        (10, "daily: 3", "at most 3 memory limit increases per day"),
+        (10, "weekly: 6", "at most 6 per week"),
     ]
-    return "".join(" " * ind + x + "\n" for x in lines)
+    out = []
+    for rel, text, comment in rows:
+        if text is None:
+            out.append(_cm(ind + rel, KEEP_LIMIT_NOTE) + " " * (ind + rel) + KEEP_LIMIT_LINE + "\n")
+        else:
+            out.append(_kv(ind + rel, text, comment))
+    return "".join(out)
 
 
 def ns_type_block(t):
     """One workloadTypes entry of a NamespaceAutomationConfig. Identical for every namespace, so the
     page embeds it once per kind and the browser appends the ones a namespace needs."""
-    return ("".join("      # " + n + "\n" for n in TYPE_NOTE.get(t, ()))
+    return ((_cm(6, TYPE_NOTE[t]) if t in TYPE_NOTE else "")
             + f"      {t}:\n        operational:\n" + _operational(t, 10))
 
 
@@ -148,7 +177,7 @@ def namespace_doc(ns, types):
 
 def workload_doc(r):
     t = r["type"]
-    return ("".join("# " + n + "\n" for n in TYPE_NOTE.get(t, ()))
+    return ((_cm(0, TYPE_NOTE[t]) if t in TYPE_NOTE else "")
             + f"apiVersion: {API}\nkind: WorkloadAutomationConfig\nmetadata:\n"
             f"  name: {q(cr_name(r))}\n  namespace: {q(r['ns'])}\n"
             f"spec:\n  targetRef:\n    kind: {t}\n    name: {q(r['name'])}\n"
@@ -157,43 +186,52 @@ def workload_doc(r):
 
 def cluster_doc():
     types = "".join(f"      {t}:\n        operational:\n          automationMode: \"Disabled\"\n" for t in POV_CR_TYPES)
-    return (f"apiVersion: {API}\nkind: ClusterAutomationConfig\nmetadata:\n  name: cluster-automation-config\n"
+    return (f"---\napiVersion: {API}\nkind: ClusterAutomationConfig\nmetadata:\n  name: cluster-automation-config\n"
             "spec:\n  automation:\n    operational:\n"
-            "      stopAllAutomation: false  # global kill switch: true pauses all automation\n"
-            "      cleanupAllAutomation: false  # true stops automation and reverts every change it made\n"
-            "    # Disabled at cluster scope on purpose: namespace settings override cluster settings and\n"
-            "    # workload settings override both, so automation runs only where the namespace and\n"
-            "    # workload files enable it - the POV scope, and nothing outside it.\n"
-            "    workloadTypes:\n" + types)
+            + _kv(6, "stopAllAutomation: false", "global kill switch: true pauses all automation")
+            + _kv(6, "cleanupAllAutomation: false", "true stops automation and reverts every change it made")
+            + _cm(4, "Disabled at cluster scope on purpose: namespace settings override cluster settings and "
+                     "workload settings override both, so automation runs only where the namespace and workload "
+                     "files enable it - the POV scope, and nothing outside it.")
+            + "    workloadTypes:\n" + types)
+
+
+def _para(*texts):
+    return "".join(_cm(0, t) for t in texts)
 
 
 def file_heads(cluster, prepared):
-    """Comment headers. __TYPES__, __NWL__, __NSNAME__ and __NEX__ are filled in for the selection
-    at generation time (here in bundle()/bundle_ns(), and in the browser by JS_BUILD/JS_BUILD_NS)."""
-    gen = f"# Cluster: {cluster}. From the POV automation kickoff table prepared {prepared}.\n"
-    tail = ("# Nothing has been applied. Review, then apply with: kubectl apply -f <this file>\n"
-            "# After applying, PerfectScale shows the merged result per workload (zoom-in, Automation\n"
-            "# Config CR, mergedConfig) - check one workload there before widening the scope.\n")
-    cost = ("# Cost-optimization profile: requests can only go down. Raising a request to fix a\n"
-            "# resiliency risk is not enabled here; turn increaseEnabled on once the POV cost baseline\n"
-            "# is agreed, so the savings and the reliability work are measured separately.\n")
+    """Comment headers, wrapped to WIDTH. Values that vary per file (__NSNAME__, __TYPES__, __NEX__,
+    __WLKIND__, __WLNAME__, __WLNS__, __WLRANK__) sit alone on short labelled lines, so filling them in
+    (here in bundle()/bundle_ns(), and in the browser by JS_BUILD/JS_BUILD_NS) cannot push wrapped prose
+    past WIDTH."""
+    gen = f"# Cluster: {cluster}\n# From the POV automation kickoff page prepared {prepared}.\n"
+    tail = ("# Nothing has been applied. Review, then apply with:\n#   kubectl apply -f <this file>\n"
+            + _para("After applying, PerfectScale shows the merged result per workload (zoom-in, Automation "
+                 "Config CR, mergedConfig) - check one workload there before widening the scope."))
+    cost = _para("Cost-optimization profile: requests can only go down. Raising a request to fix a resiliency "
+                 "risk is not enabled here; turn increaseEnabled on once the POV cost baseline is agreed, so "
+                 "the savings and the reliability work are measured separately.")
     return {
         "cluster": ("# PerfectScale automation - cluster prerequisite\n" + gen
-                    + "# Required once per cluster, and only one is allowed per cluster. Skip this file if the\n"
-                    "# cluster already has one (kubectl get clusterautomationconfig): applying it over an\n"
-                    "# existing config with the same name replaces that config's settings.\n" + tail),
-        "nsfile": ("# PerfectScale automation - namespace __NSNAME__, cost optimization\n" + gen
-                   + "# Enables __TYPES__ for every workload of those kinds in this namespace, ranked or not.\n"
-                   "# Kept out: __NEX__. Each kept-out workload has its own config below with automationMode\n"
-                   "# \"Disabled\" and the reason; workload settings override namespace settings.\n"
-                   "# A config of the same name from the workload file replaces an exclusion here, so apply\n"
-                   "# the namespace files first and the workload file after.\n"
+                    + _para("Required once per cluster, and only one is allowed per cluster. Skip this file if "
+                            "the cluster already has one (kubectl get clusterautomationconfig): applying it over "
+                            "an existing config with the same name replaces that config's settings.")
+                    + tail),
+        "nsfile": ("# PerfectScale automation - namespace scope, cost optimization\n"
+                   "# Namespace: __NSNAME__\n# Enables: __TYPES__\n# Kept out: __NEX__\n" + gen
+                   + _para("The config enables those kinds for every workload of them in this namespace, ranked "
+                           "or not. Each kept-out workload has its own config below with automationMode "
+                           "\"Disabled\" and the reason; workload settings override namespace settings.",
+                           "A config of the same name from the workload files replaces an exclusion here, so "
+                           "apply the namespace files first and the workload files after.")
                    + cost + tail),
-        "wlfile": ("# PerfectScale automation - workload __WLKIND__ __WLNAME__ in namespace __WLNS__, cost optimization\n"
-                   + gen
-                   + "# Ranked __WLRANK__ in the table. A workload config overrides any namespace config for this\n"
-                   "# workload, so this file alone automates only this workload. With namespace configs applied\n"
-                   "# as well, apply this file after them: it replaces a namespace exclusion of the same name.\n"
+        "wlfile": ("# PerfectScale automation - workload scope, cost optimization\n"
+                   "# Workload: __WLNAME__\n# Kind: __WLKIND__\n# Namespace: __WLNS__\n"
+                   "# Rank in the table: __WLRANK__\n" + gen
+                   + _para("A workload config overrides any namespace config for this workload, so this file "
+                           "alone automates only this workload. With namespace configs applied as well, apply "
+                           "this file after them: it replaces a namespace exclusion of the same name.")
                    + cost + tail),
     }
 
@@ -229,8 +267,8 @@ def exclusion_doc(ns, x):
     """A Disabled WorkloadAutomationConfig keeping one workload out of its namespace's config. Same
     metadata.name as workload_doc() would give it, so a later explicit choice in the workload file
     replaces the exclusion rather than conflicting with it."""
-    return (f"# Kept out of namespace automation: {EXCL_REASON[x['reason']]}.\n"
-            f"apiVersion: {API}\nkind: WorkloadAutomationConfig\nmetadata:\n"
+    return (_cm(0, f"Kept out of namespace automation: {EXCL_REASON[x['reason']]}.")
+            + f"apiVersion: {API}\nkind: WorkloadAutomationConfig\nmetadata:\n"
             f"  name: {q(cr_name(x))}\n  namespace: {q(ns)}\n"
             f"spec:\n  targetRef:\n    kind: {x['type']}\n    name: {q(x['name'])}\n"
             "  automation:\n    operational:\n      automationMode: \"Disabled\"\n")

@@ -108,9 +108,12 @@ class T(unittest.TestCase):
         i = next(i for i, x in enumerate(lines) if x.strip().startswith("keepLimit:"))
         self.assertEqual(lines[i].strip(), "keepLimit: false  # REVIEW: see the note above before applying")
         self.assertIn("  # REVIEW", lines[i])                   # two spaces before an inline comment
-        self.assertTrue(lines[i - 1].strip().startswith("#"))
-        self.assertIn("REVIEW", lines[i - len(pov.KEEP_LIMIT_NOTE)])
-        self.assertIn("ResourceQuota", "\n".join(lines[i - 3:i]))
+        j = i
+        while lines[j - 1].strip().startswith("#"):
+            j -= 1
+        block = " ".join(x.strip().lstrip("# ") for x in lines[j:i])  # the wrapped note directly above
+        self.assertTrue(block.startswith("REVIEW: keepLimit is false"))
+        self.assertIn("ResourceQuota on limits.cpu", block)
 
     @staticmethod
     def TEMPLATE_OPERATIONAL(waste_freq):
@@ -182,6 +185,22 @@ class T(unittest.TestCase):
         self.assertEqual(d["spec"]["targetRef"]["name"], "true")
         self.assertEqual(yaml.safe_load(pov.namespace_doc("123", ["Deployment"]))["metadata"]["namespace"], "123")
 
+    @unittest.skipIf(shutil.which("yamllint") is None, "yamllint not installed")
+    def test_every_generated_file_passes_default_yamllint(self):
+        """yamllint's default rules (80-column lines, document start, comment spacing, indentation)
+        are what a customer's GitOps pre-commit gate runs; every file either generator writes must pass."""
+        allt = list(model.POV_CR_TYPES)
+        nss = self.mixed_ns()["namespaces"] + self.prod["pov"]["namespaces"]
+        files = (pov.bundle("prod-a", "2026-11-20", self.rows, allt)
+                 + pov.bundle_ns("prod-a", "2026-11-20", nss, [n["ns"] for n in nss], allt)[1:])
+        d = self.tmp / "lint"
+        for i, (name, _, text) in enumerate(files):
+            (d / f"{i:03d}.yaml").parent.mkdir(parents=True, exist_ok=True)
+            (d / f"{i:03d}.yaml").write_text(text)
+        r = subprocess.run(["yamllint", "-d", "default", "-f", "parsable", str(d)], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "", r.stdout[:2000])
+        self.assertTrue(any("Disabled" in t for _, _, t in files))        # exclusion docs were linted too
+
     def test_cr_name_is_a_dns_subdomain_and_keeps_kinds_apart(self):
         a = pov.cr_name({"type": "Deployment", "name": "api"})
         b = pov.cr_name({"type": "StatefulSet", "name": "api"})
@@ -202,7 +221,7 @@ class T(unittest.TestCase):
             self.assertEqual(d[0]["kind"], "WorkloadAutomationConfig")
             self.assertEqual(d[0]["spec"]["targetRef"], {"kind": "StatefulSet", "name": r["name"]})
             self.assertTrue(name.startswith(f"workloads/{r['ns']}-statefulset-"))
-            self.assertIn(f"Ranked {r['rank']} in the table", text)
+            self.assertIn(f"# Rank in the table: {r['rank']}\n", text)
             self.assertNotIn("__", text)                         # every token filled
 
     def test_unticked_workloads_get_no_file(self):
@@ -258,7 +277,7 @@ class T(unittest.TestCase):
         self.assertEqual({x["spec"]["targetRef"]["name"] for x in ex}, {"hold", "javasvc"})   # db's kind is not enabled
         self.assertTrue(all(x["spec"]["automation"]["operational"]["automationMode"] == "Disabled" for x in ex))
         self.assertEqual({x["metadata"]["name"] for x in ex}, {pov.cr_name({"type": "Deployment", "name": n}) for n in ("hold", "javasvc")})
-        self.assertIn("Kept out: 2.", text)
+        self.assertIn("# Kept out: 2\n", text)
         self.assertNotIn("__", text)
 
     def test_namespace_with_none_of_the_selected_kinds_is_skipped(self):
