@@ -150,7 +150,7 @@ class TestModel(Base):
     def test_pool_classes_and_cross_link(self):
         a, _ = model.load_all(self.cfg, parallel=False)
         self.assertEqual(a["pools"]["ap_n"], 0)             # no auto-provisioned patterns configured
-        self.assertEqual(a["pools"]["ll_n"], 4)
+        self.assertEqual(a["pools"]["ll_n"], 9)   # 4 original + 5 Karpenter structural-diff fixtures
         gpu = [p for p in a["pools"]["long_lived"] if p["id"] == "karp-gpu"][0]
         self.assertTrue(gpu["gpu"])
         self.assertGreater(a["pools"]["gpu_idle_share"], 0.2)
@@ -179,6 +179,28 @@ class TestModel(Base):
         a1 = model.load_all(self.cfg, parallel=False)
         a2 = model.load_all(self.cfg, parallel=False)
         self.assertEqual(a1[0]["_fingerprint"], a2[0]["_fingerprint"])
+
+    def test_hpa_file_absent_is_unconfirmed(self):
+        # Optional enrichment (see references/eligibility-enrichment.md): absent => unconfirmed, same
+        # "optional enrichment, absent = unconfirmed" shape as eligibility_file.
+        a, _ = model.load_all(self.cfg, parallel=False)
+        self.assertFalse(a["hpa"]["provided"])
+        self.assertEqual(a["hpa"]["n_hpa"], 0)
+        self.assertEqual(a["hpa"]["workloads"], [])
+
+    def test_hpa_file_marks_matching_workload(self):
+        # "ingest"/"data" on prod-a is the fixture's dominant OOM workload (see test_resiliency_ranges_ordered).
+        hpa_path = self.tmp / "hpa.json"
+        hpa_path.write_text(json.dumps({fixtures.UIDS["prod-a"]: {"data-deployment-ingest": {"hasHpa": True, "cpuTriggerPct": 70}}}))
+        cfg = Config.load(self.src / "acme.tenant.json")
+        cfg["hpa_file"] = str(hpa_path)
+        a, b = model.load_all(cfg, parallel=False)
+        self.assertTrue(a["hpa"]["provided"])
+        self.assertEqual(a["hpa"]["n_hpa"], 1)
+        self.assertEqual(a["hpa"]["workloads"][0]["name"], "ingest")
+        self.assertEqual(a["hpa"]["workloads"][0]["namespace"], "data")
+        # a cluster with no entry in hpa_file still reports "provided: False" for itself, not a crash
+        self.assertFalse(b["hpa"]["provided"])
 
 
 class TestCollector(Base):
@@ -423,6 +445,19 @@ class TestConfigValidation(unittest.TestCase):
         self.assertNotIn("nonprod_patterns", buf.getvalue())
         self.assertNotIn("gpu_pool_patterns", buf.getvalue())
 
+    def test_native_vpa_defaults_to_none(self):
+        # Unset, like gitops: an open assumption, never guessed into a fact.
+        cfg = Config.load(self.src / "acme.tenant.json")
+        self.assertIsNone(cfg["assumptions"]["native_vpa"])
+
+    def test_native_vpa_set_value_is_readable_from_loaded_config(self):
+        p = self._write_cfg(assumptions={"native_vpa": "on the checkout namespace"})
+        cfg = Config.load(p)
+        self.assertEqual(cfg["assumptions"]["native_vpa"], "on the checkout namespace")
+        # merging a partial assumptions override must not clobber the other assumptions keys
+        self.assertIn("scope", cfg["assumptions"])
+        self.assertIn("delivery", cfg["assumptions"])
+
 
 class TestQuantityFormatting(unittest.TestCase):
     """A small non-zero request must never render as '0'.
@@ -455,6 +490,114 @@ class TestQuantityFormatting(unittest.TestCase):
     def test_rounding_cannot_cross_into_zero(self):
         # 0.49 rounds to 0 at .0f; the helper must keep it visible
         self.assertEqual(cores(0.49), "0.49")
+
+
+class TestKarpenterDiff(unittest.TestCase):
+    """Unit tests for model.diff_karpenter_config - the structural diff behind the
+    pool_karpenter_tuning action, exercised directly against minimal NodePool CR fragments
+    rather than through a full cluster fixture."""
+
+    def np(self, consolidation_policy="WhenEmpty", consolidate_after="5m", cpu_limit="64", memory_limit=None, requirements=None):
+        spec = {"disruption": {"consolidationPolicy": consolidation_policy, "consolidateAfter": consolidate_after},
+                "limits": {"cpu": cpu_limit}, "template": {"spec": {"requirements": requirements or []}}}
+        if memory_limit is not None:
+            spec["limits"]["memory"] = memory_limit
+        return {"spec": spec}
+
+    def req(self, key, values):
+        return {"key": key, "operator": "In", "values": values}
+
+    def kinds(self, changes):
+        return {c["kind"] for c in changes}
+
+    def test_no_diff_on_identical_configs(self):
+        cur = self.np()
+        self.assertEqual(model.diff_karpenter_config(cur, self.np()), [])
+
+    def test_consolidation_policy_change(self):
+        c = model.diff_karpenter_config(self.np(consolidation_policy="WhenEmpty"), self.np(consolidation_policy="WhenEmptyOrUnderutilized"))
+        self.assertEqual(self.kinds(c), {"consolidation_policy"})
+        row = c[0]
+        self.assertEqual((row["from"], row["to"]), ("WhenEmpty", "WhenEmptyOrUnderutilized"))
+
+    def test_consolidate_after_change(self):
+        c = model.diff_karpenter_config(self.np(consolidate_after="5m"), self.np(consolidate_after="30m"))
+        self.assertEqual(self.kinds(c), {"consolidate_after"})
+        self.assertEqual((c[0]["from"], c[0]["to"]), ("5m", "30m"))
+
+    def test_limits_cpu_near_exhaustion(self):
+        c = model.diff_karpenter_config(self.np(cpu_limit="64"), self.np(cpu_limit="128"))
+        self.assertEqual(self.kinds(c), {"limits_cpu"})
+        self.assertEqual((c[0]["from"], c[0]["to"]), ("64", "128"))
+
+    def test_limits_memory_newly_added_is_a_valid_change(self):
+        cur = self.np()  # no memory limit set at all
+        rec = self.np(memory_limit="384Gi")
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"limits_memory"})
+        self.assertIsNone(c[0]["from"])
+        self.assertEqual(c[0]["to"], "384Gi")
+
+    def test_static_nodepool_detection_same_key_broadened(self):
+        cur = self.np(requirements=[self.req("node.kubernetes.io/instance-type", ["m5.xlarge"])])
+        rec = self.np(requirements=[self.req("node.kubernetes.io/instance-type", ["m5.xlarge", "m5.2xlarge", "m5.4xlarge", "m5.large"])])
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"static_nodepool_detection"})
+
+    def test_instance_type_pinning_prevention_key_dropped_for_broader_selector(self):
+        cur = self.np(requirements=[self.req("node.kubernetes.io/instance-type", ["m5.xlarge"])])
+        rec = self.np(requirements=[self.req("karpenter.k8s.aws/instance-family", ["m5", "m6i", "m7i"])])
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"instance_type_pinning_prevention", "instance_family_modernization"})
+        pin = next(x for x in c if x["kind"] == "instance_type_pinning_prevention")
+        self.assertEqual(pin["from"], ["m5.xlarge"])
+        self.assertIsNone(pin["to"])
+
+    def test_instance_family_modernization(self):
+        cur = self.np(requirements=[self.req("karpenter.k8s.aws/instance-family", ["m5"])])
+        rec = self.np(requirements=[self.req("karpenter.k8s.aws/instance-family", ["m7i", "m7a"])])
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"instance_family_modernization"})
+        self.assertEqual((c[0]["from"], c[0]["to"]), (["m5"], ["m7a", "m7i"]))
+
+    def test_instance_category_change(self):
+        cur = self.np(requirements=[self.req("karpenter.k8s.aws/instance-category", ["c"])])
+        rec = self.np(requirements=[self.req("karpenter.k8s.aws/instance-category", ["c", "m"])])
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"instance_category_change"})
+
+    def test_instance_generation_flexibility(self):
+        cur = self.np(requirements=[self.req("karpenter.k8s.aws/instance-generation", ["5"])])
+        rec = self.np(requirements=[])
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"instance_generation_flexibility"})
+        self.assertEqual(c[0]["from"], ["5"])
+        self.assertIsNone(c[0]["to"])
+
+    def test_multiple_independent_kinds_in_one_diff(self):
+        cur = self.np(consolidation_policy="WhenEmpty", cpu_limit="64")
+        rec = self.np(consolidation_policy="WhenEmptyOrUnderutilized", cpu_limit="128")
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"consolidation_policy", "limits_cpu"})
+
+    # ---- defensive handling: never raise on an unexpected shape, just skip that diff
+    def test_non_dict_config_returns_empty(self):
+        self.assertEqual(model.diff_karpenter_config("not-a-dict", self.np()), [])
+        self.assertEqual(model.diff_karpenter_config(self.np(), None), [])
+        self.assertEqual(model.diff_karpenter_config(None, None), [])
+
+    def test_requirements_not_a_list_is_skipped_not_raised(self):
+        cur = self.np(requirements="not-a-list")
+        rec = self.np(requirements=[self.req("karpenter.k8s.aws/instance-category", ["c"])])
+        # must not raise; the malformed side just contributes no requirements
+        c = model.diff_karpenter_config(cur, rec)
+        self.assertEqual(self.kinds(c), {"instance_category_change"})
+
+    def test_malformed_requirement_entry_is_dropped(self):
+        cur = self.np(requirements=["not-a-dict", {"key": None, "values": ["x"]}, {"key": "k", "values": "not-a-list"}])
+        rec = self.np(requirements=[])
+        # none of the malformed entries should surface as a change or raise
+        self.assertEqual(model.diff_karpenter_config(cur, rec), [])
 
 
 if __name__ == "__main__":

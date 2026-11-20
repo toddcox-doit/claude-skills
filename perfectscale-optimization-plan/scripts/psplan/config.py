@@ -27,7 +27,11 @@ DEFAULTS = {
     "status": None,                         # e.g. "Draft for review": adds a banner and a feedback section
     "adoption_factor": 0.7,                 # share of recommendations realistically adopted; drives the adoption view
     # -- scope / assumptions recorded at intake. null => stated as an assumption in the plan.
-    "assumptions": {"scope": "entire cluster", "delivery": "automation", "gitops": None},
+    # native_vpa: whether this tenant also runs upstream Kubernetes-native VPA (a distinct object from
+    # PerfectScale's own PodFit right-sizing) alongside PerfectScale. pscli has no field for this and
+    # never will - a native VPA object is not something the public API would ever expose - so this can
+    # only ever be answered by asking the customer. null => open assumption, stated as unconfirmed.
+    "assumptions": {"scope": "entire cluster", "delivery": "automation", "gitops": None, "native_vpa": None},
     "intake": {"change_freeze": None, "approval_lead_time": None, "namespace_owners": None},
     "foreign_tenants": [],                  # other customer names this working copy has handled; the
                                             # verifier fails the run if one appears in a rendered file
@@ -58,6 +62,7 @@ DEFAULTS = {
     },
     "cluster_settings": {},                 # optional facts the API cannot see: {cluster: {"autoscaling_profile": "..."}}
     "eligibility_file": None,               # optional JSON from the PodFit browser pass (see references)
+    "hpa_file": None,                       # optional JSON from the PodFit browser pass: per-workload HPA presence/triggers (see eligibility-enrichment.md)
     "trends_csv": None,                     # optional daily cost-by-cluster CSV for seasonality check
     "previous_plan": None,                  # path to an earlier plan JSON, for the change log
 }

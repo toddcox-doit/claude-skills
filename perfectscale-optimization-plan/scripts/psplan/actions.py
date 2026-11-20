@@ -21,9 +21,10 @@ TIERS = ["XS", "S", "M", "L"]
 FIT = {"automation_proof": "PodFit", "automation_w2": "PodFit", "automation_w3": "PodFit", "memory_limits": "PodFit", "oom_fix": "PodFit", "job_grouping": "PodFit",
        "replicated_grouping": "PodFit",
        "job_rightsize": "PodFit", "stateful_manual": "PodFit", "heldout_manual": "PodFit", "underprov_other": "PodFit", "headroom_policy": "PodFit", "default_policy": "PodFit",
+       "policy_underprotected": "PodFit", "policy_overprotected": "PodFit",
        "stale_optout": "InfraFit", "pdb": "InfraFit", "unevictable_affinity": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
        "pool_machine_recs": "InfraFit", "autoprov_review": "InfraFit", "gpu_cap": "InfraFit", "commitments": "InfraFit", "review_cadence": "Governance", "rerun": "Governance",
-       "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit"}
+       "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit", "pool_karpenter_tuning": "InfraFit"}
 # Question groups for the customer conversation, matched on the start of each question.
 DECISION_GROUPS = [("Who owns", "Ownership"), ("Are the minimum sizes", "Ownership"), ("Are the do-not-evict", "Intent"), ("Does every environment", "Intent"),
                    ("Is the headroom", "Intent"), ("The workloads kept out", "Intent"), ("Is automation enabled", "Access and constraints"), ("Do the node pools", "Ownership"),
@@ -51,6 +52,45 @@ FW_WHERE = {
 }
 
 
+def _karp_vals(v):
+    """Render a diff_karpenter_config() value (a list of requirement values, a scalar limit/policy
+    string, or None) for a title or step sentence."""
+    if v is None:
+        return "unset"
+    if isinstance(v, list):
+        return "`" + ", ".join(v) + "`" if v else "unset"
+    return f"`{v}`"
+
+
+# One sentence fragment (for the title) and one imperative step (for the steps list) per
+# diff_karpenter_config() change kind. All of these stay on the single catalog type
+# `autoscaler_tune_karpenter` ("Karpenter NodePool: consolidationPolicy, consolidateAfter,
+# disruption.budgets, instance-type breadth" per action-catalog.md) - only the title/evidence
+# differ per kind, deliberately, rather than inventing one action_type per kind.
+KARP_CHANGE_TEXT = {
+    "consolidation_policy": lambda c: (f"consolidation policy from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                        f"Change `spec.disruption.consolidationPolicy` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+    "consolidate_after": lambda c: (f"consolidateAfter from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                     f"Change `spec.disruption.consolidateAfter` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+    "limits_cpu": lambda c: (f"CPU limit from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                              f"Raise `spec.limits.cpu` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])} - the current limit is close to exhaustion."),
+    "limits_memory": lambda c: (f"memory limit from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                 f"Raise `spec.limits.memory` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])} - the current limit is close to exhaustion."),
+    "static_nodepool_detection": lambda c: (f"instance-type requirement from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                             f"Broaden `node.kubernetes.io/instance-type` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])} - the pinned set never flexed."),
+    "instance_type_pinning_prevention": lambda c: (f"pinned instance-type list ({_karp_vals(c['from'])}) for a broader selector",
+                                                    f"Replace the pinned `node.kubernetes.io/instance-type` list ({_karp_vals(c['from'])}) with a broader family/category selector."),
+    "instance_family_modernization": lambda c: (f"instance family from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                                 f"Move `karpenter.k8s.aws/instance-family` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+    "instance_category_change": lambda c: (f"instance category from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                            f"Change `karpenter.k8s.aws/instance-category` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+    "instance_generation_flexibility": lambda c: (f"instance generation from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                                   f"Change `karpenter.k8s.aws/instance-generation` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+    "instance_type_values_changed": lambda c: (f"instance-type values from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                                f"Change `node.kubernetes.io/instance-type` from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."),
+}
+
+
 def effort(base, esc):
     i = TIERS.index(base)
     esc = esc[:2]
@@ -73,6 +113,20 @@ class Plan:
         self.CL = CLOUD.get(self.cloud, CLOUD["unknown"])
         gitops = (cfg["assumptions"] or {}).get("gitops")
         self.gitops = gitops or "your GitOps / pull-request flow"
+        # native_vpa: same open-assumption mechanism as gitops above - null is never guessed into a
+        # specific claim; a wrong guess would be reported in the plan as fact, so unset stays unset
+        # and contributes no customer-facing text, exactly like an unset gitops contributes only the
+        # generic "your GitOps / pull-request flow" rather than naming a tool it was never told about.
+        # A set value (True, or a short descriptive string) becomes a plain fact threaded into
+        # whichever right-sizing rule's evidence is relevant - see r_oom below, deliberately the one
+        # place this is wired rather than an elaborate new rule.
+        native_vpa = (cfg["assumptions"] or {}).get("native_vpa")
+        self.native_vpa = native_vpa
+        if native_vpa in (None, False, ""):
+            self.native_vpa_note = ""
+        else:
+            detail = native_vpa if isinstance(native_vpa, str) else "on this tenant"
+            self.native_vpa_note = f" This tenant also runs native VPA ({detail}) - confirm no conflicting mutation before applying."
         self.early = any(f["early"] for f in facts)
         self.has_elig = any(f["eligibility"].get("provided") for f in facts)
         self.total_idle = sum(f["pools"]["idle"] for f in facts)
@@ -119,6 +173,13 @@ class Plan:
     def names(self, fs):
         return human_list([f["name"] for f in fs])
 
+    def hpa_note(self, f, name, ns):
+        """Optional HPA enrichment (hpa_file, see eligibility-enrichment.md): informational evidence
+        text only, never a scoring input. Absent hpa_file => f["hpa"]["workloads"] is empty and this
+        is silently a no-op, same "optional enrichment, absent = unconfirmed" shape as eligibility."""
+        hit = any(w["name"] == name and w["namespace"] == ns for w in f.get("hpa", {}).get("workloads", []))
+        return ", HPA-driven: check trigger thresholds before applying" if hit else ""
+
     def pick_proof(self):
         audited = [f for f in self.F if f["audit"]["n"] > 0]
         if audited:
@@ -142,8 +203,8 @@ class Plan:
         for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_replicated_grouping, self.r_automation,
                      self.r_memory_limits, self.r_oom, self.r_jvm,
                      self.r_grouping, self.r_stale_optout, self.r_pdb, self.r_unevictable_affinity,
-                     self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_autoprov, self.r_gpu, self.r_underprov,
-                     self.r_headroom, self.r_local_storage, self.r_governance):
+                     self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_pool_karpenter_tuning, self.r_autoprov, self.r_gpu, self.r_underprov,
+                     self.r_headroom, self.r_policy_mismatch, self.r_local_storage, self.r_governance):
             rule()
         return self.finish()
 
@@ -294,7 +355,8 @@ class Plan:
                  range={"low": low, "likely": lik, "literal": lit}, steps=steps,
                  verification="OOM indicators clear; no memory-attributed restarts in 7 days",
                  evidence=(f"OOM is flagged on {n} workloads. " + (f"One group ({short_name(top['name'])}) is {share * 100:.0f}% of the literal figure, which is why the literal number is a ceiling to size down from, not a budget request. " if share > 0.5 else "") +
-                           f"Range: {usd(low)} low, {usd(lik)} likely, {usd(lit)} literal per month. Only critical-severity item in the plan, so it sits in Phase 1 regardless of cost."))
+                           f"Range: {usd(low)} low, {usd(lik)} likely, {usd(lit)} literal per month. Only critical-severity item in the plan, so it sits in Phase 1 regardless of cost." +
+                           self.native_vpa_note + self.hpa_note(lead, top["name"], top["ns"])))
 
     # ---- grouping
     def r_grouping(self):
@@ -716,6 +778,48 @@ class Plan:
                      evidence=f"{r['cluster']} `{r['id']}`: {usd(r['idle'])}/mo of idle with {r['blockers']} blocking pod{'s' if r['blockers'] != 1 else ''} and no machine-type recommendation. Idle pool, not a computed saving. Medium confidence: a bursty pool makes a short window over- or under-state it.")
             self.claimed_pools.add((r["cluster"], r["id"]))
 
+    # ---- Karpenter NodePool structural recommendations (consolidation policy/delay, limits, instance selection)
+    def r_pool_karpenter_tuning(self):
+        """One action per node group with a non-empty Karpenter structural diff (model.py's
+        `diff_karpenter_config`), not one pooled tenant-wide action: every change here is an edit to
+        that one NodePool custom resource, so the natural unit of work is the node group, the same
+        per-target granularity `r_pool_actions` above already uses for
+        pool_shrink_blocked/pool_shrink_free/pool_machine_recs. Multiple change kinds found on the
+        SAME node group become ONE action whose steps/evidence list every kind found, rather than one
+        action per kind, because they land in the same commit to the same NodePool manifest - splitting
+        them would turn one PR into several for no reason. Only long-lived pools are considered: that
+        is the only pool population model.py exposes by node group (auto-provisioned pools are not
+        individually named downstream), and it is also where a persistent NodePool's own tuning
+        matters most."""
+        rows = [(f, p) for f in self.F for p in f["pools"]["long_lived"] if p.get("karpenter_changes")]
+        if not rows:
+            return
+        for f, p in rows:
+            kc = p["karpenter_changes"]
+            frags = [KARP_CHANGE_TEXT.get(c["kind"], lambda c: (f"{c['kind']} from {_karp_vals(c['from'])} to {_karp_vals(c['to'])}",
+                                                                 f"Review `{c['kind']}`: {_karp_vals(c['from'])} to {_karp_vals(c['to'])}."))(c)
+                     for c in kc]
+            titles = [t for t, _ in frags]
+            step_lines = [s for _, s in frags]
+            plural = "s" if len(kc) != 1 else ""
+            title = (f"Apply Karpenter's {titles[0]} on `{p['id']}`" if len(kc) == 1
+                     else f"Apply {len(kc)} Karpenter NodePool changes on `{p['id']}`")
+            t, r = effort("M", [])
+            self.add("pool_karpenter_tuning", action_type="autoscaler_tune_karpenter", title=title,
+                     cluster=f["name"], scope=f"{f['name']} `{p['id']}` ({len(kc)} change{plural})",
+                     savings_monthly_usd=0, savings_basis="achievable_now", confidence="high",
+                     effort_tier=t, effort_rationale=r + " - a Karpenter NodePool custom resource edit",
+                     change_risk="medium", owner_role="platform", phase=2, lane="platform",
+                     _uids=[f["uid"]], _resource=p["id"],
+                     steps=[f"Confirm the diff is still current: PerfectScale's Karpenter recommendation for `{p['id']}` reports {len(kc)} change{plural} - {human_list(titles)}."]
+                           + step_lines
+                           + [f"Apply the change{plural} to the `{p['id']}` NodePool custom resource in one commit through {self.gitops}.",
+                              "Verify: PerfectScale's Karpenter recommendation for this NodePool shows has_changes = false on the next collection."],
+                     verification="PerfectScale's Karpenter recommendation for this NodePool reports no further changes",
+                     evidence=(f"PerfectScale's Karpenter recommendation for {f['name']} `{p['id']}` differs from the live NodePool on {len(kc)} field{plural}: "
+                               + "; ".join(titles) + ". No dollar claim here: where a dollar value exists for this node group it is this plan's own idle or "
+                               "machine-type estimate carried elsewhere, not re-derived from this structural diff."))
+
     # ---- auto-provisioned pools
     def r_autoprov(self):
         fs = [f for f in self.F if f["pools"]["ap_n"] > 0]
@@ -812,6 +916,61 @@ class Plan:
                         "Verify: potential savings re-computes within 24h of the change."],
                  verification="Potential savings and cost-increase figures re-compute within 24h",
                  evidence=f"Potential savings on {self.names(fs)} is computed inside the {pol} policy, so it is not comparable with clusters on another policy.")
+
+    # ---- workload-level Optimization Policy mismatches
+    def r_policy_mismatch(self):
+        """`r_headroom` above only sees a whole cluster deliberately set to a headroom-style policy.
+        Optimization Policy (docs.perfectscale.io) is actually a per-workload dial - a workload's own
+        setting overrides its cluster's - so it can also go wrong one workload at a time, in either
+        direction, which the cluster aggregate cannot show. Two separate findings, two separate
+        actions: they have different owners and different urgency (under-protection is the one that
+        bites first), the same reasoning `r_pool_actions` uses to split blocked/free pool rows into
+        their own action records under one rule method."""
+        fs_u = [f for f in self.F if f["policy_mismatches"]["under_protected"]]
+        if fs_u:
+            rows = sorted([dict(r, cluster=f["name"]) for f in fs_u for r in f["policy_mismatches"]["under_protected"]], key=lambda r: -r["cost_increase"])
+            n = len(rows)
+            inc = sum(r["cost_increase"] for r in rows)
+            oom_n = sum(1 for r in rows if r["oom"])
+            pols = human_list(sorted({r["policy"] for r in rows}))
+            top = rows[0]
+            t, r = effort("S", [])
+            self.add("policy_underprotected", action_type="policy_workload_mismatch",
+                     title=f"Move {n} at-risk workloads off {pols}", cluster=self.names(fs_u),
+                     scope=f"{n} workloads with real resiliency risk" + (f"; {oom_n} already OOM-flagged" if oom_n else ""),
+                     savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", effort_tier=t,
+                     effort_rationale=r + " - an Optimization Policy change per workload in the PerfectScale console",
+                     change_risk="medium", owner_role="app-team", phase=1, lane="decision",
+                     _uids=sorted({f["uid"] for f in fs_u}),
+                     steps=[f"Confirm the set: {n} workloads PerfectScale already flags for real resiliency risk (OOM or high severity) are set to {pols} - the policy level built to push cost down, not to protect a workload that is already in trouble.",
+                            f"Start with the largest: {short_name(top['name'])} in {top['ns']}, carrying {usd(top['cost_increase'])}/mo of cost-increase exposure at its current sizing.",
+                            "Open each workload's Optimization Policy in the PerfectScale console and move it to Balanced, or to ExtraHeadroom/MaxHeadroom if it actually needs more room than Balanced gives - the point is to stop the policy fighting the risk, not to over-correct.",
+                            "Verify: the workload's recommendation re-computes under the new policy and the risk indicator is re-evaluated within 24h."],
+                     verification="Recommendation and risk indicator re-compute under the new policy within 24h",
+                     evidence=(f"{n} workloads carry real resiliency risk (OOM or high severity) while sitting on {pols} - the policy level tuned to maximize savings, which is actively working against the protection PerfectScale would otherwise recommend. "
+                               f"{usd(inc)}/mo of cost-increase exposure sits on these workloads" + (f", {oom_n} of them already OOM-flagged" if oom_n else "") + ". "
+                               "No dollar claim: changing the policy changes what PerfectScale computes for that workload, it is not a saving by itself."))
+        fs_o = [f for f in self.F if f["policy_mismatches"]["over_protected"]]
+        if fs_o:
+            rows = sorted([dict(r, cluster=f["name"]) for f in fs_o for r in f["policy_mismatches"]["over_protected"]], key=lambda r: -r["cost"])
+            n = len(rows)
+            cost = sum(r["cost"] for r in rows)
+            pols = human_list(sorted({r["policy"] for r in rows}))
+            top = rows[0]
+            t, r = effort("S", [])
+            self.add("policy_overprotected", action_type="policy_workload_mismatch",
+                     title=f"Lower the Optimization Policy on {n} non-production workloads off {pols}", cluster=self.names(fs_o),
+                     scope=f"{n} non-production workloads ({usd(cost)}/mo)",
+                     savings_monthly_usd=0, savings_basis="achievable_now", confidence="medium", effort_tier=t,
+                     effort_rationale=r + " - an Optimization Policy change per workload in the PerfectScale console",
+                     change_risk="low", owner_role="app-team", phase=2, lane="decision",
+                     _uids=sorted({f["uid"] for f in fs_o}),
+                     steps=[f"Confirm the set: {n} workloads matching your non-production naming pattern are set to {pols} - the levels built for latency-sensitive production workloads above their highest spike, starting with {short_name(top['name'])} in {top['ns']}.",
+                            "Check with the owning team whether the headroom is deliberate (a load test, a staging environment that deliberately mirrors production traffic). If not, move the policy to Balanced or MaxSavings.",
+                            "Verify: potential savings on the changed workloads rises within 24h of the change."],
+                     verification="Potential savings on the changed workloads rises within 24h",
+                     evidence=(f"{n} workloads matching a non-production naming pattern sit on {pols} ({usd(cost)}/mo of cost) - headroom levels meant for latency-sensitive production workloads, not non-production ones. "
+                               "No dollar claim: changing the policy changes what PerfectScale computes for that workload, it is not a saving by itself; it is ceiling that could otherwise be spent on a workload that needs it."))
 
     # ---- local storage (non-managed)
     def r_local_storage(self):

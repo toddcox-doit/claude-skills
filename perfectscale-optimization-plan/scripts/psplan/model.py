@@ -66,6 +66,14 @@ FRAMEWORKS = [
     ("ray", lambda l, ns, n: any(k.startswith("label_ray_io") for k in l)),
 ]
 
+# Optimization Policy (docs.perfectscale.io): a real, documented cost<->resiliency dial, independent
+# per CPU and Memory, settable per cluster, namespace, or workload - a workload's own setting overrides
+# its cluster's. The ladder is the same four values at every level: MaxSavings / Balanced /
+# ExtraHeadroom / MaxHeadroom (there is no separate "MaxEconomy"). Matched case-insensitively since
+# collected values are not guaranteed to carry the product's own casing.
+POLICY_UNDER = {"maxsavings"}
+POLICY_OVER = {"extraheadroom", "maxheadroom"}
+
 
 # ------------------------------------------------------------------ small helpers
 def humanize(n):
@@ -199,6 +207,115 @@ def load_node_groups(d):
     return jl(d / "nodegroups.jsonl")
 
 
+# ------------------------------------------------------------------ Karpenter NodePool structural diff
+# PerfectScale's public API returns the full Karpenter NodePool custom resource (not a proprietary
+# shape) for both `current_config` and `recommended_config` on a Karpenter-managed node group's
+# recommendation - the same schema Karpenter itself uses. There is no pre-labeled `changes[]` format
+# to lean on (the field exists but was never observed non-empty against a live tenant, so its shape
+# is unconfirmed); the classification below is a structural diff on the field paths docs.perfectscale.io
+# names for Karpenter optimization, not a passthrough of anything the API itself labels.
+#
+# Every lookup here is defensive: an unexpected shape (not a dict, not a list, a missing branch) is
+# treated as "not found" rather than raised, and `diff_karpenter_config` never lets an exception
+# escape - a diff it cannot make is dropped, not a crash. A field present on one side and absent on
+# the other is itself a valid, reported change (e.g. `spec.limits.memory` newly added).
+KARP_PIN_MAX = 3  # a requirement this narrow on instance-type reads as "pinned", not "selected"
+KARP_SELECTOR_KEYS = (
+    ("karpenter.k8s.aws/instance-family", "instance_family_modernization"),
+    ("karpenter.k8s.aws/instance-category", "instance_category_change"),
+    ("karpenter.k8s.aws/instance-generation", "instance_generation_flexibility"),
+)
+
+
+def _karp_get(d, *path):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _karp_requirements(cfg):
+    """key -> sorted values for spec.template.spec.requirements. Tolerant of any shape that is not
+    a well-formed requirements list - a malformed entry is dropped silently, not raised."""
+    out = {}
+    reqs = _karp_get(cfg, "spec", "template", "spec", "requirements")
+    if not isinstance(reqs, list):
+        return out
+    for r in reqs:
+        if not isinstance(r, dict):
+            continue
+        k, vals = r.get("key"), r.get("values")
+        if not k or not isinstance(vals, list):
+            continue
+        out[k] = sorted(str(v) for v in vals)
+    return out
+
+
+def diff_karpenter_config(cur, rec):
+    """Structural diff of a Karpenter NodePool current_config vs recommended_config, mapped onto the
+    8 recommendation types docs.perfectscale.io names for Karpenter optimization. Returns a list of
+    {"kind", "from", "to"} dicts; kind is one of consolidation_policy, consolidate_after, limits_cpu,
+    limits_memory, static_nodepool_detection, instance_type_pinning_prevention,
+    instance_family_modernization, instance_category_change, instance_generation_flexibility (or the
+    generic instance_type_values_changed fallback below).
+
+    #3 (Static NodePool Detection) and #7 (Instance Type Pinning Prevention) are the one genuinely
+    ambiguous pair: both start from the same observation (current_config pins
+    node.kubernetes.io/instance-type to a handful of values). They are told apart by what the
+    recommended side does about it - broadens the *same* key (#3: still a pinned-style list, just a
+    bigger one) versus drops that key in favor of a broader selector like family/category (#7: a
+    different kind of requirement entirely). That is a reasonable, defensible split on the data
+    available, not an attempt to reproduce PerfectScale's own internal classification, which is not
+    observable from this API.
+    """
+    if not isinstance(cur, dict) or not isinstance(rec, dict):
+        return []
+    changes = []
+    try:
+        cp_cur = _karp_get(cur, "spec", "disruption", "consolidationPolicy")
+        cp_rec = _karp_get(rec, "spec", "disruption", "consolidationPolicy")
+        if cp_cur != cp_rec and (cp_cur or cp_rec):
+            changes.append({"kind": "consolidation_policy", "from": cp_cur, "to": cp_rec})
+    except Exception:
+        pass
+    try:
+        ca_cur = _karp_get(cur, "spec", "disruption", "consolidateAfter")
+        ca_rec = _karp_get(rec, "spec", "disruption", "consolidateAfter")
+        if ca_cur != ca_rec and (ca_cur or ca_rec):
+            changes.append({"kind": "consolidate_after", "from": ca_cur, "to": ca_rec})
+    except Exception:
+        pass
+    for res in ("cpu", "memory"):
+        try:
+            lc = _karp_get(cur, "spec", "limits", res)
+            lr = _karp_get(rec, "spec", "limits", res)
+            if lc != lr and (lc or lr):
+                changes.append({"kind": f"limits_{res}", "from": lc, "to": lr})
+        except Exception:
+            pass
+    try:
+        cur_reqs, rec_reqs = _karp_requirements(cur), _karp_requirements(rec)
+        it_key = "node.kubernetes.io/instance-type"
+        it_cur, it_rec = cur_reqs.get(it_key), rec_reqs.get(it_key)
+        if it_cur != it_rec:
+            if it_cur and len(it_cur) <= KARP_PIN_MAX and not it_rec:
+                kind = "instance_type_pinning_prevention"          # #7: key dropped for a broader selector
+            elif it_cur and it_rec and len(it_rec) > len(it_cur):
+                kind = "static_nodepool_detection"                 # #3: same key, broadened
+            else:
+                kind = "instance_type_values_changed"               # fallback: a change we can't cleanly place
+            changes.append({"kind": kind, "from": it_cur, "to": it_rec})
+        for key, kind in KARP_SELECTOR_KEYS:
+            c, r_ = cur_reqs.get(key), rec_reqs.get(key)
+            if c != r_:
+                changes.append({"kind": kind, "from": c, "to": r_})
+    except Exception:
+        pass
+    return changes
+
+
 def sizing_fraction(w, margin, pkey):
     d = w["derived"]
     fr = []
@@ -222,7 +339,7 @@ def fingerprint(cfg, cluster, files):
                 h.update(f"{cand.name}:{st.st_size}:{int(st.st_mtime)}".encode())
     relevant = {k: cfg[k] for k in ("exclusions", "held_out_from_automation", "stateful_patterns", "managed_namespaces",
                                     "auto_provisioned_pool_patterns", "gpu_pool_patterns", "thresholds", "scale_to_days",
-                                    "min_history_days", "cloud", "eligibility_file")}
+                                    "min_history_days", "cloud", "eligibility_file", "hpa_file")}
     h.update(json.dumps(relevant, sort_keys=True).encode())
     return h.hexdigest()[:16]
 
@@ -234,6 +351,8 @@ def load_cluster(cfg, cluster, use_cache=True):
                              "unevictable-full.jsonl", "unevictable-topgroups.jsonl", "audit.jsonl", "cluster.json")]
     if cfg.get("eligibility_file"):
         files.append(Path(cfg["eligibility_file"]))
+    if cfg.get("hpa_file"):
+        files.append(Path(cfg["hpa_file"]))
     cache = cfg.data(name).parent / ".cache" / f"{name}.json"
     fp = fingerprint(cfg, cluster, files)
     if use_cache and cache.exists():
@@ -265,6 +384,7 @@ def _load(cfg, cluster, d):
     stateful_rx = re.compile("|".join(cfg["stateful_patterns"]), re.I) if cfg["stateful_patterns"] else None
     held_rx = re.compile("|".join(cfg["held_out_from_automation"]), re.I) if cfg["held_out_from_automation"] else None
     jvm_rx = re.compile("|".join(cfg["jvm_patterns"]), re.I) if cfg["jvm_patterns"] else None
+    nonprod_rx = re.compile("|".join(cfg["nonprod_patterns"]), re.I) if cfg["nonprod_patterns"] else None
     excl = [e.lower() for e in cfg["exclusions"]]
 
     # ---- eligibility (optional enrichment)
@@ -272,6 +392,15 @@ def _load(cfg, cluster, d):
     if cfg.get("eligibility_file"):
         ej = jload(cfg["eligibility_file"], {}) or {}
         elig_map = ej.get(uid) or ej.get(name) or {}
+
+    # ---- HPA triggers (optional enrichment). Same PodFit-zoom-in-only shape as eligibility above:
+    # no public-API field exists for a workload's HPA presence or CPU/Memory trigger thresholds, so
+    # this is populated only when a browser pass wrote one. Absent => every workload's "_hpa" stays
+    # None and the plan states HPA status as unconfirmed, same as eligibility without eligibility_file.
+    hpa_map = {}
+    if cfg.get("hpa_file"):
+        hj = jload(cfg["hpa_file"], {}) or {}
+        hpa_map = hj.get(uid) or hj.get(name) or {}
 
     # ---- filter
     n_synth = n_muted = n_excl = 0
@@ -321,6 +450,7 @@ def _load(cfg, cluster, d):
                          and (jvm_rx.search(x["name"]) or jvm_rx.search(x["namespace"])))
         st = elig_map.get(x.get("id"))
         x["_elig"] = st
+        x["_hpa"] = hpa_map.get(x.get("id"))
 
     cost_o = sum(x["cost"] for x in w); waste_o = sum(x["waste"] for x in w); pot_o = sum(x["potential_savings"] for x in w)
     out = {
@@ -510,6 +640,23 @@ def _load(cfg, cluster, d):
         top1 = max(oom, key=lambda x: x["cost_increase"])
         out["res_oom_top_share"] = top1["cost_increase"] / max(sum(x["cost_increase"] for x in oom), 1e-9)
 
+    # ---- policy mismatches: a workload's own Optimization Policy fighting its risk profile.
+    # This is per-workload, unlike out["policies"]/out["headroom_policy"] above (cluster-aggregate
+    # counts only - they cannot see that one specific workload is set differently from its cluster).
+    # Under-protected reuses `res`, the same high_sev(x)/has_oom(x) risk population the resiliency
+    # section above already built, rather than re-deriving risk from scratch.
+    def prow(x):
+        return {"name": x["name"], "ns": x["namespace"], "type": x["type"],
+                "policy": x.get("optimization_policy"), "cost_increase": R(x["cost_increase"]),
+                "cost": R(x["cost"]), "oom": has_oom(x)}
+    under_protected = [x for x in res if (x.get("optimization_policy") or "").lower() in POLICY_UNDER]
+    over_protected = [x for x in w if (x.get("optimization_policy") or "").lower() in POLICY_OVER
+                      and nonprod_rx and (nonprod_rx.search(x["name"]) or nonprod_rx.search(x["namespace"]))]
+    out["policy_mismatches"] = {
+        "under_protected": [prow(x) for x in sorted(under_protected, key=lambda x: -x["cost_increase"])],
+        "over_protected": [prow(x) for x in sorted(over_protected, key=lambda x: -x["cost"])],
+    }
+
     # ---- eligibility summary
     if elig_map:
         by = collections.defaultdict(lambda: {"n": 0, "pot_o": 0.0})
@@ -520,6 +667,15 @@ def _load(cfg, cluster, d):
     else:
         out["eligibility"] = {"provided": False}
 
+    # ---- HPA summary (optional enrichment). `hpa_workloads` carries just enough identity (id/name/ns)
+    # for a rule to append an evidence caveat on the matching action - this is informational enrichment
+    # of existing right-sizing evidence, not a new scoring input, so no dollars are derived from it here.
+    if hpa_map:
+        hpa_workloads = [{"id": x["id"], "name": x["name"], "namespace": x["namespace"]} for x in w if x.get("_hpa")]
+        out["hpa"] = {"provided": True, "n_hpa": len(hpa_workloads), "workloads": hpa_workloads}
+    else:
+        out["hpa"] = {"provided": False, "n_hpa": 0, "workloads": []}
+
     # ---- node pools
     ap_rx = [re.compile(p) for p in cfg["auto_provisioned_pool_patterns"]]
     gpu_rx = [re.compile(p) for p in cfg["gpu_pool_patterns"]]
@@ -529,6 +685,13 @@ def _load(cfg, cluster, d):
         r = g.get("recommendations") or {}
         rl = r.get("node_type_recommendations") or []
         best = max(rl, key=lambda x: x["estimated_savings"]) if (r.get("has_changes") and rl) else None
+        # Karpenter-managed pools carry a structurally different recommendation shape (full NodePool
+        # current_config/recommended_config, not a node_type_recommendations list) - see
+        # diff_karpenter_config above. Only attempted when the API says there is something to diff;
+        # a config shape this doesn't expect yields an empty list rather than raising (never blocks
+        # the rest of this pool's record).
+        karp_changes = diff_karpenter_config(r.get("current_config"), r.get("recommended_config")) \
+            if (r.get("type") == "karpenter" and r.get("has_changes")) else []
         nodes = g.get("nodes") or {}
         avg_nodes = max(nodes.get("avg") or 0, 1e-9)
         ap = any(rx.search(g["id"]) for rx in ap_rx)
@@ -548,6 +711,7 @@ def _load(cfg, cluster, d):
             "cpu_req": g["cpu"]["requested"]["avg"], "cpu_used": g["cpu"]["used"]["avg"],
             "mem_req": g["mem"]["requested"]["avg"], "mem_used": g["mem"]["used"]["avg"],
             "rec": ({"save_o": best["estimated_savings"], "save": R(best["estimated_savings"]), "to": best["instance_type"], "pct": best["estimated_savings_pct"]} if best else None),
+            "karpenter_changes": karp_changes,
         })
     ll = sorted([p for p in pools if p["kind"] == "long_lived"], key=lambda p: -p["idle"])
     apv = [p for p in pools if p["kind"] == "auto_provisioned"]

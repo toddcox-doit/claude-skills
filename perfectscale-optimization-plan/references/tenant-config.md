@@ -2,3 +2,17 @@
 See `psplan/config.py` DEFAULTS for every key and default. Required: customer, clusters (name + uid). Paths are relative to the folder containing `config/`. `thresholds`, `stateful_patterns`, `nonprod_patterns`, `managed_namespaces`, `auto_provisioned_pool_patterns`, `gpu_pool_patterns` tune classification without code changes.
 
 `foreign_tenants` is the leak-scan list: the names of other customers this working copy has been run against. The verifier fails the run if one of them reaches a rendered file. It defaults to empty, so set it on every run in a folder that has held more than one tenant. No customer name is hard-coded in the library.
+
+`assumptions.native_vpa` records whether this tenant also runs upstream
+Kubernetes-native VPA (a distinct object from PerfectScale's own PodFit
+right-sizing) alongside PerfectScale. `pscli` has no VPA field anywhere and
+never will — a native VPA object is not something the public API would ever
+expose — so this can only be answered by asking the customer. Default `null`:
+an open assumption, never guessed into a fact. Set `true`/`false`/a short
+descriptive string once asked; `true` (or a string) surfaces a one-line
+"confirm no conflicting mutation" caveat on the matching right-sizing action's
+evidence. Same open-assumption mechanism as `assumptions.gitops`.
+
+`hpa_file` is optional JSON from the PodFit browser pass (per-workload HPA
+presence/trigger thresholds); see `references/eligibility-enrichment.md`.
+Absent, HPA status is unconfirmed and the plan says so.

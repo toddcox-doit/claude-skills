@@ -57,6 +57,39 @@ def pool(pid, machine, nodes, idle, cost, minutes, autoscaler="karpenter", spot=
     }
 
 
+def karp_nodepool(consolidation_policy="WhenEmpty", consolidate_after="5m", cpu_limit="64", instance_type_values=None):
+    """Minimal-but-real Karpenter NodePool CR fragment - only the fields model.py's
+    diff_karpenter_config() actually reads, not a full copy of the schema."""
+    spec = {
+        "disruption": {"consolidationPolicy": consolidation_policy, "consolidateAfter": consolidate_after},
+        "limits": {"cpu": cpu_limit},
+        "template": {"spec": {"requirements": []}},
+    }
+    if instance_type_values:
+        spec["template"]["spec"]["requirements"].append(
+            {"key": "node.kubernetes.io/instance-type", "operator": "In", "values": instance_type_values})
+    return {"spec": spec}
+
+
+def karp_pool(pid, machine, nodes, idle, cost, minutes, current_config=None, recommended_config=None, has_changes=True):
+    """A Karpenter-managed node group carrying the full-shape current_config/recommended_config
+    NodePool recommendation (model.py's diff_karpenter_config branch) rather than `pool()`'s
+    node_type_recommendations shape."""
+    rec = {"type": "karpenter", "has_changes": has_changes}
+    if has_changes:
+        rec["current_config"] = current_config
+        rec["recommended_config"] = recommended_config
+    return {
+        "id": pid, "autoscaler_type": "karpenter", "nodes": {"min": nodes[0], "avg": nodes[1], "max": nodes[2]},
+        "running_minutes": minutes,
+        "cpu": {"idle": 10, "requested": {"avg": 2.0}, "used": {"avg": 1.0}},
+        "mem": {"idle": 1000, "requested": {"avg": 4000}, "used": {"avg": 2000}},
+        "cost": {"hourly": 1.0, "timeframe": cost, "idle_total": idle},
+        "labels": {"instance_type": machine, "is_spot": "false"},
+        "recommendations": rec,
+    }
+
+
 def pod(name, ns, wtype, node_group, code, reason, phase="Running", fix="Remove the annotation"):
     return {"name": name, "namespace": ns, "id": f"pod-{name}", "workload": {"id": f"w-{name}", "name": name.rsplit('-', 1)[0], "type": wtype},
             "reasons": [{"reason": reason, "reason_code": code, "details": "Pod has karpenter.sh/do-not-disrupt annotation" if code == "opt_out_annotation" else reason,
@@ -107,6 +140,12 @@ def build_prod_a():
     # held out of automation by name, but not stateful - r_stateful's heldout lane should score this
     # rightsize_manual (S), not rightsize_stateful (M)
     w.append(wl("manual-hold-svc", "finance", "Deployment", 200, 100, 60, 35, cpu=(2, 1)))
+    # workload-level Optimization Policy mismatches - r_policy_mismatch
+    # under-protected: real resiliency risk (high-severity indicator + cost_increase>0), sitting on MaxSavings
+    w.append(wl("risky-savings-svc", "risk-review", "Deployment", 150, 20, 10, 35, inc=300, cpu=(1, 2), mem=(512, 2048),
+                policy="MaxSavings", cont_inds=[ind("UnderProvisionedMemRequest", "risk", 3)], max_ind="UnderProvisionedMemRequest"))
+    # over-protected: matches nonprod_patterns ("staging") by namespace, sitting on ExtraHeadroom
+    w.append(wl("staging-canary", "staging", "Deployment", 80, 40, 25, 35, policy="ExtraHeadroom"))
     return w
 
 
@@ -138,7 +177,26 @@ def make(root):
                pool("karp-batch", "c6i.4xlarge", (0, 6.0, 40), 900, 1500, 9000, spot=True),
                pool("karp-gpu", "p3.2xlarge", (0, 2.0, 6), 1400, 1000, 3000, cpu_req=30, cpu_used=2),
                # never flexes (min == max) and reports no autoscaler - r_pool_flex + r_autoscaler_labels
-               pool("karp-unknown-pinned", "m6i.large", (3, 3.0, 3), 80, 200, 6000, autoscaler="unknown")]
+               pool("karp-unknown-pinned", "m6i.large", (3, 3.0, 3), 80, 200, 6000, autoscaler="unknown"),
+               # Karpenter structural-diff recommendations (model.py's diff_karpenter_config), distinct from
+               # the node_type_recommendations shape the pools above use - r_pool_karpenter_tuning.
+               # Idle kept below pool_idle_min_usd and min != max, so these stay out of the
+               # pool_shrink_blocked/free/pinned buckets and isolate the Karpenter-tuning rule.
+               karp_pool("karp-consolidation", "m6i.xlarge", (1, 2.0, 4), 10, 300, 5000,
+                         current_config=karp_nodepool(consolidation_policy="WhenEmpty"),
+                         recommended_config=karp_nodepool(consolidation_policy="WhenEmptyOrUnderutilized")),
+               karp_pool("karp-delay", "m6i.xlarge", (1, 2.0, 4), 10, 300, 5000,
+                         current_config=karp_nodepool(consolidate_after="5m"),
+                         recommended_config=karp_nodepool(consolidate_after="30m")),
+               karp_pool("karp-limits", "m6i.xlarge", (1, 2.0, 4), 10, 300, 5000,
+                         current_config=karp_nodepool(cpu_limit="64"),
+                         recommended_config=karp_nodepool(cpu_limit="128")),
+               # has_changes: false - identical configs, must produce no pool_karpenter_tuning action
+               karp_pool("karp-no-changes", "m6i.xlarge", (1, 2.0, 4), 10, 300, 5000, has_changes=False),
+               # has_changes: true but current_config is an unexpected shape (string, not a dict) - must
+               # not crash Plan.build(), and must not produce an action since nothing can be diffed
+               karp_pool("karp-malformed", "m6i.xlarge", (1, 2.0, 4), 10, 300, 5000,
+                         current_config="not-a-dict", recommended_config=karp_nodepool())]
     unev_a = ([pod(f"api-pdb-{i}", "payments", "Deployment", "karp-general", "pod_disruption_budget", "Over-restrictive PodDisruptionBudget", fix="Set minAvailable below replicas") for i in range(9)]
               + [pod(f"cache-opt-{i}", "platform", "Deployment", "karp-general", "opt_out_annotation", "Do-not-evict annotation") for i in range(4)]
               + [pod(f"scratch-{i}", "data", "Deployment", "karp-batch", "local_node_storage", "Local Node Storage") for i in range(3)]

@@ -107,6 +107,7 @@ flood Phase 1.
 | `restriction_clear_user` | Clear a user-set restriction — `DisabledByUser`, `IncreaseDisabled`, a manual bound | XS | `ps-admin` | low |
 | `restriction_clear_system` | Resolve a system restriction (Limited by System). Not a toggle — needs the underlying cause fixed | M | `platform` | medium |
 | `policy_headroom_tune` | Adjust ExtraHeadroom or a policy floor that is holding recommendations back | XS | `ps-admin` | medium |
+| `policy_workload_mismatch` | A workload's own Optimization Policy mismatches its risk profile — `MaxSavings` on a workload with real resiliency risk (under-protected), or `ExtraHeadroom`/`MaxHeadroom` on a workload that is clearly non-production by name (over-protected) | S | `app-team` | medium |
 | `custom_grouping` | Create a custom group so N identical workload copies share one policy | S | `ps-csm` | low |
 | `rightsize_manual` | Apply recommended requests/limits by hand — for `NotSupported` workloads, or where automation is deliberately held | S | `app-team` | medium |
 | `rightsize_stateful` | Manual right-sizing of a StatefulSet, Kafka/Strimzi, or a database | M | `app-team` | high |
@@ -132,6 +133,26 @@ customer-facing step as "create a custom grouping rule," not as a vague
 "ask PerfectScale to merge these" — the mechanism exists and is configurable
 by the customer or `ps-csm` today.
 
+**Note on `policy_workload_mismatch`.** Optimization Policy (docs.perfectscale.io)
+is a real, documented cost↔resiliency dial, independent per CPU and Memory,
+settable per cluster, namespace, or workload — a workload's own setting
+overrides its cluster's. The ladder is the same four values at every level:
+`MaxSavings` / `Balanced` / `ExtraHeadroom` / `MaxHeadroom` (there is no
+separate "MaxEconomy" — an earlier draft of this note used that name in error).
+`policy_headroom_tune` above only sees a whole *cluster* deliberately set to a
+headroom-style policy; this type is for the workload-level case that aggregate
+cannot see — a workload sitting on a policy that actively fights its own risk
+profile (under-protected: real OOM or high-severity risk sitting on
+`MaxSavings`) or wastes headroom a non-production workload does not need
+(over-protected: a workload matching the tenant's non-production naming
+pattern sitting on `ExtraHeadroom`/`MaxHeadroom`).
+`savings_monthly_usd` is always `0` here, same reasoning as
+`policy_headroom_tune`: changing a policy changes what PerfectScale computes as
+the recommendation for that workload, it is not a saving in itself. Owner is
+`app-team`, not `ps-admin`, because a workload-level policy override is a
+decision about that specific workload's risk tolerance, which belongs to the
+team that owns it — not a tenant-wide PerfectScale setting.
+
 ---
 
 ## InfraFit — node groups, autoscaler, unevictable pods
@@ -155,6 +176,19 @@ by the customer or `ps-csm` today.
 node group definition — with `high` risk, because it drains and replaces nodes.
 Almost always escalates to M via the restart-required escalator, and it should:
 the work is not editing the value, it is the change window.
+
+**Note on bin-packing.** `pool_shrink_blocked`, `pool_shrink_free` and
+`pool_machine_recs` (`r_pool_actions` in actions.py; rendered as action_type
+`nodepool_shrink`/`nodepool_machine_type`) consolidate workloads onto fewer or
+better-shaped nodes to raise utilization — this is PerfectScale's own
+documented **bin-packing** capability, part of NodeFit (node right-sizing).
+PerfectScale's own docs (docs.perfectscale.io) say it plainly: "This provides
+insights that can help you more efficiently bin-pack and size your node to
+maximize resource utilization," and list it as a benefit — "Optimized Resource
+Allocation... improving bin-packing, and optimizing the performance of
+node-autoscalers." Not a missing capability this plan is reaching for; when a
+customer asks "do you do bin-packing," the answer is yes, use PerfectScale's
+own term, and point at these actions.
 
 **Note on `unevictable_karpenter_optout`.** Despite the name, this type also covers
 the Cluster Autoscaler equivalent of the same finding — a stale

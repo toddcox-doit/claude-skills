@@ -134,6 +134,7 @@ Then set by hand, because guessing them is worse than leaving them null:
 | Key | Why |
 |---|---|
 | `assumptions.gitops` | **Ask.** `null` is stated in the plan as an open assumption; a wrong guess is reported as fact. |
+| `assumptions.native_vpa` | **Ask.** Whether this tenant also runs upstream Kubernetes-native VPA alongside PerfectScale — `pscli` has no field for this and never will, so this is manual-only. `null` is an open assumption; a wrong guess is reported as fact. |
 | `stateful_patterns` | Add whatever search or streaming engine *this* tenant runs. The defaults are not exhaustive — see `references/methodology.md`. |
 | `held_out_from_automation` | Name or namespace regexes to keep out of the automation ask. Anchor them: `^prod$` does not catch `preprod`. |
 | `managed_namespaces` | Platform add-ons to hold out of the ask. |
@@ -301,6 +302,7 @@ adding one.
   effort weight (XS 1, S 2, M 4, L 8), rounded half-up; unblockers are promoted
   one phase.
 - Optional enrichment: `eligibility_file` (the PodFit browser pass, as JSON),
+  `hpa_file` (per-workload HPA presence/triggers, same PodFit browser pass),
   `trends_csv` (seasonality), `cluster_settings` (facts the API cannot see).
 - Voice and wording gates, enforced by the verifier: no unsupported causal
   claims (label them `inferred - cause not confirmed`), no filler words, no

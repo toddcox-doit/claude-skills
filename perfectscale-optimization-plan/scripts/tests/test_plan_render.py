@@ -30,7 +30,8 @@ class T(unittest.TestCase):
     def test_expected_rules_fire(self):
         for k in ("automation_proof", "oom_fix", "memory_limits", "stale_optout", "pdb", "unevictable_affinity", "job_grouping", "job_rightsize",
                    "stateful_manual", "heldout_manual", "headroom_policy", "pool_machine_recs", "rerun",
-                   "autoscaler_labels", "pool_flex", "jvm_rightsize", "gpu_cap", "underprov_other", "local_storage", "default_policy", "commitments"):
+                   "autoscaler_labels", "pool_flex", "jvm_rightsize", "gpu_cap", "underprov_other", "local_storage", "default_policy", "commitments",
+                   "policy_underprotected", "policy_overprotected"):
             self.assertIn(k, self.by)
         self.assertNotIn("autoprov_review", self.by)       # no auto-provisioned pools in this tenant
 
@@ -469,10 +470,86 @@ class T(unittest.TestCase):
         self.assertLessEqual(a["range"]["low"], a["range"]["likely"])
         self.assertLessEqual(a["range"]["likely"], a["range"]["literal"])
 
+    def test_policy_underprotected_rule(self):
+        # under-protected: real resiliency risk (OOM/high-severity) sitting on MaxSavings
+        a = self.by["policy_underprotected"]
+        self.assertEqual(a["action_type"], "policy_workload_mismatch")
+        self.assertEqual(a["savings_monthly_usd"], 0)
+        self.assertEqual(a["owner_role"], "app-team")
+        self.assertIn("risky-savings-svc", " ".join(a["steps"]))
+        self.assertIn("MaxSavings", a["title"])
+
+    def test_policy_underprotected_no_false_positive_on_normal_policy(self):
+        # "ingest" carries the same OOM risk signal but sits on the default Balanced policy, so it
+        # must not be swept into the under-protected finding just for carrying risk.
+        a = self.by["policy_underprotected"]
+        self.assertNotIn("ingest", " ".join(a["steps"]))
+        self.assertEqual(a["scope"].split(" ", 1)[0], "1")   # only risky-savings-svc qualifies
+
+    def test_policy_overprotected_rule(self):
+        # over-protected: matches nonprod_patterns by name/namespace, sitting on ExtraHeadroom/MaxHeadroom
+        a = self.by["policy_overprotected"]
+        self.assertEqual(a["action_type"], "policy_workload_mismatch")
+        self.assertEqual(a["savings_monthly_usd"], 0)
+        self.assertEqual(a["owner_role"], "app-team")
+        self.assertIn("staging-canary", " ".join(a["steps"]))
+        self.assertIn("ExtraHeadroom", a["title"])
+
+    def test_policy_overprotected_no_false_positive_on_prod_name(self):
+        # svc-eh-0..3 sit on extraHeadroom too, but they are in a production namespace (payments) with
+        # no nonprod-pattern match, so they must not be counted in the over-protected finding.
+        a = self.by["policy_overprotected"]
+        self.assertNotIn("svc-eh", " ".join(a["steps"]))
+        self.assertEqual(a["scope"].split(" ", 1)[0], "1")   # only staging-canary qualifies
+
     def test_local_storage_rule(self):
         a = self.by["local_storage"]
         self.assertEqual(a["action_type"], "unevictable_localpv")
         self.assertIn("3 pods", a["scope"])
+
+    # ---- Karpenter NodePool structural recommendations (model.py's diff_karpenter_config)
+    def test_pool_karpenter_tuning_fires_once_per_changed_pool(self):
+        A = [a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning"]
+        # exactly the 3 fixture pools that carry a real diff; karp-no-changes (has_changes: false)
+        # and karp-malformed (unparseable current_config) must not produce an action
+        self.assertEqual(len(A), 3)
+        ids = {a["scope"].split("`")[1] for a in A}
+        self.assertEqual(ids, {"karp-consolidation", "karp-delay", "karp-limits"})
+        for a in A:
+            self.assertEqual(a["action_type"], "autoscaler_tune_karpenter")
+            self.assertEqual(a["owner_role"], "platform")
+            self.assertEqual(a["savings_monthly_usd"], 0)   # follows pool_flex precedent: no dollar re-derived here
+
+    def test_pool_karpenter_consolidation_policy_names_actual_values(self):
+        a = next(a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning" and "karp-consolidation" in a["scope"])
+        self.assertIn("WhenEmpty", a["title"])
+        self.assertIn("WhenEmptyOrUnderutilized", a["title"])
+        self.assertIn("WhenEmpty", a["evidence"])
+        self.assertIn("WhenEmptyOrUnderutilized", a["evidence"])
+        self.assertTrue(any("consolidationPolicy" in s for s in a["steps"]))
+
+    def test_pool_karpenter_consolidate_after_names_actual_values(self):
+        a = next(a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning" and "karp-delay" in a["scope"])
+        self.assertIn("5m", a["title"])
+        self.assertIn("30m", a["title"])
+        self.assertTrue(any("consolidateAfter" in s for s in a["steps"]))
+
+    def test_pool_karpenter_limits_names_actual_values(self):
+        a = next(a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning" and "karp-limits" in a["scope"])
+        self.assertIn("64", a["title"])
+        self.assertIn("128", a["title"])
+        self.assertIn("close to exhaustion", " ".join(a["steps"]))
+
+    def test_pool_karpenter_no_changes_produces_no_action(self):
+        A = [a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning"]
+        self.assertFalse(any("karp-no-changes" in a["scope"] for a in A))
+
+    def test_pool_karpenter_malformed_config_is_skipped_not_crashed(self):
+        # Plan.build() already ran clean in setUpClass with this fixture in scope - the real
+        # assertion is that it didn't raise. Here we additionally confirm the unparseable pool
+        # produced no action rather than a bogus one.
+        A = [a for a in self.S["actions"] if a["key"] == "pool_karpenter_tuning"]
+        self.assertFalse(any("karp-malformed" in a["scope"] for a in A))
 
     def test_governance_default_policy_and_commitments(self):
         dp = self.by["default_policy"]
@@ -741,6 +818,46 @@ class T(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("`", html)
         self.assertIn("example-ns", html)
+
+
+    # ---- assumptions.native_vpa: same open-assumption mechanism as assumptions.gitops
+    def test_native_vpa_unset_adds_no_caveat(self):
+        self.assertIsNone(self.cfg["assumptions"]["native_vpa"])
+        plan = Plan(self.cfg, self.F)
+        self.assertIsNone(plan.native_vpa)
+        self.assertEqual(plan.native_vpa_note, "")
+        self.assertNotIn("native VPA", self.by["oom_fix"]["evidence"])
+
+    def test_native_vpa_true_threads_into_rightsizing_evidence(self):
+        cfg2 = Config.load(self.cfg_path)
+        cfg2["assumptions"]["native_vpa"] = True
+        S2 = Plan(cfg2, self.F).build()
+        by2 = {a["key"]: a for a in S2["actions"]}
+        self.assertIn("native VPA", by2["oom_fix"]["evidence"])
+        self.assertIn("confirm no conflicting mutation", by2["oom_fix"]["evidence"])
+
+    def test_native_vpa_string_detail_is_readable_and_threads_through(self):
+        cfg2 = Config.load(self.cfg_path)
+        cfg2["assumptions"]["native_vpa"] = "on the checkout namespace"
+        plan = Plan(cfg2, self.F)
+        self.assertEqual(plan.native_vpa, "on the checkout namespace")
+        S2 = plan.build()
+        by2 = {a["key"]: a for a in S2["actions"]}
+        self.assertIn("on the checkout namespace", by2["oom_fix"]["evidence"])
+
+    # ---- hpa_file: optional enrichment, same "absent = unconfirmed" shape as eligibility_file
+    def test_hpa_file_absent_adds_no_evidence_note(self):
+        self.assertNotIn("HPA-driven", self.by["oom_fix"]["evidence"])
+
+    def test_hpa_file_present_adds_evidence_caveat_on_the_matching_workload(self):
+        hpa_path = self.tmp / "hpa-for-plan.json"
+        hpa_path.write_text(json.dumps({"prod-a": {"data-deployment-ingest": {"hasHpa": True}}}))
+        cfg2 = Config.load(self.cfg_path)
+        cfg2["hpa_file"] = str(hpa_path)
+        F2 = model.load_all(cfg2, parallel=False)
+        S2 = Plan(cfg2, F2).build()
+        by2 = {a["key"]: a for a in S2["actions"]}
+        self.assertIn("HPA-driven: check trigger thresholds before applying", by2["oom_fix"]["evidence"])
 
 
 if __name__ == "__main__":
