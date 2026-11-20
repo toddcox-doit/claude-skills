@@ -45,7 +45,7 @@ ISSUE = {
     "CpuRequestNotSet": "No CPU request set", "MemRequestNotSet": "No memory request set",
     "NoRequestsSet": "No resource requests set", "CpuThrottling": "CPU throttling", "Throttling": "CPU throttling",
     "OOM": "OOM risk", "OOMRisk": "OOM risk", "OOMKilled": "OOM risk", "GuaranteedQos": "Guaranteed QoS constraints",
-    "RestartsObserved": "Restarts observed",
+    "RestartsObserved": "Restarts observed", "HPAAtMaxReplicasObserved": "HPA at max replicas",
 }
 
 # unevictable reason code -> (customer label, fix complexity, what the fix is)
@@ -74,13 +74,25 @@ FRAMEWORKS = [
 POLICY_UNDER = {"maxsavings"}
 POLICY_OVER = {"extraheadroom", "maxheadroom"}
 
+# POV automation kickoff (pov.py). Controller kinds a WorkloadAutomationConfig targetRef or a
+# NamespaceAutomationConfig workloadTypes key accepts (docs.perfectscale.io, "Configuring Automation
+# with CRD"). Anything else - GroupedJob/GroupedPod custom groupings, bare pods ("<none>") - needs a
+# custom-type CR built from a grouping rule first, so it is counted but kept out of the ranked table.
+POV_CR_TYPES = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job", "Rollout")
+# PerfectScale indicator severity runs 0-4; the UI labels 1-4 Low / Medium / High / Critical.
+RISK_LEVEL = {0: "none", 1: "low", 2: "medium", 3: "high", 4: "critical"}
+
 
 # ------------------------------------------------------------------ small helpers
 def humanize(n):
+    """Indicator code -> label. Unmapped codes are split on word boundaries with acronyms kept
+    whole ("HPAAtMaxReplicasObserved" -> "HPA at max replicas observed"), never letter by letter."""
     s = ISSUE.get(n)
     if s:
         return s
-    t = re.sub(r"(?<!^)(?=[A-Z])", " ", n).lower()
+    words = re.findall(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+|[A-Z]+", n) or [n]
+    words = [w if (len(w) > 1 and w.isupper()) else w.lower() for w in words]
+    t = " ".join(words)
     return t[:1].upper() + t[1:]
 
 
@@ -109,6 +121,118 @@ def memlimit_sev2(w):
 
 def has_oom(w):
     return any(i["name"] in ("OOM", "OOMKilled", "OOMRisk") for i in allind(w))
+
+
+def risk_sev(w):
+    """Highest risk-indicator severity (0-4) on the workload or any container. An OOM signal is
+    never read as less than High, whatever severity the indicator itself carries."""
+    s = max([int(i.get("severity") or 0) for i in allind(w) if i.get("type") == "risk"] or [0])
+    return max(min(s, 4), 3) if has_oom(w) else min(s, 4)
+
+
+def pov_rank(w, R, T, top_n=50, savings_weight=0.6):
+    """Rank a cluster's workloads for the POV automation kickoff table.
+
+    Score (0-100) = savings_weight x (this workload's potential savings / the largest in the
+    candidate pool) + (1 - savings_weight) x (risk severity / 4). Savings lead because the CRs
+    generated from the table are cost-optimization configs; risk still lifts a workload that is
+    already failing, so the POV starts with the reliability picture in view rather than after it.
+
+    Candidates exclude platform-managed namespaces (PerfectScale does not automate kube-system by
+    default, and the plan holds those out the same way), workloads the tenant config holds out of
+    automation, and kinds no automation CR can target. Each exclusion is counted, never dropped
+    silently. A workload with neither savings nor risk scores 0 and is left out: there is nothing
+    for automation to do there.
+    """
+    pool = []
+    held = collections.defaultdict(lambda: {"n": 0, "pot": 0.0})
+    held_types = collections.Counter()
+    for x in w:
+        if x["_lane"] in ("managed", "held_out"):
+            k = x["_lane"]
+        elif x["type"] not in POV_CR_TYPES:
+            k = "unsupported_type"
+            held_types[x["type"] or "<none>"] += 1
+        else:
+            pool.append(x)
+            continue
+        held[k]["n"] += 1
+        held[k]["pot"] += R(max(x["potential_savings"], 0.0))
+    top_pot = max([x["potential_savings"] for x in pool] or [0.0])
+    sw = min(max(float(savings_weight), 0.0), 1.0)
+    rows = []
+    for x in pool:
+        sev = risk_sev(x)
+        share = max(x["potential_savings"], 0.0) / top_pot if top_pot > 0 else 0.0
+        score = round(100 * (sw * share + (1 - sw) * sev / 4), 1)
+        if score <= 0:
+            continue
+        risky = (high_sev(x) or has_oom(x)) and x["cost_increase"] > 0
+        dd = x["derived"]
+        rows.append({
+            "name": x["name"], "ns": x["namespace"], "type": x["type"], "lane": x["_lane"],
+            "cost": R(x["cost"]), "waste": R(x["waste"]), "pot": R(max(x["potential_savings"], 0.0)),
+            "risk_sev": sev, "risk": RISK_LEVEL[sev], "oom": has_oom(x), "issue": primary_issue(x),
+            "res_likely": R(x["cost_increase"] * sizing_fraction(x, T["oom_margin"], "p95")) if risky else 0.0,
+            "policy": x.get("optimization_policy") or "unset", "jvm": bool(x.get("_jvm")),
+            "hpa": x.get("_hpa"), "replicas": x["replicas_counts"]["avg_count"],
+            "cpu_cur": dd["current_cpu_request_cores_total"], "cpu_rec": dd["recommended_cpu_request_cores_total"],
+            "mem_cur_gib": dd["current_memory_request_mib_total"] / 1024, "mem_rec_gib": dd["recommended_memory_request_mib_total"] / 1024,
+            "score": score,
+        })
+    rows.sort(key=lambda r: (-r["score"], -r["pot"], r["ns"], r["name"]))
+    rows = rows[:top_n]
+    for i, r in enumerate(rows, 1):
+        r["rank"] = i
+    return {"rows": rows, "top_n": top_n, "savings_weight": sw, "pool_n": len(pool),
+            "held": {k: dict(v) for k, v in held.items()}, "held_types": dict(held_types.most_common()),
+            **pov_namespaces(w, R)}
+
+
+def pov_namespaces(w, R):
+    """Every namespace, for the kickoff page's namespace picker - not only the ones the ranked
+    table touches: a namespace of many small workloads can carry more savings than any one ranked
+    workload and never appear in the top N.
+
+    A NamespaceAutomationConfig covers every workload of its enabled kinds in the namespace, so
+    each namespace also lists the workloads that must NOT ride along: held out by the tenant
+    config, stateful (the plan's manual lane), or JVM (the heap flag has to move with the memory
+    request). The generator writes a Disabled WorkloadAutomationConfig for each one whose kind
+    the namespace config enables - workload settings override namespace settings.
+
+    `auto` is broken out per kind so the page can recompute a namespace's figures for whichever
+    controller types are selected. Platform-managed namespaces are listed (shown, never
+    selectable); a namespace with nothing a namespace config could automate is only counted.
+    """
+    nsd = {}
+    for x in w:
+        a = nsd.get(x["namespace"])
+        if a is None:
+            a = nsd[x["namespace"]] = {"ns": x["namespace"], "managed": x["_lane"] == "managed", "auto": {}, "excl": [],
+                                       "types": []}
+        if x["type"] not in POV_CR_TYPES:
+            continue
+        if a["managed"]:
+            # shown greyed out only while one of the kinds it runs is selected, like every other row
+            if x["type"] not in a["types"]:
+                a["types"].append(x["type"])
+            continue
+        reason = ("held_out" if x["_lane"] == "held_out" else "stateful" if x["_lane"] == "stateful"
+                  else "jvm" if x.get("_jvm") else None)
+        if reason:
+            a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason})
+            continue
+        t = a["auto"].setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
+        t["n"] += 1
+        t["pot"] += R(max(x["potential_savings"], 0.0))
+        t["waste"] += R(max(x["waste"], 0.0))
+        t["risk"] += 1 if risk_sev(x) >= 3 else 0
+    for a in nsd.values():
+        a["excl"].sort(key=lambda e: (e["type"], e["name"]))
+        a["pot"] = sum(t["pot"] for t in a["auto"].values())
+    listed = [a for a in nsd.values() if (a["managed"] and a["types"]) or a["auto"]]
+    listed.sort(key=lambda a: (a["managed"], -a["pot"], a["ns"]))
+    return {"namespaces": listed, "ns_nothing_to_automate": sum(1 for a in nsd.values() if not a["managed"] and not a["auto"])}
 
 
 def primary_issue(w):
@@ -339,7 +463,8 @@ def fingerprint(cfg, cluster, files):
                 h.update(f"{cand.name}:{st.st_size}:{int(st.st_mtime)}".encode())
     relevant = {k: cfg[k] for k in ("exclusions", "held_out_from_automation", "stateful_patterns", "managed_namespaces",
                                     "auto_provisioned_pool_patterns", "gpu_pool_patterns", "thresholds", "scale_to_days",
-                                    "min_history_days", "cloud", "eligibility_file", "hpa_file")}
+                                    "min_history_days", "cloud", "eligibility_file", "hpa_file",
+                                    "jvm_patterns", "nonprod_patterns", "pov_top_n", "pov_savings_weight")}
     h.update(json.dumps(relevant, sort_keys=True).encode())
     return h.hexdigest()[:16]
 
@@ -656,6 +781,9 @@ def _load(cfg, cluster, d):
         "under_protected": [prow(x) for x in sorted(under_protected, key=lambda x: -x["cost_increase"])],
         "over_protected": [prow(x) for x in sorted(over_protected, key=lambda x: -x["cost"])],
     }
+
+    # ---- POV automation kickoff ranking (rendered by pov.py, one page per cluster)
+    out["pov"] = pov_rank(w, R, T, top_n=int(cfg["pov_top_n"]), savings_weight=cfg["pov_savings_weight"])
 
     # ---- eligibility summary
     if elig_map:

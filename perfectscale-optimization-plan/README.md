@@ -18,12 +18,23 @@ programs, which is the point.
 | Optimization plan | `.md`, `.html`, `.json`, `.xlsx`, `.csv` | the customer's platform / FinOps team |
 | Executive summary, one page | `.docx`, `.html` | a decision-maker |
 | Per-cluster findings | `.md`, one per cluster | the engineers who do the work |
+| POV automation kickoff | `.html`, one per cluster | the POV working session: scope automation, then generate its CRDs |
 | Change log against the previous run | `.md` | you, when re-running later |
 
-The two HTML files are self-contained — no external assets, no server. Email them
+The HTML files are self-contained — no external assets, no server. Email them
 and they open in any browser. The plan's HTML carries a live adoption-rate control
 and per-table column controls, which makes it a working session tool rather than
 a static report.
+
+The POV automation kickoff page ranks a cluster's top 50 workloads by cost and
+resiliency and filters them with a controller-type pull-down. Two independent
+buttons write PerfectScale automation configs as YAML to download: **Generate
+workload CRDs** for the workloads ticked in the ranked table, and **Generate
+namespace CRDs** for the namespaces ticked in its namespace picker, one file per
+workload or namespace, with held-out, stateful and JVM workloads disabled inside
+each namespace file. CPU
+`keepLimit` is set to `false` with a review comment on the line. Nothing is
+applied to a cluster. See [references/pov-kickoff.md](references/pov-kickoff.md).
 
 ## Requirements
 

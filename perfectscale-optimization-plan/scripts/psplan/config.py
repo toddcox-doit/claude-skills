@@ -65,6 +65,10 @@ DEFAULTS = {
     "hpa_file": None,                       # optional JSON from the PodFit browser pass: per-workload HPA presence/triggers (see eligibility-enrichment.md)
     "trends_csv": None,                     # optional daily cost-by-cluster CSV for seasonality check
     "previous_plan": None,                  # path to an earlier plan JSON, for the change log
+    # POV automation kickoff page (one per cluster): how many workloads the ranked table holds, and
+    # the savings share of its 0-100 score (the rest is risk severity). See references/pov-kickoff.md.
+    "pov_top_n": 50,
+    "pov_savings_weight": 0.6,
 }
 
 

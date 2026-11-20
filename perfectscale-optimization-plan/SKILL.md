@@ -3,27 +3,19 @@ name: perfectscale-optimization-plan
 license: Apache-2.0
 description: >
   Produce a sequenced, ROI-ranked PerfectScale optimization plan for a customer
-  tenant — a working-session worksheet (Markdown + self-contained HTML, plus
-  XLSX/CSV and JSON) that a solutions engineer screen-shares with the customer's
-  platform/K8s and FinOps team to decide what to do first, second, and third.
-  Converts findings into discrete Actions, scores each as (monthly savings x
-  confidence) / effort, assigns owner + prerequisite + verification method,
-  groups into Phase 1 (0-30d quick wins) / Phase 2 (30-90d structural) /
-  Phase 3 (90d+ govern), and promotes unblocker actions whose own dollar value
-  understates what they release. Use for: "optimization plan", "optimization
-  strategy", "optimization roadmap", "detailed optimization steps",
-  "optimization session", "where do we start", "what's the highest ROI",
-  "prioritized action plan", "how do we capture these savings", "sequence the
-  work", "quick wins", "90-day plan", "phased rollout plan", "customer working
-  session", "drive the conversation with the customer", "regenerate the plan",
-  "re-run the analysis for this tenant". Distinct from
-  perfectscale-tenant-savings-report-v2.0 (finds and reports the opportunity,
-  organized by cluster — this skill consumes that and organizes by what you DO,
-  in order). Also covers the executive one-pager: `scripts/exec_summary.js`
-  renders a one-page buying-decision summary (.docx) straight from the plan
-  JSON, so use this skill for "executive brief", "exec summary", "one-pager" or
-  "buying-decision brief" too. The separate perfectscale-executive-1pager skill
-  was retired on 2026-10-21 and now lives in `~/.claude/skills-archive`.
+  tenant: a working-session worksheet (Markdown, self-contained HTML, XLSX/CSV,
+  JSON) an SE screen-shares with the customer's platform and FinOps teams to
+  decide what to do first, second and third. Scores each action as (savings x
+  confidence) / effort, assigns owner, prerequisite and verification, and phases
+  it 0-30 / 30-90 / 90+ days. The same run renders the one-page executive
+  summary and, per cluster, a POV automation kickoff page: top 50
+  workloads ranked by cost and resiliency, filtered by controller type, that
+  generates PerfectScale automation CRDs. Use for: "optimization plan",
+  "roadmap", "where do we start", "highest ROI", "prioritized action plan",
+  "quick wins", "90-day plan", "customer working session", "regenerate the
+  plan", "executive summary", "one-pager", "POV kickoff", "POV scope",
+  "automation CRDs", "generate automation configs". Takes what
+  perfectscale-tenant-savings-report-v2.0 finds and orders it by what you do.
 compatibility: >
   CLI-first via `pscli`. A public-API service token is the only hard
   prerequisite — the default path produces a complete, scored, sequenced plan
@@ -201,7 +193,28 @@ Step 3 writes all of this. None of it needs a second command:
 | Optimization plan | `.md`, `.html`, `.json`, `.xlsx`, `.csv` |
 | Per-cluster findings | `.md`, one per cluster |
 | **Executive summary** (one page) | **`.docx` and `.html`** |
+| **POV automation kickoff** | **`.html`, one per cluster** (plus a `POV kickoff` sheet in the `.xlsx`) |
 | Change log vs `previous_plan` | `.md`, when configured |
+
+The POV automation kickoff page sets the scope of a PerfectScale POV, from the
+day automation is switched on to the technical win. It ranks the cluster's top
+50 workloads by one cost-and-resiliency score in a single table with a
+Controller type column and filters it with a controller-type pull-down. Two
+independent buttons write PerfectScale automation configs, each with the
+one-per-cluster `ClusterAutomationConfig` prerequisite: **Generate workload
+CRDs** writes one file per workload ticked in the ranked table, and
+**Generate namespace CRDs** writes one file per namespace ticked in the
+namespace picker (every namespace running a selected controller type, not only
+the top-50 ones), each
+holding its `NamespaceAutomationConfig` plus a `Disabled` workload config for
+every held-out, stateful or JVM workload in it. Every config uses the
+cost-optimization profile of PerfectScale's published examples, with CPU
+`keepLimit: false` and a REVIEW comment on that line. The page applies nothing.
+See `references/pov-kickoff.md` for the ranking, the CR shape and how to walk a
+customer through it.
+
+The separate perfectscale-executive-1pager skill was retired on 2026-10-21 and
+now lives in `~/.claude/skills-archive`; this skill's executive summary replaces it.
 
 The executive summary is rendered by `scripts/exec_summary.js` from the plan
 JSON — the same content model emits both formats, so they cannot drift from the
@@ -338,3 +351,5 @@ python3 -W ignore -m unittest discover -s tests
   (rate limits, window normalization, wall minutes, idle as an upper bound).
 - `references/tenant-config.md` — the config keys.
 - `references/eligibility-enrichment.md` — the optional PodFit eligibility pass.
+- `references/pov-kickoff.md` — the POV automation kickoff page: ranking score,
+  what is kept out, the generated CRs, and the keepLimit review.

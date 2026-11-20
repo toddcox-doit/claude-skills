@@ -1018,6 +1018,24 @@ def render_tables(cfg, S, facts, out_dir):
     for f in facts:
         for r in f["top"]:
             w3.append([f["name"], short_name(r["name"]), r["ns"], r["lane"], r["cpu_cur"], r["cpu_rec"], round(r["waste"]), round(r["pot"])])
+    # The POV kickoff table, every cluster in one sheet - the same rows and order as each
+    # cluster's kickoff page, for anyone who scopes the POV in a spreadsheet instead.
+    from . import pov
+    pov_rows = list(pov.pov_sheet_rows(facts))
+    if pov_rows:
+        wp = wb.create_sheet("POV kickoff")
+        wp.append(pov.POV_COLS)
+        for r in pov_rows:
+            wp.append(r)
+        for c in wp[1]:
+            c.font = Font(bold=True)
+        wp.freeze_panes = "A2"; wp.auto_filter.ref = wp.dimensions
+        for col, wd in zip("ABCDEFGHIJKL", (18, 6, 40, 24, 14, 12, 14, 9, 28, 14, 7, 48)):
+            wp.column_dimensions[col].width = wd
+        for row in wp.iter_rows(min_row=2):
+            for c in row:
+                if pov.POV_COLS[c.column - 1] in ("monthly_cost", "potential_savings", "resiliency_likely"):
+                    c.number_format = '"$"#,##0'
     w4 = wb.create_sheet("Node pools")
     w4.append(["cluster", "pool", "machine", "nodes_avg", "idle", "cost", "rec_to", "rec_save"])
     for f in facts:
@@ -1075,6 +1093,11 @@ def write_all(cfg, S, facts):
     w(fname(cfg, "optimization-plan", "json"), json.dumps(S, indent=1, default=str))
     for f in facts:
         w(fname(cfg, f"{f['name']}-findings", "md"), render_cluster_md(cfg, S, f))
+    # POV automation kickoff, one page per cluster. Imported here, not at module top: pov.py
+    # reuses this module's CSS and table scripts, so a top-level import would be circular.
+    from . import pov
+    for f in facts:
+        w(pov.pov_fname(cfg, f), pov.render_pov_html(cfg, f))
     made += render_tables(cfg, S, facts, out)
     made += write_exec_summary(cfg, plan_json, out)
     return made

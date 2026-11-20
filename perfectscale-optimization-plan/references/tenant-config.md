@@ -16,3 +16,8 @@ evidence. Same open-assumption mechanism as `assumptions.gitops`.
 `hpa_file` is optional JSON from the PodFit browser pass (per-workload HPA
 presence/trigger thresholds); see `references/eligibility-enrichment.md`.
 Absent, HPA status is unconfirmed and the plan says so.
+
+`pov_top_n` (default 50) is how many workloads each cluster's POV automation
+kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of
+its 0-100 ranking score; the rest is risk severity. See
+`references/pov-kickoff.md`.

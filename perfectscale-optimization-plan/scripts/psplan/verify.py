@@ -1,4 +1,5 @@
 """Independent verifier: recomputes headline numbers from the raw files (not from the model) and runs wording gates."""
+import html
 import json
 import re
 from pathlib import Path
@@ -165,4 +166,51 @@ def verify(cfg, S, facts, files):
                     row_mark = f"| {ns} |" if p.suffix == ".md" else f">{ns}</button>"
                     chk(row_mark not in main_span, f"{p.name}: managed namespace {ns}'s row is not in the main by-namespace table")
                     chk(row_mark in mg_span, f"{p.name}: managed namespace {ns}'s row appears in the platform-managed add-ons appendix")
+        if "pov-automation-kickoff" in p.name and p.suffix == ".html":
+            # The POV kickoff page: its ranked rows must match the model, nothing the model held
+            # out may appear as a row, and the CR pieces must carry the keepLimit review comment.
+            from .pov import pov_fname  # lazy: pov imports render, which this module need not load
+            f = next((x for x in facts if pov_fname(cfg, x) == p.name), None)
+            chk(f is not None, f"{p.name}: POV kickoff page maps to a cluster in this run")
+            if f is None:
+                continue
+            rows = (f.get("pov") or {}).get("rows", [])
+            body = t.split("<tbody>", 1)[1].split("</tbody>", 1)[0] if "<tbody>" in t else ""
+            chk(body.count("<tr data-type=") == len(rows), f"{p.name}: POV table holds exactly the {len(rows)} ranked rows")
+            chk(body.count("class=wlck value=") == len(rows),
+                f"{p.name}: every ranked workload has its own in-scope checkbox")
+            chk(all(r["lane"] not in ("managed", "held_out") for r in rows),
+                f"{p.name}: no platform-managed or held-out workload is ranked")
+            m = re.search(r"<script type=application/json id=povdata>(.*?)</script>", t, re.S)
+            chk(m is not None, f"{p.name}: POV page embeds its CR data")
+            if m:
+                D = json.loads(m.group(1).replace("<\\/", "</"))
+                chk(len(D["rows"]) == len(rows), f"{p.name}: CR data covers every ranked row")
+                lim = [b for b in D["type_block"].values()] + [r["wl_doc"] for r in D["rows"]]
+                chk(all(any(x.strip().startswith("keepLimit: false  # REVIEW") for x in b) for b in lim),
+                    f"{p.name}: every generated CR sets keepLimit false with an inline REVIEW comment")
+                chk(all(not any("increaseEnabled: true" in x for x in b) for b in lim),
+                    f"{p.name}: generated CRs are cost-only (no request or limit increases)")
+                # PerfectScale's namespace/workload templates spell out the whole operational block;
+                # a CR carrying only automationMode + restrictions leaves the customer guessing at
+                # frequencies, maintenance window and runaway limits.
+                need = ("automationStrategy:", "podResizePendingStrategy:", "duringRolloutInProgress:",
+                        "wasteMaxAutomationFrequency:", "fixResiliencyMaxAutomationFrequency:", "maintenanceWindow:",
+                        "maintenanceWindowIgnoredMinResiliencyLevel:", "workloadMinWasteUSDPerMonth:",
+                        "cpuRunawayDetection:", "memoryLeakDetection:", "minimumCores:", "maximumGiB:")
+                chk(all(all(any(x.strip().startswith(k) for x in b) for k in need) for b in lim),
+                    f"{p.name}: every generated CR carries the full operational block of PerfectScale's templates")
+                # Namespace picker: a platform-managed namespace is shown but can never be generated,
+                # and every namespace exclusion is a Disabled config, never an enabling one.
+                model_ns = (f.get("pov") or {}).get("namespaces", [])
+                managed = [n["ns"] for n in model_ns if n["managed"]]
+                d_ns = {n["ns"] for n in D.get("namespaces", [])}
+                chk(not (d_ns & set(managed)), f"{p.name}: no platform-managed namespace can be generated")
+                chk(all(f"class=nsck value='{html.escape(ns)}' disabled" in t for ns in managed),
+                    f"{p.name}: platform-managed namespaces are listed with their checkbox disabled")
+                chk(d_ns == {n["ns"] for n in model_ns if not n["managed"]},
+                    f"{p.name}: the namespace picker lists every namespace the model found automatable")
+                ex = [x["doc"] for n in D.get("namespaces", []) for x in n["excl"]]
+                chk(all('      automationMode: "Disabled"' in d and not any("Enabled" in y for y in d) for d in ex),
+                    f"{p.name}: every namespace exclusion is a Disabled workload config")
     return ok, errs
