@@ -23,7 +23,7 @@ impersonation. It always runs the browser automation in Haiku (fastest model).
 fallback — a nine-step portal flow — and should only be reached via Step 4 below, or when
 the user asks for Frontegg by name.
 
-**Tenant selection is mandatory and never hard-coded.** Do not default to Finom,
+**Tenant selection is mandatory and never hard-coded.** Do not default to Acme,
 Demo-saas, Latest-prod, or any other sample tenant from docs or prior runs. Use only
 the tenant the skill user provides for this run.
 
