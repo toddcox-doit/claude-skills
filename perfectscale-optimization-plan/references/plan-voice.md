@@ -232,3 +232,10 @@ columns. Sorted by phase then roi_score.]
   blocked-pending.
 - **Worksheet columns** (`Owner`, `Target`, `Decision`) are always the last
   three, always empty, always footnoted the first time they appear.
+- **Platform-managed namespaces** (kube-system and similar) get their own
+  appendix, structurally separate from the main by-namespace table — never an
+  inline tag or asterisk in a shared table. Held out of the savings/automation
+  ask because the platform reconciles those manifests, not because the money
+  or the risk stopped being real: the managed appendix carries the exact same
+  columns, including At risk and OOM, and a resiliency finding on a managed
+  namespace is never softened or dropped, only moved to its own section.

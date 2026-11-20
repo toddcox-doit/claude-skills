@@ -47,7 +47,7 @@ class TestModel(Base):
 
     def test_lanes(self):
         a, _ = model.load_all(self.cfg, parallel=False)
-        self.assertEqual(a["lanes"]["managed"]["n"], 3)     # kube-system
+        self.assertEqual(a["lanes"]["managed"]["n"], 4)     # kube-system (coredns x3 + metrics-server)
         self.assertEqual(a["lanes"]["stateful"]["n"], 7)    # kafka x4 + elasticsearch x3
         self.assertGreater(a["lanes"]["job"]["n"], 250)
         self.assertEqual(a["primary_framework"], "airflow")

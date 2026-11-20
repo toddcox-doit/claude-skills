@@ -712,26 +712,48 @@ class T(unittest.TestCase):
         rec = self.S["namespace_rollup"]["rows"][0]
         self.assertIn(f"`{rec['ns']}` - {', '.join(rec['clusters'])}", mt)
 
-    def test_managed_marker_is_named_not_a_bare_asterisk(self):
-        # an unexplained "*" in a table is a question the reader cannot answer
+    def test_managed_namespaces_get_their_own_appendix_not_a_marker(self):
+        # an unexplained mark in a shared table is a question the reader cannot answer;
+        # structural separation replaces the old inline "(platform-managed)" tag entirely -
+        # a managed namespace must never appear in the main by-namespace table, only in its
+        # own section, with no mark left to misread in either one
         files = render.write_all(self.cfg, self.S, self.F)
         md = [f for f in files if f.suffix == ".md" and "optimization-plan" in f.name][0]
         mt = md.read_text(encoding="utf-8")
-        body = mt.split(render.NS_TITLE, 1)[1].split("## Appendix: evidence", 1)[0]
-        self.assertNotIn(" *", body.replace(render.NS_LEGEND, ""))
-        if any(r["managed"] for r in self.S["namespace_rollup"]["rows"][:self.S["namespace_rollup"]["n_shown"]]):
-            self.assertIn(render.NS_MANAGED_MARK, body)
-        self.assertIn(render.NS_MANAGED_MARK, render.NS_LEGEND)
+        main_body = mt.split(render.NS_TITLE, 1)[1].split(render.MANAGED_TITLE, 1)[0]
+        managed_rows = [r for r in self.S["namespace_rollup"]["rows"] if r["managed"]]
+        self.assertTrue(managed_rows, "fixture should exercise at least one managed namespace")
+        managed_body = mt.split(render.MANAGED_TITLE, 1)[1].split("## Appendix: evidence", 1)[0]
+        for r in managed_rows:
+            self.assertNotIn(f"| {r['ns']} |", main_body)
+            self.assertIn(f"| {r['ns']} |", managed_body)
+
+    def test_managed_addon_with_resiliency_finding_is_not_softened(self):
+        # held out of the savings/automation ask is not the same as held out of the
+        # resiliency finding - a managed namespace that is OOM-killing must still show it,
+        # in the same At risk / OOM columns as any other namespace, not zeroed to "-"
+        rows = [r for r in self.S["namespace_rollup"]["rows"] if r["managed"]]
+        ks = next(r for r in rows if r["ns"] == "kube-system")
+        self.assertGreater(ks["oom_n"], 0)
+        row = render._ns_row(ks)
+        self.assertEqual(row[7], str(ks["oom_n"]))  # OOM column, not the "-" placeholder
+        files = render.write_all(self.cfg, self.S, self.F)
+        md = [f for f in files if f.suffix == ".md" and "optimization-plan" in f.name][0]
+        managed_body = md.read_text(encoding="utf-8").split(render.MANAGED_TITLE, 1)[1].split("## Appendix: evidence", 1)[0]
+        self.assertIn("| " + " | ".join(row) + " |", managed_body)
 
     def test_namespace_total_reconciles_to_achievable_plus_held_out(self):
-        # the table sums to full pod potential, not to the headline achievable figure;
-        # the gap is the platform-managed namespaces, and the doc must say so
+        # the full namespace total sums to full pod potential, not to the headline
+        # achievable figure; the gap is the platform-managed namespaces, and the managed
+        # add-ons appendix (not the main table) must say so
         nr, S = self.S["namespace_rollup"], self.S
         gap = nr["totals"]["pot"] - S["totals"]["achievable_now_monthly"]
         self.assertLessEqual(abs(gap - S["pod"]["managed_held_out"]), nr["n_total"] + 2)
-        note = render.namespace_note(S)
-        self.assertIn(usd(nr["totals"]["pot"]), note)
-        self.assertIn(usd(S["pod"]["managed_held_out"]), note)
+        managed_rows = [r for r in nr["rows"] if r["managed"]]
+        held_from_rows = sum(r["pot"] for r in managed_rows)
+        note = render.managed_addon_note(S)
+        self.assertIn(usd(held_from_rows), note)
+        self.assertNotIn(usd(nr["totals"]["pot"]), render.namespace_note(S))
 
     def test_prose_appendix_is_capped_but_the_sheet_is_not(self):
         nr = self.S["namespace_rollup"]

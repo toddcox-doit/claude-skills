@@ -119,6 +119,13 @@ def build_prod_a():
     # managed add-ons
     for i in range(3):
         w.append(wl(f"coredns-{i}", "kube-system", "Deployment", 20, 12, 9, 35))
+    # a managed-namespace workload with a real resiliency risk: held out of the savings/
+    # automation ask does not mean held out of the resiliency finding - it should still
+    # surface in Action detail (r_oom), and the managed-add-ons appendix should still show
+    # its OOM/at-risk columns rather than softening them.
+    w.append(wl("metrics-server", "kube-system", "Deployment", 40, 5, 0, 35, inc=100, cpu=(1, 1), mem=(512, 900),
+                p95=(0.5, 850), p90=(0.4, 820), p100=(0.9, 980),
+                cont_inds=[ind("OOM", "risk", 3)], max_ind="OOM"))
     # extraHeadroom policy cohort
     for i in range(4):
         w.append(wl(f"svc-eh-{i}", "payments", "Deployment", 90, 40, 20, 35, policy="extraHeadroom"))

@@ -149,4 +149,20 @@ def verify(cfg, S, facts, files):
         # pattern only ever returns tokens starting with "$", so a bare "nan" could never appear in its
         # result - provably dead. The "$nan"/"$inf" checks below are the real, live coverage.)
         chk("$nan" not in t and "$inf" not in t, f"{p.name}: no NaN/inf dollars")
+        if "optimization-plan" in p.name and p.suffix in (".md", ".html"):
+            # Platform-managed namespaces (kube-system and similar) get their own appendix,
+            # structurally separate from the main by-namespace table - not an inline tag a
+            # reader could miss. Match the actual table-row markup (not a bare substring -
+            # the legend text itself names "kube-system" as an example, which a substring
+            # check would wrongly catch), so a managed namespace's own row must never appear
+            # in the main table and must appear in its own section's table.
+            managed_names = [r["ns"] for r in (S.get("namespace_rollup") or {}).get("rows", []) if r["managed"]]
+            if managed_names and "Appendix: platform-managed add-ons" in t:
+                mg_mark = "Appendix: platform-managed add-ons"
+                main_span = t.split(mg_mark, 1)[0]
+                mg_span = t.split(mg_mark, 1)[1]
+                for ns in managed_names:
+                    row_mark = f"| {ns} |" if p.suffix == ".md" else f">{ns}</button>"
+                    chk(row_mark not in main_span, f"{p.name}: managed namespace {ns}'s row is not in the main by-namespace table")
+                    chk(row_mark in mg_span, f"{p.name}: managed namespace {ns}'s row appears in the platform-managed add-ons appendix")
     return ok, errs

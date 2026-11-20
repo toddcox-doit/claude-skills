@@ -219,51 +219,86 @@ NS_FOOT = ("Potential savings here is PodFit-computed, the same money the action
            "table re-cuts it by owner, it does not add to it. Resiliency spend is money to add, never "
            "netted against savings.")
 NS_COLS = ["Namespace", "Clusters", "Workloads", "Cost", "Waste", "Potential savings", "At risk", "OOM", "Resiliency spend (likely)"]
-NS_MANAGED_MARK = "platform-managed"
-NS_LEGEND = (f"Marked {NS_MANAGED_MARK}: a platform add-on namespace. The platform reconciles its "
-             "manifests, so it is held out of the automation ask and its savings are not claimed.")
+MANAGED_TITLE = "Appendix: platform-managed add-ons (held out of this ask)"
+NS_LEGEND = ("Platform-managed namespaces (kube-system and similar) are not in this table - "
+             f"see '{MANAGED_TITLE}' below.")
+MANAGED_LEAD = ("The namespaces below are platform add-ons - kube-system and similar - where the platform "
+                "itself reconciles the manifests, so a PerfectScale change would just be reverted. They are "
+                "not part of this plan's savings or automation ask for that reason, not because they were "
+                "overlooked. Held out here, not deleted from the plan: the same columns as the table above, "
+                "including At risk and OOM. A platform add-on that is failing is still a real resiliency risk "
+                "- if one shows a finding here, it is already covered by its own action in Action detail above, "
+                "the same as any other workload.")
 
 
-def namespace_rows(S):
-    """Rows for the by-namespace appendix, as display strings, capped for prose."""
-    nr = S.get("namespace_rollup") or {}
-    out = []
-    for r in nr.get("rows", [])[:nr.get("n_shown", 0)]:
-        out.append([
-            r["ns"] + (f" ({NS_MANAGED_MARK})" if r["managed"] else ""),
-            str(r["n_clusters"]),
-            str(r["n"]),
-            usd(r["cost"]),
-            usd(r["waste"]),
-            usd(r["pot"]),
-            str(r["risk_n"]) if r["risk_n"] else "-",
-            str(r["oom_n"]) if r["oom_n"] else "-",
-            usd(r["res_likely"]) if r["res_likely"] else "-",
-        ])
-    return out
+def _ns_row(r):
+    return [
+        r["ns"],
+        str(r["n_clusters"]),
+        str(r["n"]),
+        usd(r["cost"]),
+        usd(r["waste"]),
+        usd(r["pot"]),
+        str(r["risk_n"]) if r["risk_n"] else "-",
+        str(r["oom_n"]) if r["oom_n"] else "-",
+        usd(r["res_likely"]) if r["res_likely"] else "-",
+    ]
 
 
-def namespace_note(S):
-    """The 'and N more' line, plus why this table's total is not the headline figure.
+def _ns_split(S, top=40):
+    """Platform-managed namespaces get their own section (see MANAGED_LEAD for why), so they
+    are split out before the main appendix is ranked and capped - a managed namespace must
+    never occupy one of the main table's top-N slots only to be hidden from it.
 
-    Summed, this column comes to the full PodFit potential, which is larger than the
-    plan's achievable figure because achievable excludes the platform-managed
-    namespaces. Someone checking the two against each other deserves that stated
-    rather than left as an apparent error.
+    Returns (non_managed_rows_all, non_managed_shown_n, non_managed_rest, managed_rows_all).
     """
     nr = S.get("namespace_rollup") or {}
-    t = nr.get("truncated")
-    cap = (f"Showing the top {nr['n_shown']} of {nr['n_total']} namespaces, ranked by potential savings plus "
-           f"resiliency spend. The remaining {t['n']} hold {usd(t['pot'])}/mo of potential savings and "
-           f"{usd(t['res_likely'])}/mo of resiliency spend between them; the spreadsheet lists every namespace."
-           if t else f"All {nr.get('n_total', 0)} namespaces in scope are listed.")
-    held = S.get("pod", {}).get("managed_held_out") or 0
-    tot = (nr.get("totals") or {}).get("pot") or 0
-    ach = S.get("totals", {}).get("achievable_now_monthly") or 0
-    if held and tot:
-        cap += (f" Potential savings across all {nr['n_total']} namespaces comes to {usd(tot)}/mo, above the "
-                f"plan's {usd(ach)}/mo achievable figure: the difference is {usd(held)}/mo in platform-managed "
-                f"namespaces, which this table shows but the automation ask deliberately leaves out.")
+    rows = nr.get("rows", [])
+    nm = [r for r in rows if not r["managed"]]
+    mg = [r for r in rows if r["managed"]]
+    shown_n = min(top, len(nm))
+    rest = nm[top:]
+    return nm, shown_n, rest, mg
+
+
+def namespace_rows(S, top=40):
+    """Rows for the by-namespace appendix, as display strings, capped for prose. Excludes
+    platform-managed namespaces - those get their own section, managed_addon_rows."""
+    nm, shown_n, _, _ = _ns_split(S, top)
+    return [_ns_row(r) for r in nm[:shown_n]]
+
+
+def managed_addon_rows(S):
+    """Platform-managed namespaces, same columns as namespace_rows, kept in their own section.
+    Never capped: the count is small by construction (platform add-ons, not application
+    namespaces), so there is no "top N" to rank within it."""
+    _, _, _, mg = _ns_split(S)
+    return [_ns_row(r) for r in mg]
+
+
+def namespace_note(S, top=40):
+    """The 'and N more' line, scoped to the non-managed table only (platform-managed
+    namespaces have their own section and their own total, not this one)."""
+    nm, shown_n, rest, _ = _ns_split(S, top)
+    cap = (f"Showing the top {shown_n} of {len(nm)} namespaces, ranked by potential savings plus "
+           f"resiliency spend. The remaining {len(rest)} hold {usd(sum(r['pot'] for r in rest))}/mo of potential savings and "
+           f"{usd(sum(r['res_likely'] for r in rest))}/mo of resiliency spend between them; the spreadsheet lists every namespace."
+           if rest else f"All {len(nm)} namespaces in scope are listed.")
+    return cap
+
+
+def managed_addon_note(S):
+    """Why this total sits outside the plan's achievable figure, mirroring namespace_note's
+    reconciliation note but scoped to the managed-only total."""
+    _, _, _, mg = _ns_split(S)
+    if not mg:
+        return ""
+    held = round(sum(r["pot"] for r in mg))
+    res = round(sum(r["res_likely"] for r in mg))
+    cap = f"{len(mg)} platform-managed namespace{'s' if len(mg) != 1 else ''} carrying {usd(held)}/mo of PodFit-computed potential savings"
+    cap += f" and {usd(res)}/mo of resiliency spend" if res else ""
+    cap += (", none of it counted in this plan's achievable or resiliency-investment totals - the automation "
+            "ask deliberately leaves it out, for the reason above.")
     return cap
 
 
@@ -380,8 +415,9 @@ def render_plan_md(cfg, S):
         for i, s in enumerate(a["steps"], 1):
             L.append(f"{i}. {s}")
         L.append("")
-    nrows = namespace_rows(S)
-    if nrows:
+    nm, shown_n, _, mg = _ns_split(S)
+    if nm:
+        nrows = [_ns_row(r) for r in nm[:shown_n]]
         L += [f"## {NS_TITLE}", "", NS_LEAD, "",
               "| " + " | ".join(NS_COLS) + " |",
               "|" + "---|" * len(NS_COLS)]
@@ -391,7 +427,17 @@ def render_plan_md(cfg, S):
         # reader can open: collapsible where the viewer supports it, plain text where
         # it does not, and present on paper either way.
         L += ["<details>", "<summary>Which clusters each namespace runs in</summary>", ""]
-        for rec in S["namespace_rollup"]["rows"][:len(nrows)]:
+        for rec in nm[:shown_n]:
+            L.append(f"- `{rec['ns']}` - {', '.join(rec['clusters'])}")
+        L += ["", "</details>", ""]
+    if mg:
+        L += [f"## {MANAGED_TITLE}", "", MANAGED_LEAD, "",
+              "| " + " | ".join(NS_COLS) + " |",
+              "|" + "---|" * len(NS_COLS)]
+        L += ["| " + " | ".join(_ns_row(r)) + " |" for r in mg]
+        L += ["", managed_addon_note(S), ""]
+        L += ["<details>", "<summary>Which clusters each namespace runs in</summary>", ""]
+        for rec in mg:
             L.append(f"- `{rec['ns']}` - {', '.join(rec['clusters'])}")
         L += ["", "</details>", ""]
     L += ["## Appendix: evidence detail", "", "The statements above, with their basis and how to check each one in PerfectScale.", "", "| Status | Statement | Basis | How to check |", "|---|---|---|---|"] + [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in evidence_rows(S)] + [""]
@@ -862,30 +908,32 @@ def render_html(cfg, S, facts):
     P.append("<h2>Clusters</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("Cluster", "Window (d)", "Pod cost", "Waste", "Potential", "Node cost", "Node idle")) + "</tr></thead><tbody>")
     for f in facts:
         P.append(f"<tr><td>{e(f['name'])}</td><td>{f['window_days']:.0f}</td><td data-v='{f['cost']:.0f}'>{usd(f['cost'])}</td><td data-v='{f['waste']:.0f}'>{usd(f['waste'])}</td><td data-v='{f['pot']:.0f}'>{usd(f['pot'])}</td><td data-v='{f['pools']['cost']:.0f}'>{usd(f['pools']['cost'])}</td><td data-v='{f['pools']['idle']:.0f}'>{usd(f['pools']['idle'])}</td></tr>")
-    nrows = namespace_rows(S)
-    ns_html = ""
-    if nrows:
-        nrec = (S["namespace_rollup"]["rows"])[:len(nrows)]
+    nm, shown_n, _, mg = _ns_split(S)
+
+    def _ns_table_html(title, lead, records, note):
         body = ""
-        for row, rec in zip(nrows, nrec):
+        for rec in records:
+            row = _ns_row(rec)
             # The cluster list gets a full-width row of its own, tied to its namespace by
             # data-ns / data-for. The sort script re-pairs them, so reordering the table
             # cannot separate a namespace from its clusters. data-v keeps the sort keyed on
             # the bare name rather than anything rendered around it.
-            tag = f" <span class=tag>{e(NS_MANAGED_MARK)}</span>" if rec["managed"] else ""
             body += (f"<tr data-ns='{e(rec['ns'])}'><td data-v='{e(rec['ns'])}'>"
-                     f"<button type=button class=nstog aria-expanded=false>{e(rec['ns'])}</button>{tag}</td>"
+                     f"<button type=button class=nstog aria-expanded=false>{e(rec['ns'])}</button></td>"
                      + "".join(f"<td class=num>{e(c)}</td>" for c in row[1:]) + "</tr>")
             body += (f"<tr class=nsdet data-for='{e(rec['ns'])}' hidden><td colspan={len(NS_COLS)}>"
                      f"<span class=mut>Runs in {rec['n_clusters']} cluster"
                      f"{'' if rec['n_clusters'] == 1 else 's'}: {e(', '.join(rec['clusters']))}</span></td></tr>")
-        ns_html = ("<h2>" + e(NS_TITLE) + "</h2><p>" + e(NS_LEAD) + "</p>"
-                   + "<p class=mut>Click a namespace to see which clusters it runs in.</p>"
-                   + "<div class=wrap><table class=sort><thead><tr>"
-                   + "".join(f"<th>{e(h)}</th>" for h in NS_COLS) + "</tr></thead><tbody>"
-                   + body + "</tbody></table></div><p class=mut>" + e(namespace_note(S))
-                   + "</p><p class=fn>" + e(NS_LEGEND) + " " + e(NS_FOOT) + "</p>")
-    P.append("</tbody></table></div>" + "<h2>" + DECISIONS_TITLE + "</h2><p>" + e(DECISIONS_LEAD) + "</p>" + "".join(f"<h3>{e(g)}: {e(cap)}</h3><ol>" + "".join(f"<li>{e(x)}</li>" for x in lines) + "</ol>" for g, cap, lines in decision_groups(S)) + ns_html + ("<h2>Appendix: evidence detail</h2><p class=mut>The statements above, with their basis and how to check each one in PerfectScale.</p><div class=wrap><table><thead><tr><th>Status</th><th>Statement</th><th>Basis</th><th>How to check</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in evidence_rows(S)) + "</tbody></table></div>") + (("<h2>Feedback requested</h2><ol>" + "".join(f"<li>{e(x)}</li>" for x in FEEDBACK_PROMPTS) + "</ol>") if cfg.get("status") else "") + "</main>")
+        return ("<h2>" + e(title) + "</h2><p>" + e(lead) + "</p>"
+                + "<p class=mut>Click a namespace to see which clusters it runs in.</p>"
+                + "<div class=wrap><table class=sort><thead><tr>"
+                + "".join(f"<th>{e(h)}</th>" for h in NS_COLS) + "</tr></thead><tbody>"
+                + body + "</tbody></table></div><p class=mut>" + e(note) + "</p>")
+
+    ns_html = (_ns_table_html(NS_TITLE, NS_LEAD, nm[:shown_n], namespace_note(S))
+               + "<p class=fn>" + e(NS_LEGEND) + " " + e(NS_FOOT) + "</p>") if nm else ""
+    managed_html = _ns_table_html(MANAGED_TITLE, MANAGED_LEAD, mg, managed_addon_note(S)) if mg else ""
+    P.append("</tbody></table></div>" + "<h2>" + DECISIONS_TITLE + "</h2><p>" + e(DECISIONS_LEAD) + "</p>" + "".join(f"<h3>{e(g)}: {e(cap)}</h3><ol>" + "".join(f"<li>{e(x)}</li>" for x in lines) + "</ol>" for g, cap, lines in decision_groups(S)) + ns_html + managed_html + ("<h2>Appendix: evidence detail</h2><p class=mut>The statements above, with their basis and how to check each one in PerfectScale.</p><div class=wrap><table><thead><tr><th>Status</th><th>Statement</th><th>Basis</th><th>How to check</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in evidence_rows(S)) + "</tbody></table></div>") + (("<h2>Feedback requested</h2><ol>" + "".join(f"<li>{e(x)}</li>" for x in FEEDBACK_PROMPTS) + "</ol>") if cfg.get("status") else "") + "</main>")
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{e(cfg['customer'])} Optimization Plan</title>"
             f"<style>{CSS}</style></head><body>{''.join(P)}<script type=application/json id=plan>{json.dumps(CALC)}</script><script>{JS};{JS_CALC};{JS_RESIZE};{JS_NSROW};{JS_COLLAPSE}</script></body></html>")
 
