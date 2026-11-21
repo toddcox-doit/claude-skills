@@ -28,6 +28,8 @@ compatibility: >
   to full confidence: `workloadAutomationStatusV2` and the Limited-by-User/System
   blocker text have no public-API equivalent, and neither does the
   cpuReasoning/memReasoning narrative. Offer it; never require it.
+  Optional public API v2 credentials (scripts/set_api_credentials.sh) add HPA
+  triggers and per-workload automation status, which pscli (v1) cannot see.
   Pure Python 3.10+, standard library only (openpyxl optional, for XLSX).
 ---
 
@@ -75,6 +77,7 @@ copies only the library.
 | Node.js 22+ (only for the .docx one-pager or browser enrichment) | `node -v` | `scripts/browser/cdp-chrome.js` needs the native `WebSocket` global, stable only from Node 22 |
 | `docx` npm package (for the .docx one-pager) | `node -e "require('docx')"` from `scripts/` | `cd scripts && npm install`; without it the run still completes and warns |
 | `openpyxl` (for XLSX) | `python3 -c "import openpyxl"` | optional: `python3 -m pip install -r scripts/requirements-optional.txt`; CSV is always written |
+| Public API v2 credentials (optional: HPA triggers, automation status) | `ls ~/.perfectscale/<profile>.env` | `bash scripts/set_api_credentials.sh <profile>` (same Read Only token as pscli; owner-only file, secret never echoed). Without it the v2 step is skipped and HPA status reads Unknown |
 
 The optional PodFit eligibility browser pass (`references/eligibility-enrichment.md`)
 is macOS-only: `cdp-chrome.js` reads a hard-coded macOS Chrome profile path. On

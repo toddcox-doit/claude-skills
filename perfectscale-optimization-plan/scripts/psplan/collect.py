@@ -8,6 +8,9 @@ Lessons baked in:
   * Unevictable pods: one cluster-wide pull first; if that fails, fall back to the top-N node groups by idle cost
     (auto-provisioned clusters have thousands of short-lived pools).
   * Clusters are addressed by UID (names can be ambiguous).
+  * HPA triggers, automation status and recommendation maturity are not in pscli (v1 only): when API
+    credentials are available, one extra read-only call per cluster pulls them from the public v2
+    API (apiv2.py). Without credentials that step is skipped, never failed.
 """
 import json
 import os
@@ -20,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .apiv2 import DEFAULT_BASE, ApiError, PublicApi, load_credentials
 from .util import exists, jl, jload
 
 
@@ -107,6 +111,9 @@ class Collector:
             self.env["PERFECTSCALE_PROFILE"] = cfg["profile"]
         self.failures = []
         self._print = threading.Lock()
+        creds, self.api_skip = load_credentials(cfg)
+        self.api = PublicApi(creds, base=cfg.get("public_api_base") or DEFAULT_BASE, limiter=self.limiter) if creds else None
+        del creds
 
     # ------------------------------------------------------------------ plumbing
     def say(self, msg):
@@ -195,6 +202,7 @@ class Collector:
             S("workloads", "workloads-all.jsonl", ["-o", "jsonl", "workloads", "list", "-c", uid, "-V", "all"], "workloads (-V all)")
             S("audit", "audit.jsonl", ["-o", "jsonl", "automation", "audit-logs", "-c", uid, "--all", "--since", "720h"], "automation audit log (30d)")
             S("nodegroups", "nodegroups.jsonl", ["-o", "jsonl", "nodegroups", "list", "-c", uid, "--all"], "node groups")
+            self._v2_workloads(d, manifest, name, uid)
             self._unevictable(d, manifest, name, uid)
         finally:
             # Always persist whatever progress was made (atomically), even if a circuit breaker or
@@ -203,6 +211,30 @@ class Collector:
         if self.compress:
             self._gzip(d)
         return name
+
+    def _v2_workloads(self, d, manifest, name, uid):
+        """Public API v2 workloads: HPA triggers, automation status, maturity. Optional - skipped
+        without credentials; a failure is recorded but leaves every pscli-collected file usable."""
+        path = d / "workloads-v2.json"
+        label = f"{name}: v2 workloads (HPA, automation status)"
+        if not self.api:
+            self.say(f"  [skip] {label}: {self.api_skip}")
+            return
+        if self._fresh(path, manifest, "workloads_v2"):
+            self.say(f"  [skip] {label}")
+            return
+        t0 = time.time()
+        try:
+            body = self.api.workloads_v2(uid)
+            atomic_write_json(path, body)
+            ok, err = True, ""
+            self.say(f"  [ok]   {label}  ({len(body.get('data') or []):,} workloads, {time.time() - t0:.0f}s)")
+        except (ApiError, ValueError) as e:
+            ok, err = False, str(e)[:300]
+            self.failures.append(f"{d.name}/workloads-v2.json: {err}")
+            self.say(f"  [FAIL] {label}: {err}")
+        manifest["workloads_v2"] = {"ok": ok, "ts": time.time(), "err": err,
+                                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
     def _unevictable(self, d, manifest, name, uid):
         full = d / "unevictable-full.jsonl"
@@ -246,7 +278,7 @@ class Collector:
 
     def _gzip(self, d):
         import gzip
-        for f in ("workloads-all.jsonl", "nodegroups.jsonl", "unevictable-full.jsonl"):
+        for f in ("workloads-all.jsonl", "nodegroups.jsonl", "unevictable-full.jsonl", "workloads-v2.json"):
             p = d / f
             if p.exists() and p.stat().st_size > 1_000_000:
                 with p.open("rb") as src, gzip.open(str(p) + ".gz", "wb") as dst:

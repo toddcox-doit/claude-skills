@@ -25,16 +25,44 @@ workload that is already failing, so the POV starts with the reliability picture
 in view rather than discovering it after automation is on. A workload with
 neither savings nor risk scores 0 and is left out.
 
-Columns: Rank, Workload, Namespace, **Controller type**, Monthly cost, Potential
-savings, Risk, Top issue, Resiliency spend (likely), Score, Review before
-automating. Savings and resiliency spend are different money and are never
-added together, the same rule as the plan.
+The rows are grouped by what automation can do now, each group a collapsible
+section with its own Select all / Clear and a live count, savings and tick
+total: **Ready to automate** (Wave 1 and 1b, open), **Review** and **Hold**
+(collapsed). Within a group the rows keep their rank order. Each row has six
+columns: in-scope checkbox, Workload (the name, with namespace and **controller
+type** on a second line), Savings/mo, Risk, HPA (first trigger plus a count) and
+a short Note. Click a workload's name for its detail row: rank and score,
+monthly cost, resiliency spend, top issue, CPU and memory now vs recommended,
+replicas, and the full HPA trigger list. Savings and resiliency spend are
+different money and are never added together, the same rule as the plan. The
+XLSX sheet keeps every column in one flat grid.
 
 "Review before automating" flags what a cost-only config does not handle on its
 own: stateful workloads (agree a restart window), JVM workloads from
 `jvm_patterns` (move the heap flag with the memory request), MaxSavings policy
 on an at-risk workload, a known HPA (a smaller request moves its scaling point),
 and DaemonSets (decrease-only).
+
+### Waves and HPA
+
+Each ranked row carries a **Wave** and an **HPA** column, the automation waves
+from the POV Command Center playbook:
+
+| Wave | Which workloads | Pre-ticked |
+|---|---|---|
+| Wave 1 | no HPA, or an HPA triggered on the container itself (ContainerResource) | yes |
+| Wave 1b | stateful workloads and service-mesh components (istio, linkerd, envoy): resize with extra headroom | yes |
+| Review | HPA on custom metrics only (a resize does not move the trigger, but confirm with the owner), or PerfectScale reports automation not supported | no |
+| Hold | HPA on pod CPU/memory utilization: a smaller request moves its scaling point, and with injected or native mesh sidecars the HPA math shifts | no |
+
+HPA triggers come from the public API v2 (`scaling.hpaTargets`), shown as, for
+example, "CPU 50%, istio_requests_per_second 20". v2 has no min/max replicas, so
+an HPA pinned at fixed replicas (min == max, safe to resize) also reads as Hold;
+tick it by hand once the owner confirms. Without API credentials the HPA column
+reads Unknown, nothing is held for its HPA, and the page says so. A pod-level-HPA
+workload inside a ticked namespace is kept out of that namespace's config with a
+Disabled workload config (reason `hpa`). Rows also flag recommendations that are
+not mature yet and workloads PerfectScale cannot automate.
 
 ### Kept out, and counted
 
@@ -213,7 +241,7 @@ subdomain, so a Deployment and a StatefulSet sharing a name do not collide.
   and compares it with the same files.
 - A test runs yamllint's default config over every file both generators can
   write, including namespace exclusions.
-- `verify.py` checks every kickoff page: its rows match the model's ranking,
+- `verify.py` checks every kickoff page: no Hold or Review row is pre-ticked; its rows match the model's ranking,
   nothing managed or held out is ranked, every config sets `keepLimit: false`
   with the inline REVIEW comment, every config carries the full operational block, no config enables an increase, the namespace
   picker lists exactly the namespaces the model found automatable, every

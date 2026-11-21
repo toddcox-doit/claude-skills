@@ -175,10 +175,14 @@ def verify(cfg, S, facts, files):
             if f is None:
                 continue
             rows = (f.get("pov") or {}).get("rows", [])
-            body = t.split("<tbody>", 1)[1].split("</tbody>", 1)[0] if "<tbody>" in t else ""
+            # The ranked workloads live in one table per wave group; read them all, not just the first.
+            body = "".join(re.findall(r"<table class='sort povgrp[^']*'[^>]*>(.*?)</table>", t, re.S))
             chk(body.count("<tr data-type=") == len(rows), f"{p.name}: POV table holds exactly the {len(rows)} ranked rows")
             chk(body.count("class=wlck value=") == len(rows),
                 f"{p.name}: every ranked workload has its own in-scope checkbox")
+            held = [r for r in rows if r.get("wave") in ("Hold", "Review")]
+            chk(all(f"class=wlck value='{r['rank']}' checked" not in body for r in held),
+                f"{p.name}: no Hold or Review workload ({len(held)}) is pre-ticked")
             chk(all(r["lane"] not in ("managed", "held_out") for r in rows),
                 f"{p.name}: no platform-managed or held-out workload is ranked")
             m = re.search(r"<script type=application/json id=povdata>(.*?)</script>", t, re.S)

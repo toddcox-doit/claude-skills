@@ -581,6 +581,7 @@ document.querySelectorAll('button.nstog').forEach(function(b){
 JS_RESIZE = """(function(){var MIN=44;
 function K(t,n){return 'psplan.cols.'+(t.dataset.rsz||'t')+'.'+n}
 document.querySelectorAll('table').forEach(function(t,ti){
+ if(t.classList.contains('nrsz'))return; // compact tables opt out of the column picker
  var head=t.tHead&&t.tHead.rows[0];if(!head)return;
  var n=head.cells.length;if(n<3||!t.tBodies[0]||!t.tBodies[0].rows.length)return;
  t.dataset.rsz='t'+ti;
@@ -1030,7 +1031,7 @@ def render_tables(cfg, S, facts, out_dir):
         for c in wp[1]:
             c.font = Font(bold=True)
         wp.freeze_panes = "A2"; wp.auto_filter.ref = wp.dimensions
-        for col, wd in zip("ABCDEFGHIJKL", (18, 6, 40, 24, 14, 12, 14, 9, 28, 14, 7, 48)):
+        for col, wd in zip("ABCDEFGHIJKLMN", (18, 6, 9, 40, 24, 14, 30, 12, 14, 9, 28, 14, 7, 48)):
             wp.column_dimensions[col].width = wd
         for row in wp.iter_rows(min_row=2):
             for c in row:

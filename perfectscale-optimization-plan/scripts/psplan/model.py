@@ -81,6 +81,59 @@ POLICY_OVER = {"extraheadroom", "maxheadroom"}
 POV_CR_TYPES = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job", "Rollout")
 # PerfectScale indicator severity runs 0-4; the UI labels 1-4 Low / Medium / High / Critical.
 RISK_LEVEL = {0: "none", 1: "low", 2: "medium", 3: "high", 4: "critical"}
+# Service-mesh and proxy components: resized like anything else, but with extra headroom (Wave 1b).
+MESH_RX = re.compile(r"istio|linkerd|envoy|consul-connect", re.I)
+
+
+def _hpa_part(metric, targets):
+    val = next(iter(targets.values()), None) if isinstance(targets, dict) else targets
+    kind = next(iter(targets), "") if isinstance(targets, dict) else ""
+    if metric in ("cpu", "memory") and kind == "utilization":
+        return f"{'CPU' if metric == 'cpu' else 'memory'} {val:g}%"
+    return f"{metric} {val:g}" if isinstance(val, (int, float)) else metric
+
+
+def hpa_class(r2):
+    """(class, detail) for a workload from its public API v2 row; (None, None) without one.
+
+    class: "none" (no HPA), "container" (ContainerResource triggers only - a resize keeps the
+    trigger on the container it measures), "pod_resource" (pod-level CPU/memory utilization - a
+    smaller request moves the scaling point), "custom" (custom/external metrics only). v2 carries no
+    min/max replicas, so an HPA pinned at fixed replicas reads as its trigger type."""
+    if not r2:
+        return None, None
+    t = (r2.get("scaling") or {}).get("hpaTargets") or {}
+    conts = r2.get("containers") or {}
+    conts = conts.values() if isinstance(conts, dict) else conts
+    ct = {k: v for c in conts for k, v in ((c or {}).get("hpaTargets") or {}).items()}
+    if not t and not ct:
+        return "none", ""
+    parts = [_hpa_part(k, v) for k, v in sorted(t.items(), key=lambda kv: (kv[0] not in ("cpu", "memory"), kv[0]))]
+    parts += [_hpa_part(k, v) + " (container)" for k, v in sorted(ct.items())]
+    if set(t) & {"cpu", "memory"}:
+        cls = "pod_resource"
+    elif ct:
+        cls = "container"
+    else:
+        cls = "custom"
+    return cls, ", ".join(parts)
+
+
+def pov_wave(x):
+    """The Command Center's automation waves. Wave 1: no HPA or container-level triggers. Wave 1b:
+    stateful or mesh components (extra headroom). Review: HPA on custom metrics only, or automation
+    not supported. Hold: pod-level CPU/memory HPA. Workloads with no HPA data fall in Wave 1/1b and
+    the page says the HPA is unknown."""
+    if x.get("_auto_status") == "NotSupported":
+        return "Review"
+    h = x.get("_hpa_class")
+    if h == "pod_resource":
+        return "Hold"
+    if h == "custom":
+        return "Review"
+    if x["_lane"] == "stateful" or x["type"] == "StatefulSet" or MESH_RX.search(x["name"]):
+        return "1b"
+    return "1"
 
 
 # ------------------------------------------------------------------ small helpers
@@ -176,6 +229,9 @@ def pov_rank(w, R, T, top_n=50, savings_weight=0.6):
             "res_likely": R(x["cost_increase"] * sizing_fraction(x, T["oom_margin"], "p95")) if risky else 0.0,
             "policy": x.get("optimization_policy") or "unset", "jvm": bool(x.get("_jvm")),
             "hpa": x.get("_hpa"), "replicas": x["replicas_counts"]["avg_count"],
+            "replicas_max": x["replicas_counts"].get("max_count", x["replicas_counts"]["avg_count"]),
+            "hpa_class": x.get("_hpa_class"), "hpa_detail": x.get("_hpa_detail"), "wave": pov_wave(x),
+            "auto_status": x.get("_auto_status"), "immature": bool(x.get("_immature")),
             "cpu_cur": dd["current_cpu_request_cores_total"], "cpu_rec": dd["recommended_cpu_request_cores_total"],
             "mem_cur_gib": dd["current_memory_request_mib_total"] / 1024, "mem_rec_gib": dd["recommended_memory_request_mib_total"] / 1024,
             "score": score,
@@ -218,7 +274,7 @@ def pov_namespaces(w, R):
                 a["types"].append(x["type"])
             continue
         reason = ("held_out" if x["_lane"] == "held_out" else "stateful" if x["_lane"] == "stateful"
-                  else "jvm" if x.get("_jvm") else None)
+                  else "jvm" if x.get("_jvm") else "hpa" if x.get("_hpa_class") == "pod_resource" else None)
         if reason:
             a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason})
             continue
@@ -473,7 +529,8 @@ def load_cluster(cfg, cluster, use_cache=True):
     name, uid = cluster["name"], cluster["uid"]
     d = cfg.data(name)
     files = [d / x for x in ("summary.json", "workloads-all.jsonl", "nodegroups.json", "nodegroups.jsonl",
-                             "unevictable-full.jsonl", "unevictable-topgroups.jsonl", "audit.jsonl", "cluster.json")]
+                             "unevictable-full.jsonl", "unevictable-topgroups.jsonl", "audit.jsonl", "cluster.json",
+                             "workloads-v2.json")]
     if cfg.get("eligibility_file"):
         files.append(Path(cfg["eligibility_file"]))
     if cfg.get("hpa_file"):
@@ -527,6 +584,16 @@ def _load(cfg, cluster, d):
         hj = jload(cfg["hpa_file"], {}) or {}
         hpa_map = hj.get(uid) or hj.get(name) or {}
 
+    # ---- public API v2 (optional; the collector writes it when API credentials exist): HPA
+    # triggers, automation status, maturity - keyed by workload id, which matches v1 one-to-one.
+    v2 = {r.get("id"): r for r in ((jload(d / "workloads-v2.json", {}) or {}).get("data") or []) if r.get("id")}
+    elig_source = "browser" if elig_map else None
+    if not elig_map and v2:
+        # The same automation-status values the PodFit browser pass reads, now from the API.
+        elig_map = {i: (r.get("automation") or {}).get("status") for i, r in v2.items()
+                    if (r.get("automation") or {}).get("status")}
+        elig_source = "api_v2" if elig_map else None
+
     # ---- filter
     n_synth = n_muted = n_excl = 0
     excl_cost = excl_waste = 0.0
@@ -576,6 +643,10 @@ def _load(cfg, cluster, d):
         st = elig_map.get(x.get("id"))
         x["_elig"] = st
         x["_hpa"] = hpa_map.get(x.get("id"))
+        r2 = v2.get(x.get("id"))
+        x["_hpa_class"], x["_hpa_detail"] = hpa_class(r2)
+        x["_auto_status"] = (r2.get("automation") or {}).get("status") if r2 else None
+        x["_immature"] = bool(r2) and not ((r2.get("maturity") or {}).get("overall") or {}).get("isMature", True)
 
     cost_o = sum(x["cost"] for x in w); waste_o = sum(x["waste"] for x in w); pot_o = sum(x["potential_savings"] for x in w)
     out = {
@@ -782,6 +853,9 @@ def _load(cfg, cluster, d):
         "over_protected": [prow(x) for x in sorted(over_protected, key=lambda x: -x["cost"])],
     }
 
+    out["api_v2"] = {"provided": bool(v2), "matched": sum(1 for x in w if x.get("_hpa_class") is not None),
+                     "hpa_n": sum(1 for x in w if x.get("_hpa_class") not in (None, "none"))}
+
     # ---- POV automation kickoff ranking (rendered by pov.py, one page per cluster)
     out["pov"] = pov_rank(w, R, T, top_n=int(cfg["pov_top_n"]), savings_weight=cfg["pov_savings_weight"])
 
@@ -791,7 +865,7 @@ def _load(cfg, cluster, d):
         for x in w:
             s = x["_elig"] or "Unknown"
             by[s]["n"] += 1; by[s]["pot_o"] += x["potential_savings"]
-        out["eligibility"] = {"provided": True, "by_status": {k: {"n": v["n"], "pot": R(v["pot_o"]), "pot_o": v["pot_o"]} for k, v in by.items()}}
+        out["eligibility"] = {"provided": True, "source": elig_source, "by_status": {k: {"n": v["n"], "pot": R(v["pot_o"]), "pot_o": v["pot_o"]} for k, v in by.items()}}
     else:
         out["eligibility"] = {"provided": False}
 

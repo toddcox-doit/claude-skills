@@ -126,6 +126,7 @@ python3 $SKILL/scripts/new_tenant.py init --customer "Acme" --profile acme --dir
 cd ~/work/Acme_analysis
 export PERFECTSCALE_PROFILE=acme
 pscli auth status                      # confirm it is the right tenant
+bash skill/perfectscale-optimization-plan/scripts/set_api_credentials.sh acme   # optional: HPA + automation status (API v2)
 
 # 1. rank every cluster, then agree the scope with the customer
 python3 skill/perfectscale-optimization-plan/scripts/rank_clusters.py --customer "Acme" --top 10

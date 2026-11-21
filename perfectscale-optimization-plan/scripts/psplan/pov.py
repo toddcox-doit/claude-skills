@@ -32,7 +32,7 @@ import textwrap
 from datetime import date
 
 from .model import POLICY_UNDER, POV_CR_TYPES
-from .render import CSS, JS, JS_RESIZE, e, fname, risk_text
+from .render import CSS, JS, JS_NSROW, JS_RESIZE, e, fname, risk_text
 from .util import human_list, long_date, plural, slug, usd
 
 API = "perfectscale.io/v1"
@@ -260,6 +260,7 @@ EXCL_REASON = {
     "held_out": "held out of automation in this tenant's configuration",
     "stateful": "stateful workload - automate it only with its owner and an agreed restart window",
     "jvm": "JVM workload - the heap flag has to move with the memory request",
+    "hpa": "pod-level CPU/memory HPA - a smaller request moves its scaling point",
 }
 
 
@@ -369,8 +370,8 @@ if(!box)return;
 var NS={};D.namespaces.forEach(function(n){NS[n.ns]=n});
 var cbs=[].slice.call(box.querySelectorAll('input[type=checkbox]'));
 var nck=[].slice.call(document.querySelectorAll('#povns input.nsck:not([disabled])'));
-var wck=[].slice.call(document.querySelectorAll('#povtable input.wlck'));
-function vis(c){return !c.closest('tr').hidden}
+var wck=[].slice.call(document.querySelectorAll('table.povgrp input.wlck'));
+function vis(c){var tr=c.closest('tr');return !tr.hidden&&!tr.classList.contains('off')}
 function sel(){return cbs.filter(function(c){return c.checked}).map(function(c){return c.value})}
 // Only what is on screen counts: a row hidden by the controller-type filter keeps its tick for when
 // the type comes back, but is never generated and never counted.
@@ -383,10 +384,15 @@ function key(kind){return kind==='wl'?'wl|'+sel().join(',')+'|'+wticked().join('
 function stale(){var o=document.getElementById('out');if(last&&!o.hidden)document.getElementById('stale').hidden=key(last)===o.dataset.key}
 function apply(){
  var s=sel(),on={};s.forEach(function(t){on[t]=1});
- var shown=0,n=0,pot=0,risk=0,nns={};inview={};
- document.querySelectorAll('#povtable tbody tr').forEach(function(tr){
-  var show=!!on[tr.dataset.type];tr.hidden=!show;if(!show)return;shown++;
-  if(tr.querySelector('input.wlck').checked){n++;pot+=+tr.dataset.pot;if(+tr.dataset.sev>=3)risk++;nns[tr.dataset.n]=1;inview[tr.dataset.n]=(inview[tr.dataset.n]||0)+1}});
+ var shown=0,n=0,pot=0,risk=0,nns={},G={};inview={};
+ document.querySelectorAll('table.povgrp tbody tr[data-type]').forEach(function(tr){
+  var show=!!on[tr.dataset.type],g=tr.closest('table').dataset.g,a=G[g]||(G[g]={n:0,pot:0,t:0});
+  tr.classList.toggle('off',!show);
+  var det=tr.parentNode.querySelector('tr.nsdet[data-for="'+tr.dataset.ns+'"]');if(det)det.classList.toggle('off',!show);
+  if(!show)return;shown++;a.n++;a.pot+=+tr.dataset.pot;
+  if(tr.querySelector('input.wlck').checked){a.t++;n++;pot+=+tr.dataset.pot;if(+tr.dataset.sev>=3)risk++;nns[tr.dataset.n]=1;inview[tr.dataset.n]=(inview[tr.dataset.n]||0)+1}});
+ document.querySelectorAll('.gsum').forEach(function(el){var a=G[el.dataset.g]||{n:0,pot:0,t:0};
+  el.textContent=a.n?(pl(a.n,'workload')+' \u00b7 '+m(a.pot)+'/mo potential savings \u00b7 '+a.t+' ticked'):'None of the selected controller types'});
  var k=Object.keys(nns).length;
  document.getElementById('typesum').textContent=s.length===cbs.length?'All ('+s.length+')':(s.length?s.join(', '):'None');
  document.getElementById('scope').textContent=shown?(n+' of '+pl(shown,'workload')+' ticked across '+pl(k,'namespace')+' \\u00b7 '+m(pot)+'/mo potential savings \\u00b7 '+risk+' at High or Critical risk'):'No ranked workloads match. Pick at least one controller type.';
@@ -409,8 +415,9 @@ cbs.concat(nck,wck).forEach(function(c){c.addEventListener('change',apply)});
 function all(list,v){list.forEach(function(c){if(vis(c)||!v)c.checked=v});apply()}
 document.getElementById('tall').addEventListener('click',function(){cbs.forEach(function(c){c.checked=true});apply()});
 document.getElementById('tnone').addEventListener('click',function(){cbs.forEach(function(c){c.checked=false});apply()});
-document.getElementById('wlall').addEventListener('click',function(){all(wck,true)});
-document.getElementById('wlnone').addEventListener('click',function(){all(wck,false)});
+document.querySelectorAll('button.gsel').forEach(function(b){b.addEventListener('click',function(){
+ var t=document.querySelector('table.povgrp[data-g="'+b.dataset.g+'"]');
+ all([].slice.call(t.querySelectorAll('input.wlck')),b.dataset.v==='1')})});
 document.getElementById('nsall').addEventListener('click',function(){all(nck,true)});
 document.getElementById('nsnone').addEventListener('click',function(){all(nck,false)});
 document.getElementById('nsmatch').addEventListener('click',function(){nck.forEach(function(c){c.checked=!!inview[c.value]});apply()});
@@ -455,7 +462,24 @@ POV_CSS = """.pd{position:relative;display:inline-block}
 .nsbar button:not(.go){font:inherit;font-size:13px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 9px;cursor:pointer}
 .nsbar button:not(.go):hover{border-color:var(--acc);color:var(--acc)}
 #povns tr.mgd td{color:var(--mut)}
-#povtable tr:has(input.wlck:not(:checked)) td:not(:first-child){color:var(--mut);text-decoration:line-through}
+/* HPA metric names are single tokens up to ~80 characters (org_eclipse_jetty_..._utilization). Unbroken,
+   the browser sizes the whole column to the longest one and squeezes the rest; breaking anywhere lets it
+   collapse to a sliver. So: break only after underscores (<wbr>), and keep a readable minimum width. */
+td.hpa{min-width:170px}
+details.wgrp{border:0;border-top:1px solid var(--line);border-radius:0;margin:14px 0 0;padding:8px 0 0}
+details.wgrp>summary{list-style-position:outside;font-weight:400;padding:2px 0}
+details.wgrp .gt{font-weight:600;font-size:16px}
+details.wgrp .gsub{font-size:13px}
+details.wgrp .gsum{display:block;font-size:13px;margin:2px 0 0 0}
+.gbar{display:flex;gap:8px;margin:8px 0 4px}
+.gbar button{font:inherit;font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 9px;cursor:pointer}
+.gbar button:hover{border-color:var(--acc);color:var(--acc)}
+table.povgrp td:first-child,table.povgrp th:first-child{width:28px}
+table.povgrp .wsub{font-size:12px;color:var(--mut)}
+table.povgrp button.nstog{font-weight:600}
+table.povgrp td.wnote{font-size:13px;color:var(--mut)}
+table.povgrp tr.nsdet>td{font-size:13px;color:var(--mut);background:var(--card)}
+tr.off{display:none}
 #files{max-height:70vh;overflow:auto}
 .menu .cnt{color:var(--mut);margin-left:auto;padding-left:10px}
 tr[hidden]{display:none}
@@ -469,23 +493,137 @@ pre{background:var(--card);border:1px solid var(--line);border-radius:6px;paddin
 ol.steps li{margin:4px 0}"""
 
 
+WAVE_ORDER = {"1": 1, "1b": 2, "Review": 3, "Hold": 4}
+WAVE_TEXT = {"1": "Wave 1", "1b": "Wave 1b", "Review": "Review", "Hold": "Hold"}
+
+
+def wave_label(r):
+    return WAVE_TEXT.get(r.get("wave") or "1", "Wave 1")
+
+
+def hpa_text(r):
+    c = r.get("hpa_class")
+    if c is None:
+        return "Unknown"
+    if c == "none":
+        return "None"
+    return r.get("hpa_detail") or c
+
+
+def default_ticked(r):
+    """Pre-ticked only when automation can move it safely now: Wave 1 or 1b, and enough waste to
+    clear PerfectScale's automation minimum. Hold and Review rows start unticked."""
+    return (r.get("wave") or "1") in ("1", "1b") and r["waste"] >= AUTOMATION_MIN_USD
+
+
+def _wave_legend(f, pv):
+    rows = pv.get("rows") or []
+    c = {k: sum(1 for r in rows if (r.get("wave") or "1") == k) for k in WAVE_ORDER}
+    src = ("HPA triggers come from PerfectScale's public API v2. It carries no HPA min/max replicas, so an HPA "
+           "pinned at fixed replicas also shows as Hold; move it to scope by hand once confirmed."
+           if (f.get("api_v2") or {}).get("provided") else
+           "HPA data was not collected for this run, so every row's HPA reads Unknown and nothing is held for its "
+           "HPA. Store API credentials (scripts/set_api_credentials.sh) and re-collect to sort rows by HPA.")
+    return ("<p class=mut><b>Waves:</b> "
+            f"Wave 1 ({c['1']}) - no HPA, or an HPA triggered on the container itself. "
+            f"Wave 1b ({c['1b']}) - stateful or mesh components; give them extra headroom. "
+            f"Review ({c['Review']}) - HPA on custom metrics only, or automation not supported. "
+            f"Hold ({c['Hold']}) - HPA on pod CPU/memory: a smaller request moves its scaling point. "
+            "Review and Hold start collapsed and unticked. " + e(src) + "</p>")
+
+
+GROUPS = (("ready", "Ready to automate", "Wave 1 and 1b: no HPA, a container-level trigger, or extra headroom", ("1", "1b"), True),
+          ("review", "Review", "HPA on custom metrics only, or automation not supported", ("Review",), False),
+          ("hold", "Hold", "HPA on pod CPU/memory: a smaller request moves its scaling point", ("Hold",), False))
+
+
+def hpa_short(r):
+    """One line for the table: the first trigger plus a count; the full list is in the detail row."""
+    c = r.get("hpa_class")
+    if c in (None, "none"):
+        return hpa_text(r)
+    parts = (r.get("hpa_detail") or c).split(", ")
+    return parts[0] + (f" +{len(parts) - 1} more" if len(parts) > 1 else "")
+
+
+def table_notes(r):
+    """review_notes minus what the group header already says, so a Hold row does not repeat 'Hold'."""
+    return [n for n in review_notes(r) if not n.startswith(("Hold:", "Review:"))]
+
+
+def _detail_text(r):
+    bits = [f"Rank {r['rank']}, score {r['score']:.0f}", f"Cost {usd(r['cost'])}/mo",
+            f"Resiliency spend {usd(r['res_likely'])}/mo (likely)" if r["res_likely"] else "No resiliency spend",
+            f"Top issue: {r['issue']}",
+            f"CPU {r['cpu_cur']:.2f} to {r['cpu_rec']:.2f} cores, memory {r['mem_cur_gib']:.1f} to {r['mem_rec_gib']:.1f} GiB (all replicas)",
+            f"Replicas avg {r['replicas']:g}" + (f", max {r['replicas_max']:g}" if r.get("replicas_max") is not None else "")]
+    if r.get("hpa_class") not in (None, "none"):
+        bits.append(f"HPA triggers: {r.get('hpa_detail') or r['hpa_class']}")
+    bits += [n for n in review_notes(r) if n.startswith(("Hold:", "Review:"))]
+    return " · ".join(bits)
+
+
+def _wave_groups(rows):
+    """One collapsible section per group, each a small sortable table. Workload names toggle a detail
+    row (the plan's namespace-appendix mechanism, so sorting keeps a detail row under its workload)."""
+    P = []
+    for key, title, sub, waves, opened in GROUPS:
+        rs = [r for r in rows if (r.get("wave") or "1") in waves]
+        if not rs:
+            continue
+        P.append(f"<details class=wgrp data-g={key}{' open' if opened else ''}><summary><span class=gt>{e(title)}</span> "
+                 f"<span class='mut gsub'>{e(sub)}</span> <span class='mut gsum' data-g={key}></span></summary>"
+                 f"<div class=gbar><button type=button class=gsel data-g={key} data-v=1>Select all</button>"
+                 f"<button type=button class=gsel data-g={key} data-v=0>Clear</button></div>"
+                 f"<div class=wrap><table class='sort povgrp nrsz' data-g={key}><thead><tr><th aria-label='In scope'></th>"
+                 "<th>Workload</th><th>Savings/mo</th><th>Risk</th><th>HPA</th><th>Note</th></tr></thead><tbody>")
+        for r in rs:
+            k = f"r{r['rank']}"
+            notes = table_notes(r)
+            P.append(f"<tr data-type='{e(r['type'])}' data-ns='{k}' data-n='{e(r['ns'])}' data-pot='{r['pot']:.2f}' data-sev='{r['risk_sev']}'>"
+                     f"<td><input type=checkbox class=wlck value='{r['rank']}'{' checked' if default_ticked(r) else ''} aria-label='Include {e(r['name'])}'></td>"
+                     f"<td data-v='{e(r['name'])}'><button type=button class=nstog aria-expanded=false>{e(r['name'])}</button>"
+                     f"<div class=wsub>{e(r['ns'])} · {e(r['type'])}</div></td>"
+                     f"<td class=num data-v='{r['pot']:.2f}'>{usd(r['pot'])}</td>"
+                     f"<td data-v='{r['risk_sev']}'>{e(risk_text(r['risk'])) if r['risk_sev'] else '-'}</td>"
+                     f"<td class=hpa>{e(hpa_short(r)).replace('_', '_<wbr>')}</td>"
+                     f"<td class=wnote>{e('; '.join(notes)) if notes else ''}</td></tr>"
+                     f"<tr class=nsdet data-for='{k}' hidden><td></td><td colspan=5>{e(_detail_text(r)).replace('_', '_<wbr>')}</td></tr>")
+        P.append("</tbody></table></div></details>")
+    return "".join(P)
+
+
 def review_notes(r):
     """What to agree with the workload's owner before it is automated - the things a cost-only CR
-    does not handle on its own. Shared by the page and the XLSX sheet."""
+    does not handle on its own. Short labels: the waves legend above the table carries the full
+    reasoning, and a long note in a narrow column makes every row tall. Shared with the XLSX sheet."""
     n = []
     if r["type"] == "StatefulSet" or r["lane"] == "stateful":
         n.append("Stateful: agree a restart window")
     if r["jvm"]:
-        n.append("JVM: move the heap flag with the memory request")
+        n.append("JVM: move the heap flag with memory")
     if (r["policy"] or "").lower() in POLICY_UNDER and r["risk_sev"] >= 3:
         n.append("MaxSavings policy on an at-risk workload")
-    if r.get("hpa"):
-        n.append("HPA: a smaller request moves its scaling point")
+    if r.get("hpa_class") == "pod_resource":
+        n.append("Hold: pod CPU/memory HPA")
+        if r.get("replicas_max") is not None and r["replicas_max"] <= r["replicas"]:
+            # Constant replicas is a hint, not proof: an HPA that simply never crossed its target looks
+            # the same, and a smaller request could make it scale. Only min == max makes it safe.
+            n.append(f"replicas held at {r['replicas']:g} - may be pinned; check HPA min/max")
+    elif r.get("hpa_class") == "custom":
+        n.append("Review: custom-metric HPA - confirm with owner")
+    elif r.get("hpa"):
+        n.append("HPA: check the trigger first")
+    if r.get("auto_status") == "NotSupported":
+        n.append("Automation not supported")
+    if r.get("immature"):
+        n.append("Recommendation not mature yet")
+    if r.get("wave") == "1b" and r["type"] != "StatefulSet" and r["lane"] != "stateful":
+        n.append("Mesh component: extra headroom")
     if r["type"] == "DaemonSet":
         n.append("Decrease-only")
     if r["waste"] < AUTOMATION_MIN_USD:
-        n.append(f"Under ${AUTOMATION_MIN_USD}/mo waste: PerfectScale's default automation minimum skips it and a "
-                 "cost-only config changes nothing - fix the risk on its own (unticked)")
+        n.append(f"Under ${AUTOMATION_MIN_USD}/mo waste: automation skips it; fix the risk separately")
     return n
 
 
@@ -548,27 +686,11 @@ def render_pov_html(cfg, f):
                  "<div class=acts><button type=button id=tall>Select all</button><button type=button id=tnone>Clear</button></div></div></span>"
                  "<button type=button id=genwl class=go>Generate workload CRDs</button><span id=scope class=mut></span></div>")
         P.append(f"<h2>Top {len(rows)} workloads by cost and resiliency</h2>"
-                 "<p class=mut>Untick any workload the customer does not want automated; only ticked rows of the selected "
-                 f"controller types get a file, one per workload. Rows under ${AUTOMATION_MIN_USD}/mo of waste start unticked: "
-                 "they rank on risk, and PerfectScale's default automation minimum would skip them. Click a column to sort. Savings and resiliency spend are "
-                 "monthly run-rates; they are different money and are never added together.</p>"
-                 "<div class=nsbar><button type=button id=wlall>Select all</button><button type=button id=wlnone>Clear</button></div>")
-        head = ["In scope", "Rank", "Workload", "Namespace", "Controller type", "Monthly cost", "Potential savings", "Risk",
-                "Top issue", "Resiliency spend (likely)", "Score", "Review before automating"]
-        P.append("<div class=wrap><table id=povtable class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr></thead><tbody>")
-        for r in rows:
-            notes = review_notes(r)
-            P.append(f"<tr data-type='{e(r['type'])}' data-n='{e(r['ns'])}' data-pot='{r['pot']:.2f}' data-sev='{r['risk_sev']}'>"
-                     f"<td><input type=checkbox class=wlck value='{r['rank']}'{' checked' if r['waste'] >= AUTOMATION_MIN_USD else ''} aria-label='Include {e(r['name'])}'></td>"
-                     f"<td class=num data-v='{r['rank']}'>{r['rank']}</td><td>{e(r['name'])}</td><td>{e(r['ns'])}</td><td>{e(r['type'])}</td>"
-                     f"<td class=num data-v='{r['cost']:.2f}'>{usd(r['cost'])}/mo</td>"
-                     f"<td class=num data-v='{r['pot']:.2f}'>{usd(r['pot'])}/mo</td>"
-                     f"<td data-v='{r['risk_sev']}'>{e(risk_text(r['risk'])) if r['risk_sev'] else '-'}</td>"
-                     f"<td>{e(r['issue'])}</td>"
-                     f"<td class=num data-v='{r['res_likely']:.2f}'>{(usd(r['res_likely']) + '/mo') if r['res_likely'] else '-'}</td>"
-                     f"<td class=num data-v='{r['score']}'>{r['score']:.0f}</td>"
-                     f"<td>{e('; '.join(notes)) if notes else '-'}</td></tr>")
-        P.append("</tbody></table></div>")
+                 "<p class=mut>Grouped by what automation can do now. Untick anything the customer does not want automated; "
+                 "only ticked rows of the selected controller types get a file, one per workload. Click a workload for its "
+                 "details. Savings and resiliency spend are monthly run-rates and are never added together.</p>"
+                 + _wave_legend(f, pv))
+        P.append(_wave_groups(rows))
         P.append(_ns_section(pv, namespaces, {r["ns"] for r in rows}))
         P.append("<section id=out hidden><h2 id=outtitle>Generated CRDs</h2>"
                  "<p><span id=outsel></span> <span id=stale class=warn hidden>The selection has changed since these were "
@@ -590,7 +712,7 @@ def render_pov_html(cfg, f):
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>{e(title)}</title><style>{CSS}\n{POV_CSS}</style></head><body>{''.join(P)}"
             f"<script type=application/json id=povdata>{data}</script>"
-            f"<script>{JS};{JS_RESIZE};{JS_BUILD};{JS_BUILD_NS};{JS_ZIP};{JS_UI}</script></body></html>")
+            f"<script>{JS};{JS_RESIZE};{JS_NSROW};{JS_BUILD};{JS_BUILD_NS};{JS_ZIP};{JS_UI}</script></body></html>")
 
 
 def _ns_section(pv, namespaces, in_table):
@@ -635,12 +757,12 @@ def pov_fname(cfg, f):
     return fname(cfg, f"{f['name']}-pov-automation-kickoff", "html")
 
 
-POV_COLS = ["cluster", "rank", "workload", "namespace", "controller_type", "monthly_cost", "potential_savings",
-            "risk", "top_issue", "resiliency_likely", "score", "review_before_automating"]
+POV_COLS = ["cluster", "rank", "wave", "workload", "namespace", "controller_type", "hpa", "monthly_cost",
+            "potential_savings", "risk", "top_issue", "resiliency_likely", "score", "review_before_automating"]
 
 
 def pov_sheet_rows(facts):
     for f in facts:
         for r in (f.get("pov") or {}).get("rows", []):
-            yield [f["name"], r["rank"], r["name"], r["ns"], r["type"], round(r["cost"], 2), round(r["pot"], 2),
+            yield [f["name"], r["rank"], wave_label(r), r["name"], r["ns"], r["type"], hpa_text(r), round(r["cost"], 2), round(r["pot"], 2),
                    r["risk"], r["issue"], round(r["res_likely"], 2), r["score"], "; ".join(review_notes(r))]

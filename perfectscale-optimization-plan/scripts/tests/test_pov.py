@@ -358,7 +358,10 @@ class T(unittest.TestCase):
         self.assertIn("GroupedJob (6)", t)
         self.assertEqual(t.count("<tr data-type="), 50)
         self.assertEqual(len(re.findall(r"class=wlck value='\d+' checked", t)), 50)   # every ranked row ticked by default
-        self.assertIn("id=wlall", t)
+        self.assertIn("<details class=wgrp data-g=ready open>", t)        # Ready opens; others start collapsed
+        self.assertIn("class=gsel data-g=ready data-v=1", t)              # per-group Select all
+        self.assertEqual(len(re.findall(r"<tr class=nsdet data-for='r\d+' hidden>", t)), 50)   # a detail row per workload
+        self.assertNotIn("line-through", t)
 
     def test_verify_catches_a_page_that_drifts_from_the_model(self):
         S = Plan(self.cfg, self.F).build()
@@ -398,7 +401,7 @@ class T(unittest.TestCase):
         t = pov.render_pov_html(self.cfg, f)
         self.assertRegex(t, rf"class=wlck value='{low['rank']}' aria-label")             # not checked
         self.assertRegex(t, rf"class=wlck value='{f['pov']['rows'][0]['rank']}' checked")
-        self.assertIn("default automation minimum skips it", " ".join(pov.review_notes(low)))
+        self.assertIn("automation skips it", " ".join(pov.review_notes(low)))
         # a namespace whose only waste is under the minimum is listed but not pre-ticked
         n = next(x for x in f["pov"]["namespaces"] if not x["managed"] and x["ns"] == low["ns"])
         for a in n["auto"].values():

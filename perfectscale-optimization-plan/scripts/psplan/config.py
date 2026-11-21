@@ -67,6 +67,10 @@ DEFAULTS = {
     "previous_plan": None,                  # path to an earlier plan JSON, for the change log
     # POV automation kickoff page (one per cluster): how many workloads the ranked table holds, and
     # the savings share of its 0-100 score (the rest is risk severity). See references/pov-kickoff.md.
+    # Public API v2 (HPA triggers, automation status, maturity) - see psplan/apiv2.py. Credentials come
+    # from PERFECTSCALE_CLIENT_ID / PERFECTSCALE_CLIENT_SECRET, this file, or ~/.perfectscale/<profile>.env.
+    "api_credentials_file": None,
+    "public_api_base": None,                # default https://api.app.perfectscale.io
     "pov_top_n": 50,
     "pov_savings_weight": 0.6,
 }
