@@ -142,6 +142,12 @@ def verify(cfg, S, facts, files):
                     f"{p.name}: a link into a collapsed section opens it")
                 chk(re.search(r"@media print\{[^}]*\.sec\[hidden\]\{display:block", t),
                     f"{p.name}: collapsed sections print expanded")
+                # Actions table filters: present, and the page opens on Phase 1 only.
+                pm = re.search(r"<div class=menu data-f=phase hidden>(.*?)</div></div>", t, re.S)
+                chk("class=afilt" in t and "id=actions" in t and pm is not None, f"{p.name}: Actions table carries phase/topic/cluster/lane filters")
+                if pm:
+                    on = re.findall(r"value='(\d+)' checked", pm.group(1))
+                    chk(on == ["1"], f"{p.name}: Actions table opens on Phase 1 only")
                 # the resizer measures with getBoundingClientRect, which reads 0 inside a
                 # hidden section, so collapse must initialise after it
                 chk(t.find("JS_COLLAPSE") == -1 and t.rfind("var CLOSED=") > t.rfind("var MIN=44"),

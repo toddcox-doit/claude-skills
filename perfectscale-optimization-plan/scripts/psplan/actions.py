@@ -24,7 +24,19 @@ FIT = {"automation_proof": "PodFit", "automation_w2": "PodFit", "automation_w3":
        "policy_underprotected": "PodFit", "policy_overprotected": "PodFit",
        "stale_optout": "InfraFit", "pdb": "InfraFit", "unevictable_affinity": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
        "pool_machine_recs": "InfraFit", "autoprov_review": "InfraFit", "gpu_cap": "InfraFit", "commitments": "InfraFit", "review_cadence": "Governance", "rerun": "Governance",
-       "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit", "pool_karpenter_tuning": "InfraFit"}
+       "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit", "pool_karpenter_tuning": "InfraFit",
+       "binpacking": "InfraFit"}
+# What an action is about, for the reader: the plan's Actions table filters on this.
+TOPIC = {"automation_proof": "Automation", "automation_w2": "Automation", "automation_w3": "Automation", "default_policy": "Automation",
+         "replicated_grouping": "Automation", "job_grouping": "Automation",
+         "job_rightsize": "Right-sizing", "stateful_manual": "Right-sizing", "heldout_manual": "Right-sizing", "jvm_rightsize": "Right-sizing",
+         "oom_fix": "Resiliency", "underprov_other": "Resiliency", "memory_limits": "Resiliency",
+         "headroom_policy": "Policy", "policy_underprotected": "Policy", "policy_overprotected": "Policy",
+         "stale_optout": "Scale-down blockers", "pdb": "Scale-down blockers", "unevictable_affinity": "Scale-down blockers", "local_storage": "Scale-down blockers",
+         "binpacking": "Node pools and autoscaling", "pool_shrink_blocked": "Node pools and autoscaling", "pool_shrink_free": "Node pools and autoscaling",
+         "pool_machine_recs": "Node pools and autoscaling", "pool_flex": "Node pools and autoscaling", "autoscaler_labels": "Node pools and autoscaling",
+         "pool_karpenter_tuning": "Node pools and autoscaling", "autoprov_review": "Node pools and autoscaling", "gpu_cap": "Node pools and autoscaling",
+         "review_cadence": "Governance", "rerun": "Governance", "commitments": "Governance"}
 # Question groups for the customer conversation, matched on the start of each question.
 DECISION_GROUPS = [("Who owns", "Ownership"), ("Are the minimum sizes", "Ownership"), ("Are the do-not-evict", "Intent"), ("Does every environment", "Intent"),
                    ("Is the headroom", "Intent"), ("The workloads kept out", "Intent"), ("Is automation enabled", "Access and constraints"), ("Do the node pools", "Ownership"),
@@ -155,6 +167,7 @@ class Plan:
         k.setdefault("lane", "config")
         k["key"], k["id"] = key, f"A{self.n}"
         k["fit"] = FIT.get(key, "Governance")
+        k["topic"] = TOPIC.get(key, "Governance")
         k["value_kind"] = KIND.get(key, "computed")
         if "obs" not in k:
             k["obs"] = k.get("savings_monthly_usd", 0) / (self.F[0]["factor"] or 1) if k.get("savings_monthly_usd") else 0
@@ -203,7 +216,7 @@ class Plan:
         for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_replicated_grouping, self.r_automation,
                      self.r_memory_limits, self.r_oom, self.r_jvm,
                      self.r_grouping, self.r_stale_optout, self.r_pdb, self.r_unevictable_affinity,
-                     self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_pool_karpenter_tuning, self.r_autoprov, self.r_gpu, self.r_underprov,
+                     self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_pool_karpenter_tuning, self.r_binpacking, self.r_autoprov, self.r_gpu, self.r_underprov,
                      self.r_headroom, self.r_policy_mismatch, self.r_local_storage, self.r_governance):
             rule()
         return self.finish()
@@ -777,6 +790,71 @@ class Plan:
                      verification="Node count returns to the lowered floor between bursts; idle $ falls",
                      evidence=f"{r['cluster']} `{r['id']}`: {usd(r['idle'])}/mo of idle with {r['blockers']} blocking pod{'s' if r['blockers'] != 1 else ''} and no machine-type recommendation. Idle pool, not a computed saving. Medium confidence: a bursty pool makes a short window over- or under-state it.")
             self.claimed_pools.add((r["cluster"], r["id"]))
+
+    # ---- PerfectScale bin-packing automation: what turns smaller pods into fewer nodes
+    def r_binpacking(self):
+        """Right-sizing frees requests; the bill only falls when nodes leave. On long-lived pools the
+        autoscaler removes a node only once it is empty or under its threshold, and requests spread
+        across many half-used nodes rarely empty any one of them. PerfectScale's bin-packing automation
+        (ClusterNodeGroupAutomationConfig / NodeGroupAutomationConfig, `binpacking` block, in the
+        psc-autoscaler chart) moves pods off underused nodes so Karpenter or the cluster autoscaler
+        can remove them, within safety rules (PDBs respected, do-not-disrupt honoured, kube-system,
+        GPU and emptyDir pods blockable, groups at minimum size skipped).
+
+        Fires when long-lived pools carry idle worth acting on - the same pools the shrink actions
+        target. It is a Phase 1 unblocker in DryRun: the pool-shrink actions depend on it, so its
+        released value is their idle ceiling, and the plan says plainly that without it those pod
+        savings may never reach the bill."""
+        pool_acts = [a for a in self.A if a["key"] in ("pool_shrink_blocked", "pool_shrink_free")]
+        if not pool_acts:
+            return
+        pools = [(f, p) for f in self.F for p in f["pools"]["long_lived"] if (f["name"], p["id"]) in self.claimed_pools]
+        idle = sum(p["idle"] for _, p in pools)
+        fs = [f for f in self.F if any(g is f for g, _ in pools)]
+        kinds = {p.get("autoscaler") for _, p in pools}
+        names = {"karpenter": "Karpenter", "cluster_autoscaler": "the cluster autoscaler"}
+        known = [names[k] for k in ("karpenter", "cluster_autoscaler") if k in kinds]
+        who = human_list(known) if known else "the node autoscaler"
+        top = max(pools, key=lambda fp: fp[1]["idle"])
+        deps = ["automation_proof"] if self.has("automation_proof") else []
+        if self.has("autoscaler_labels"):
+            deps.append("autoscaler_labels")
+        blockers = [k for k in ("stale_optout", "pdb", "unevictable_affinity") if self.has(k)]
+        karp = "karpenter" in kinds
+        ca = "cluster_autoscaler" in kinds
+        t, r = effort("S", [])
+        self.add("binpacking", action_type="binpacking_automation",
+                 title=f"Turn on PerfectScale bin-packing so {who} can remove underused nodes",
+                 cluster=self.names(fs), scope=f"{len(pools)} long-lived node pools with {usd(idle)}/mo of idle",
+                 savings_monthly_usd=0, savings_basis="blocked_pending", confidence="medium", effort_tier=t,
+                 effort_rationale=r + "; two custom resources, run in DryRun before anything moves",
+                 change_risk="medium", owner_role="platform", phase=1, lane="toggle", is_unblocker=True, depends_on=deps,
+                 _uids=sorted({f["uid"] for f in fs}),
+                 steps=["Agree the safety settings with the platform owner: keep kube-system, GPU and emptyDir pods blocked, "
+                        "leave the PDB override off, and list any pods or node labels that must never move (protected pod "
+                        "selectors, excluded node selectors).",
+                        "Apply a ClusterNodeGroupAutomationConfig with `binpacking.operational.automationMode: DryRun` on "
+                        + self.names(fs) + ". It needs the PerfectScale automation agent the automation waves already rely on.",
+                        "Review a week of dry-run decisions: which nodes it would empty, which pods it would move, and what "
+                        "stopped it - PDBs, do-not-evict annotations" + (", node groups already at their minimum size" if ca else "")
+                        + ". Those blockers are the scale-down actions in this plan"
+                        + (f" ({human_list([b.replace('_', ' ') for b in blockers])})" if blockers else "") + ".",
+                        f"Enable it one node group at a time with a NodeGroupAutomationConfig, starting with `{top[1]['id']}` on "
+                        f"{top[0]['name']} ({usd(top[1]['idle'])}/mo idle)."
+                        + (" On Karpenter, set `karpenter.doNotDisruptFor` so freshly packed nodes are not churned straight away." if karp else "")
+                        + (" On the cluster autoscaler, check the pool minimum - a group held at its minimum is skipped." if ca else ""),
+                        "Verify: node count on each enabled pool follows demand, its idle cost falls, and the unevictable-pod "
+                        "list shrinks to what the blocker actions cover."],
+                 verification="Node count on enabled pools tracks demand; idle $ falls; bin-packing audit shows nodes emptied and removed",
+                 evidence=f"{usd(idle)}/mo of node idle sits on {len(pools)} long-lived pools ({who}). Right-sizing frees pod "
+                          "requests, but the bill only falls when nodes leave, and an autoscaler removes a node only once it is "
+                          "empty or nearly so. Requests spread thinly across many nodes rarely empty any one of them, so without "
+                          "bin-packing the pod savings can stay on paper. PerfectScale's bin-packing automation moves pods off "
+                          f"underused nodes so {who} can remove them, within the safety rules above. The idle figure is a ceiling, "
+                          "not a computed saving; the released value is the pool actions this unblocks.")
+        for a in pool_acts:
+            if "binpacking" not in a["depends_on"]:
+                a["depends_on"].append("binpacking")
 
     # ---- Karpenter NodePool structural recommendations (consolidation policy/delay, limits, instance selection)
     def r_pool_karpenter_tuning(self):

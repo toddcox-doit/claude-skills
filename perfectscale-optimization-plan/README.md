@@ -15,7 +15,7 @@ programs, which is the point.
 
 | Artifact | Formats | Audience |
 |---|---|---|
-| Optimization plan | `.md`, `.html`, `.json`, `.xlsx`, `.csv` | the customer's platform / FinOps team |
+| Optimization plan | `.md`, `.html`, `.xlsx` (plan JSON in `data/` for the tools; `.csv` only if `openpyxl` is missing) | the customer's platform / FinOps team |
 | Executive summary, one page | `.docx`, `.html` | a decision-maker |
 | Per-cluster findings | `.md`, one per cluster | the engineers who do the work |
 | POV automation kickoff | `.html`, one per cluster | the POV working session: scope automation, then generate its CRDs |

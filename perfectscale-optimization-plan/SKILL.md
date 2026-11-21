@@ -206,7 +206,7 @@ Step 3 writes all of this. None of it needs a second command:
 
 | Artifact | Formats |
 |---|---|
-| Optimization plan | `.md`, `.html`, `.json`, `.xlsx`, `.csv` |
+| Optimization plan | `.md`, `.html`, `.xlsx` - the plan JSON (read by the executive summary, the change log and verify) sits in `data/`; a `.csv` is written only when `openpyxl` is missing |
 | Per-cluster findings | `.md`, one per cluster |
 | **Executive summary** (one page) | **`.docx` and `.html`** |
 | **POV automation kickoff** | **`.html`, one per cluster** (plus a `POV kickoff` sheet in the `.xlsx`) |
@@ -255,8 +255,13 @@ it is not discussing. Asserted by the verifier, like the table controls:
 - **Click any section heading to collapse it** — or focus it and press Enter or
   Space; it is a real `role=button` with `aria-expanded`.
 - **Expand all / Collapse all** sit above the first section.
-- Body sections start open; the two appendices and **Feedback requested** start
-  collapsed, so scrolling still reads the way the plan reads on paper.
+- **Every section starts collapsed**, so the page opens as a table of contents and
+  the reader opens what they came for.
+- **The Actions table has pull-down filters** - Phase, Topic (Automation,
+  Right-sizing, Resiliency, Policy, Scale-down blockers, Node pools and
+  autoscaling, Governance), Cluster and Lane - with a "Showing N of M" count,
+  **Phase 1 only** and **Show everything**. It opens on Phase 1, the work to
+  start now; the verifier asserts both the filters and that default.
 - A link into a collapsed section opens it, so the Actions table's links to
   Action detail keep working, and so does a pasted `#A7` URL.
 - Printing ignores all of it: `@media print` forces every section open, since no

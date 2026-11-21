@@ -105,7 +105,14 @@ class T(unittest.TestCase):
     def test_render_and_verify_clean(self):
         files = render.write_all(self.cfg, self.S, self.F)
         names = {f.suffix for f in files}
-        self.assertTrue({".md", ".html", ".json", ".csv"} <= names)
+        self.assertTrue({".md", ".html", ".json"} <= names)
+        # The plan JSON is machine input and lives in data/; with the XLSX written, no duplicate CSV.
+        self.assertTrue(all(f.parent.name == "data" for f in files if f.suffix == ".json"))
+        try:
+            import openpyxl  # noqa: F401
+            self.assertNotIn(".csv", names)
+        except ImportError:
+            self.assertIn(".csv", names)
         ok, errs = verify.verify(self.cfg, self.S, self.F, files)
         self.assertEqual(errs, [])
 

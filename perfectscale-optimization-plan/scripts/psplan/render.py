@@ -2,6 +2,7 @@
 import csv
 import html
 import json
+import re
 import subprocess
 import sys
 from datetime import date
@@ -547,7 +548,15 @@ tr.nsdet[hidden]{display:none}
 .secbar{display:flex;gap:12px;justify-content:flex-end;margin:16px 0 -10px}
 .secbar button{font:inherit;font-size:12px;color:var(--acc);background:none;border:0;padding:0;cursor:pointer;text-decoration:underline}
 /* a printed plan is read on paper: no one can expand it, so print it whole */
-@media print{.sec[hidden]{display:block!important}.sechd::before{display:none}.secbar{display:none}}"""
+@media print{.sec[hidden]{display:block!important}.sechd::before{display:none}.secbar{display:none}}
+/* Actions table filters */
+.afilt{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0 4px;font-size:13px}
+.afilt .pd{position:relative;display:inline-block}
+.afilt .cfg{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:3px 9px;cursor:pointer}
+.afilt .cfg:hover,.afilt .cfg[aria-expanded=true]{border-color:var(--acc);color:var(--acc)}
+.afilt .lnk{font:inherit;color:var(--acc);background:none;border:0;padding:0;cursor:pointer;text-decoration:underline}
+.afilt .menu .cnt{color:var(--mut);margin-left:auto;padding-left:10px}
+tr.off{display:none}"""
 # Sorting keeps a detail row glued to the row it belongs to: the namespace appendix puts
 # each namespace's cluster list in a full-width <tr class=nsdet> beneath its row, and a
 # plain sort would scatter those across the table.
@@ -737,7 +746,7 @@ document.querySelectorAll('table').forEach(function(t,ti){
 # the resizer initialises. Collapse happens only once that has finished.
 JS_COLLAPSE = """(function(){
 var main=document.querySelector('main');if(!main)return;
-var CLOSED=/^(Appendix|Feedback requested)/i;
+var CLOSED=/[\s\S]*/; // every section starts collapsed: the reader opens what they came for
 var hs=[].slice.call(main.children).filter(function(n){return n.tagName==='H2'});
 if(!hs.length)return;
 var secs=[];
@@ -777,6 +786,28 @@ main.addEventListener('click',function(ev){
 revealId(location.hash.slice(1),true);
 })()"""
 
+# Actions table filters. Runs after JS_RESIZE so column widths are measured on every row, then
+# hides the rows outside the chosen phase/topic/cluster/lane (Phase 1 to start).
+JS_AFILT = """(function(){var bar=document.querySelector('.afilt'),t=document.getElementById('actions');if(!bar||!t)return;
+var rows=[].slice.call(t.tBodies[0].rows),menus=[].slice.call(bar.querySelectorAll('.menu'));
+function sel(m){return [].slice.call(m.querySelectorAll('input:checked')).map(function(c){return c.value})}
+function apply(){var F={};menus.forEach(function(m){F[m.dataset.f]=sel(m)});var n=0;
+ rows.forEach(function(r){var ok=Object.keys(F).every(function(f){return (r.dataset[f]||'').split('|').some(function(x){return F[f].indexOf(x)>=0})});
+  r.classList.toggle('off',!ok);if(ok)n++});
+ menus.forEach(function(m){var all=m.querySelectorAll('input').length,s=sel(m),lab=m.parentNode.querySelector('.fsum');
+  lab.textContent=s.length===all?'All':(s.length?(m.dataset.f==='phase'?s.join(', '):(s.length+' of '+all)):'None')});
+ bar.querySelector('.fcount').textContent='Showing '+n+' of '+rows.length+' actions'}
+bar.addEventListener('change',apply);
+bar.querySelectorAll('button.cfg').forEach(function(b){b.addEventListener('click',function(ev){ev.stopPropagation();
+ var m=b.nextElementSibling,o=m.hidden;menus.forEach(function(x){x.hidden=true});m.hidden=!o;b.setAttribute('aria-expanded',o?'true':'false')})});
+document.addEventListener('click',function(ev){if(!bar.contains(ev.target))menus.forEach(function(m){m.hidden=true})});
+document.addEventListener('keydown',function(ev){if(ev.key==='Escape')menus.forEach(function(m){m.hidden=true})});
+bar.querySelectorAll('[data-all],[data-none]').forEach(function(b){b.addEventListener('click',function(){var on=b.hasAttribute('data-all');
+ b.closest('.menu').querySelectorAll('input').forEach(function(c){c.checked=on});apply()})});
+document.getElementById('freset').addEventListener('click',function(){menus.forEach(function(m){m.querySelectorAll('input').forEach(function(c){c.checked=m.dataset.f!=='phase'||c.value==='1'})});apply()});
+document.getElementById('fall').addEventListener('click',function(){bar.querySelectorAll('.menu input').forEach(function(c){c.checked=true});apply()});
+apply()})()"""
+
 JS_CALC = """(function(){var D=JSON.parse(document.getElementById('plan').textContent);
 function m(v){return '$'+Math.round(v).toLocaleString('en-US')}
 function set(k,t){document.querySelectorAll('[data-calc="'+k+'"]').forEach(function(n){n.textContent=t})}
@@ -791,6 +822,46 @@ var s=document.getElementById('adopt');if(s)run(s.value)})();"""
 
 def e(x):
     return html.escape(str(x))
+
+
+TOPIC_ORDER = ("Automation", "Right-sizing", "Resiliency", "Policy", "Scale-down blockers", "Node pools and autoscaling", "Governance")
+TENANT_WIDE = "Tenant-wide"
+
+
+def action_clusters(a, facts):
+    """The clusters an action names, matched on whole names so 'prod' never matches 'prod-a'."""
+    hit = [f["name"] for f in facts if re.search(rf"(?<![\w-]){re.escape(f['name'])}(?![\w-])", a.get("cluster") or "")]
+    return hit or [TENANT_WIDE]
+
+
+def action_filters(S, facts):
+    """Pull-down filters over the Actions table: phase, topic, cluster, lane. The page opens on
+    Phase 1 - the work to start now - and the reader widens it to what interests them."""
+    A = S["actions"]
+
+    def menu(key, label, values, checked, text=lambda v: v):
+        counts = {v: 0 for v in values}
+        for a in A:
+            for v in (str(a["phase"]),) if key == "phase" else ((a.get("topic") or "Governance"),) if key == "topic" else \
+                    tuple(action_clusters(a, facts)) if key == "cl" else ((LANE.get(a["lane"]) or a["lane"]),):
+                if v in counts:
+                    counts[v] += 1
+        items = "".join(f"<label><input type=checkbox value='{e(v)}'{' checked' if checked(v) else ''}>{e(text(v))}"
+                        f"<span class=cnt>{counts[v]}</span></label>" for v in values if counts[v])
+        return (f"<span class=pd><button type=button class=cfg aria-haspopup=true aria-expanded=false>{e(label)}: <span class=fsum></span> &#9662;</button>"
+                f"<div class=menu data-f={key} hidden><p class=ttl>{e(label)}</p>{items}"
+                "<div class=acts><button type=button data-all>All</button><button type=button data-none>None</button></div></div></span>")
+    phases = sorted({str(a["phase"]) for a in A})
+    topics = [t for t in TOPIC_ORDER if any((a.get("topic") or "Governance") == t for a in A)]
+    clusters = [f["name"] for f in facts] + [TENANT_WIDE]
+    lanes = [LANE[k] for k in LANE if any(a["lane"] == k for a in A)]
+    return ("<div class=afilt>"
+            + menu("phase", "Phase", phases, lambda v: v == "1", lambda v: PHASE.get(int(v), f"Phase {v}"))
+            + menu("topic", "Topic", topics, lambda v: True)
+            + menu("cl", "Cluster", clusters, lambda v: True)
+            + menu("lane", "Lane", lanes, lambda v: True)
+            + "<span class='mut fcount'></span><button type=button class=lnk id=freset>Phase 1 only</button>"
+            "<button type=button class=lnk id=fall>Show everything</button></div>")
 
 
 def dep_svg(S):
@@ -888,12 +959,13 @@ def render_html(cfg, S, facts):
              + "".join(f"<th>{e(h)}</th>" for h in idle_headers(S)) + "</tr></thead><tbody>"
              + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in idle_rows(S))
              + "</tbody></table></div>" + (f"<p class=mut>{e(idle_note(S))}</p>" if idle_note(S) else ""))
-    P.append("<h2>Actions</h2><div class=wrap><table class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("ID", "Phase", "Action", "Fit", "Cluster", "Value / mo", "Basis", "Lane", "Effort", "Confidence", "ROI")) + "<th>At <span data-calc='pct'>" + pf + "</span></th></tr></thead><tbody>")
+    P.append("<h2>Actions</h2>" + action_filters(S, facts) + "<div class=wrap><table id=actions class=sort><thead><tr>" + "".join(f"<th>{h}</th>" for h in ("ID", "Phase", "Action", "Fit", "Cluster", "Value / mo", "Basis", "Lane", "Effort", "Confidence", "ROI")) + "<th>At <span data-calc='pct'>" + pf + "</span></th></tr></thead><tbody>")
     for a in S["actions"]:
         v = a["savings_monthly_usd"] or 0
         note = unblock_note(a)
         title_cell = f"<a href='#{a['id']}'>{e(a['title'])}</a>" + (f" <b>{e(note)}</b>" if note else "")
-        P.append(f"<tr><td data-v='{a['id'][1:]}'>{e(a['id'])}</td><td>{a['phase']}</td><td>{title_cell}</td><td>{e(a['fit'])}</td><td>{e(a['cluster'])}</td><td class=num data-v='{v:.0f}'>{e(money(a))}</td>"
+        P.append(f"<tr data-phase='{a['phase']}' data-topic='{e(a.get('topic') or 'Governance')}' data-lane='{e(LANE.get(a['lane']) or a['lane'])}' "
+                 f"data-cl='{e(chr(124).join(action_clusters(a, facts)))}'><td data-v='{a['id'][1:]}'>{e(a['id'])}</td><td>{a['phase']}</td><td>{title_cell}</td><td>{e(a['fit'])}</td><td>{e(a['cluster'])}</td><td class=num data-v='{v:.0f}'>{e(money(a))}</td>"
                  f"<td>{e(BASIS[a['savings_basis']])}</td><td>{e(LANE.get(a['lane']))}</td><td>{a['effort_tier']}</td><td>{a['confidence']}</td><td>{a['roi_score'] if a['roi_score'] is not None else '-'}</td><td class=num data-calc-row='{0 if a['savings_basis'] == 'resiliency_investment' else v:.0f}' data-spend='{1 if a['savings_basis'] == 'resiliency_investment' else 0}'>{e(money(a)) if a['savings_basis'] == 'resiliency_investment' else (e(usd(v * ad['factor'])) + '/mo' if v else '-')}</td></tr>")
     P.append("</tbody></table></div>")
     svg = dep_svg(S)
@@ -936,7 +1008,7 @@ def render_html(cfg, S, facts):
     managed_html = _ns_table_html(MANAGED_TITLE, MANAGED_LEAD, mg, managed_addon_note(S)) if mg else ""
     P.append("</tbody></table></div>" + "<h2>" + DECISIONS_TITLE + "</h2><p>" + e(DECISIONS_LEAD) + "</p>" + "".join(f"<h3>{e(g)}: {e(cap)}</h3><ol>" + "".join(f"<li>{e(x)}</li>" for x in lines) + "</ol>" for g, cap, lines in decision_groups(S)) + ns_html + managed_html + ("<h2>Appendix: evidence detail</h2><p class=mut>The statements above, with their basis and how to check each one in PerfectScale.</p><div class=wrap><table><thead><tr><th>Status</th><th>Statement</th><th>Basis</th><th>How to check</th></tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{e(x)}</td>" for x in row) + "</tr>" for row in evidence_rows(S)) + "</tbody></table></div>") + (("<h2>Feedback requested</h2><ol>" + "".join(f"<li>{e(x)}</li>" for x in FEEDBACK_PROMPTS) + "</ol>") if cfg.get("status") else "") + "</main>")
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{e(cfg['customer'])} Optimization Plan</title>"
-            f"<style>{CSS}</style></head><body>{''.join(P)}<script type=application/json id=plan>{json.dumps(CALC)}</script><script>{JS};{JS_CALC};{JS_RESIZE};{JS_NSROW};{JS_COLLAPSE}</script></body></html>")
+            f"<style>{CSS}</style></head><body>{''.join(P)}<script type=application/json id=plan>{json.dumps(CALC)}</script><script>{JS};{JS_CALC};{JS_RESIZE};{JS_AFILT};{JS_NSROW};{JS_COLLAPSE}</script></body></html>")
 
 
 # ---------------------------------------------------------------- XLSX / CSV
@@ -961,17 +1033,19 @@ def _acol_value(a, c):
 
 
 def render_tables(cfg, S, facts, out_dir):
+    """The action grid as XLSX. A CSV of the same rows is written only when openpyxl is missing:
+    with the workbook present it is a duplicate, and one more file in the customer's folder."""
     out_dir = Path(out_dir)
     rows = [[_acol_value(a, c) for c in ACOLS] for a in S["actions"]]
-    csvp = out_dir / fname(cfg, "optimization-plan", "csv")
-    with open(csvp, "w", newline="") as fh:
-        w = csv.writer(fh); w.writerow(ACOLS); w.writerows(rows)
-    made = [csvp]
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font
     except ImportError:
-        return made
+        csvp = out_dir / fname(cfg, "optimization-plan", "csv")
+        with open(csvp, "w", newline="") as fh:
+            w = csv.writer(fh); w.writerow(ACOLS); w.writerows(rows)
+        return [csvp]
+    made = []
     wb = Workbook(); ws = wb.active; ws.title = "Actions"
     ws.append(ACOLS)
     for r in rows:
@@ -1090,8 +1164,11 @@ def write_all(cfg, S, facts):
         p.write_text(text, encoding="utf-8"); made.append(p)
     w(fname(cfg, "optimization-plan", "md"), render_plan_md(cfg, S))
     w(fname(cfg, "optimization-plan", "html"), render_html(cfg, S, facts))
-    plan_json = out / fname(cfg, "optimization-plan", "json")
-    w(fname(cfg, "optimization-plan", "json"), json.dumps(S, indent=1, default=str))
+    # The plan JSON is machine input - the executive summary, the change log on the next run and the
+    # verifier read it - not a deliverable, so it sits in data/ beside the reports rather than among them.
+    (out / "data").mkdir(exist_ok=True)
+    plan_json = out / "data" / fname(cfg, "optimization-plan", "json")
+    w(str(Path("data") / fname(cfg, "optimization-plan", "json")), json.dumps(S, indent=1, default=str))
     for f in facts:
         w(fname(cfg, f"{f['name']}-findings", "md"), render_cluster_md(cfg, S, f))
     # POV automation kickoff, one page per cluster. Imported here, not at module top: pov.py

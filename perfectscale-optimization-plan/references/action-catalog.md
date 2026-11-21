@@ -171,11 +171,27 @@ team that owns it — not a tenant-wide PerfectScale setting.
 | `unevictable_localpv` | Migrate a local PV to network storage | L | `platform` | critical |
 | `unevictable_mirror_pod` | Address a static/mirror pod pinning a node | L | `platform` | high |
 | `unevictable_system_pod` | Move a kube-system or operator pod off a node the autoscaler needs to drain | M | `platform` | high |
+| `binpacking_automation` | Turn on PerfectScale bin-packing automation (`ClusterNodeGroupAutomationConfig` / `NodeGroupAutomationConfig`, `binpacking` block): DryRun first, then per node group, so Karpenter or the cluster autoscaler can remove the nodes it empties | S | `platform` | medium |
 
 **Note on `nodegroup_instance_change` risk.** An S-effort change — a value in a
 node group definition — with `high` risk, because it drains and replaces nodes.
 Almost always escalates to M via the restart-required escalator, and it should:
 the work is not editing the value, it is the change window.
+
+**Note on `binpacking_automation`.** Right-sizing frees pod requests; the bill
+only falls when nodes leave, and an autoscaler removes a node only once it is
+empty or under its threshold. Requests spread thinly across many nodes rarely
+empty any one of them, so pod savings can stay on paper. PerfectScale's
+bin-packing automation (psc-autoscaler chart, `binpacking` block on the cluster
+and node-group automation configs) moves pods off underused nodes so the node
+autoscaler can remove them, inside safety rules: PDBs respected unless
+`pdbOverride` is enabled, `do-not-disrupt` / `safe-to-evict` annotations
+honoured, kube-system, GPU and emptyDir pods blockable, groups at minimum size
+skipped, protected-pod and excluded-node selectors. The engine emits one action
+(`r_binpacking`) whenever long-lived pools carry idle worth a shrink action: a
+Phase 1 unblocker in DryRun that every `nodepool_shrink` action depends on, so its
+released value is their idle ceiling. It depends on the automation proof (the
+agent must be installed) and, where present, on fixing autoscaler labels.
 
 **Note on bin-packing.** `pool_shrink_blocked`, `pool_shrink_free` and
 `pool_machine_recs` (`r_pool_actions` in actions.py; rendered as action_type
@@ -188,7 +204,8 @@ maximize resource utilization," and list it as a benefit — "Optimized Resource
 Allocation... improving bin-packing, and optimizing the performance of
 node-autoscalers." Not a missing capability this plan is reaching for; when a
 customer asks "do you do bin-packing," the answer is yes, use PerfectScale's
-own term, and point at these actions.
+own term, and point at these actions together with `binpacking_automation`,
+which is what actually empties the nodes so the autoscaler can remove them.
 
 **Note on `unevictable_karpenter_optout`.** Despite the name, this type also covers
 the Cluster Autoscaler equivalent of the same finding — a stale
