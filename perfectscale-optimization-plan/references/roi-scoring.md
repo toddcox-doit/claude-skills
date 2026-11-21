@@ -284,7 +284,7 @@ possible.
   - Default optimization policy applied to new namespaces automatically
   - Automation on-by-default for new eligible workloads
   - A quarterly InfraFit review, with a named owner
-  - A re-run date for this plan
+  - When to revisit this plan: on demand, or at 30-day maturity
 - Anything whose prerequisite chain reaches into Phase 2
 
 Ordered by dependency, then `roi_score`.

@@ -13,6 +13,7 @@ import math
 import re
 from datetime import date, timedelta
 
+from .goal import goal_check
 from .model import managed_ns, short_name
 from .util import cores, gib, human_list, pct, roi_score, usd
 
@@ -113,6 +114,33 @@ def effort(base, esc):
 
 
 class Plan:
+    def revisit(self):
+        """When the next look is worth having. A POV runs 30 days, so a fixed re-run months out is
+        the wrong promise: the figures firm up once every cluster has a full month observed (the
+        run-rate scaling drops away), and otherwise a second look is on demand - after automation
+        has run, or before the success review."""
+        if getattr(self, "_revisit", None):
+            return self._revisit
+        full = int(self.cfg["scale_to_days"])
+        lag = [f for f in self.F if f["window_days"] < full - 0.5]
+        to_go = max((math.ceil(full - f["window_days"]) for f in lag), default=0)
+        d = date.fromisoformat(self.cfg["prepared"]) + timedelta(days=to_go) if lag else None
+        when = f"{d.day} {d.strftime('%B %Y')}" if d else None
+        self._revisit = {
+            "full_days": full, "days_to_go": to_go, "maturity_date": d.isoformat() if d else None,
+            "lagging": [f["name"] for f in lag],
+            "when": (f"once every cluster has {full} days of observation, around {when}" if d else None),
+            "text": (f"We can revisit these figures on demand, or once every cluster has {full} days of observation, "
+                     f"around {when}, and report what moved." if d else
+                     f"Every cluster already has {full} days of observation; we can revisit these figures on demand "
+                     "and report what moved."),
+        }
+        return self._revisit
+
+    def revisit_phrase(self):
+        r = self.revisit()
+        return f"on demand, or {r['when']}" if r["when"] else "on demand"
+
     def window_phrase(self):
         """How much data the plan rests on, per cluster when the windows differ.
 
@@ -1130,11 +1158,20 @@ class Plan:
                             "Verify: coverage ratio returns to target against the post-optimization run rate."],
                      verification="Commitment coverage ratio back to target against the new run rate",
                      evidence=f"Combined node spend is {usd(self.total_node_cost)}/mo with {usd(self.total_idle)}/mo idle. If consolidation reclaims a meaningful share, existing commitments will be over-cut against the new footprint.")
-        d = date.fromisoformat(self.cfg["prepared"]) + timedelta(days=self.cfg["rerun_days"])
-        self.rerun_date = d
-        self.add("rerun", action_type="plan_rerun", title=f"Regenerate this plan on {d.day} {d.strftime('%B %Y')} and diff it", cluster="tenant-wide", scope="all clusters",
+        rv = self.revisit()
+        self.rerun_date = date.fromisoformat(rv["maturity_date"] or self.cfg["prepared"])
+        if rv["maturity_date"]:
+            title = f"Regenerate this plan once every cluster has {rv['full_days']} days of data, or on demand, and diff it"
+            first = (f"Re-run on demand, or once {human_list(rv['lagging'])} reach{'es' if len(rv['lagging']) == 1 else ''} "
+                     f"{rv['full_days']} days of observation, around {self.rerun_date.day} {self.rerun_date.strftime('%B %Y')}. "
+                     "From then the run-rate scaling in this plan drops away and every figure is measured.")
+        else:
+            title = "Regenerate this plan on demand and diff it"
+            first = (f"Re-run on demand: after automation has run for a week, say, or before the success review. Every cluster "
+                     f"already has {rv['full_days']} days of observation, so nothing in this plan is scaled.")
+        self.add("rerun", action_type="plan_rerun", title=title, cluster="tenant-wide", scope="all clusters",
                  savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", effort_tier="XS", effort_rationale="XS (catalog), no escalators", change_risk="low", owner_role="ps-csm", phase=3, lane="decision",
-                 steps=[f"Re-run on {d.day} {d.strftime('%B %Y')}, {self.cfg['rerun_days']} days out." + (" By then every cluster has a full month or more of history, so the run-rate scaling in this plan drops away." if self.early else ""),
+                 steps=[first,
                         "Diff against this plan rather than reading the new one cold - what moved and what did not is a better conversation than a fresh list.",
                         "Verify: the re-run shows Phase 1 and Phase 2 actions closed and quantifies what they returned."],
                  verification="Re-run shows closed actions and their realized return",
@@ -1267,10 +1304,14 @@ class Plan:
                      "unclaimed_other": round(self.total_idle - claimed_idle - ap_idle), "gpu": round(gpu_idle)},
             "pod": {"cost": round(self.pod_cost), "waste": round(self.pod_waste), "potential": round(self.pod_pot), "managed_held_out": round(held)},
             "confidence_counts": dict(confs), "first_moves": [a["id"] for a in first_moves],
-            "rerun_date": getattr(self, "rerun_date", date.fromisoformat(self.cfg["prepared"]) + timedelta(days=self.cfg["rerun_days"])).isoformat(),
+            # rerun_date is kept for older readers: the maturity date, or the prepared date when every
+            # cluster already has a full month. New readers use `revisit`.
+            "revisit": self.revisit(),
+            "rerun_date": (self.revisit()["maturity_date"] or self.cfg["prepared"]),
             "decisions": self.decisions(), "decision_detail": self.decision_detail, "evidence": self.evidence(), "confidence": self.confidence_summary(), "cluster_idle": self.cluster_idle(A),
             "scale_context": self.scale_context(), "outlook": self.outlook(A, tot), "actions": A,
             "namespace_rollup": self.namespace_rollup(),
+            "goal": goal_check(self.cfg, self.F),
         }
 
     # Namespaces are the unit a platform team actually assigns work in: one owner holds
@@ -1392,7 +1433,7 @@ class Plan:
         if "stateful_manual" in by_key or "heldout_manual" in by_key:
             add("The workloads kept out of automation - is that permanent, or revisitable once the automation record is re-established?", val(["stateful_manual", "heldout_manual"]))
         if self.early:
-            add(f"Is a {self.window:.0f}-day window representative? Batch and delivery cycles can swing load. If month-end or delivery weeks look very different, the run-rate figures here will move - which is the reason to re-run in {self.cfg['rerun_days']} days.", 0, "saving", "affects every figure")
+            add(f"Is a {self.window:.0f}-day window representative? Batch and delivery cycles can swing load. If month-end or delivery weeks look very different, the run-rate figures here will move - which is the reason to revisit them {self.revisit_phrase()}.", 0, "saving", "affects every figure")
             for c, s in self.trends.items():
                 if s.get("variable"):
                     D[-1]["text"] += f" Daily cost on {c} varies by {s['cv'] * 100:.0f}% (coefficient of variation), so treat its run-rate with extra care."
@@ -1428,7 +1469,7 @@ class Plan:
         add("measured", "Automation has not yet run on these clusters." if not any(f["audit"]["n"] for f in self.F) else "Automation has run on part of these clusters.", "Automation audit log.", "Automation page, audit log.")
         add("unknown", "Autoscaler settings: autoscaling profile, auto-provisioning limits, allowed machine families.", "The API does not expose them.", "Ask the platform team, or read the cluster configuration.")
         add("unknown", "How many jobs share a node, and whether a node is created per job.", "Not in the data collected.", "Pod-to-node placement for a sample of job runs.")
-        add("unknown", f"Whether a {self.window:.0f}-day window is representative of normal load.", "Window length.", f"Re-run on {(date.fromisoformat(self.cfg['prepared']) + timedelta(days=self.cfg['rerun_days'])).isoformat()}.")
+        add("unknown", f"Whether a {self.window:.0f}-day window is representative of normal load.", "Window length.", f"Revisit {self.revisit_phrase()}.")
         return out
 
     def confidence_summary(self):
@@ -1455,7 +1496,7 @@ class Plan:
         know.append(f"{usd(self.pod_pot)}/mo is PerfectScale's computed workload saving in scope.")
         if not any(f["audit"]["n"] for f in self.F):
             know.append("Automation has not yet run on these clusters, so no savings have been realized.")
-        need.append(f"A second look after more data: this plan rests on {self.window_phrase()}, and we will re-run on {(date.fromisoformat(self.cfg['prepared']) + timedelta(days=self.cfg['rerun_days'])).isoformat()}.")
+        need.append(f"A second look after more data: this plan rests on {self.window_phrase()}, and we can revisit it {self.revisit_phrase()}.")
         grouping = None
         if fs:
             jr = {k: sum(f["job_req_vs_rec"][k] for f in fs) for k in ("cpu_cur", "cpu_rec", "mem_cur_gib", "mem_rec_gib")}

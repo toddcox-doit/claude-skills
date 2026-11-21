@@ -231,7 +231,7 @@ type. An action built from a mix of the two says so in its evidence.
 | `policy_default_new_ns` | Default optimization policy applied to new namespaces automatically | S | `ps-admin` | low |
 | `automation_default_on` | New eligible workloads get automation without a per-workload decision | S | `ps-admin` | medium |
 | `review_cadence` | A recurring InfraFit/PodFit review with a named owner and a date | XS | `platform` | low |
-| `plan_rerun` | Regenerate this plan on a set date and diff it | XS | `ps-csm` | low |
+| `plan_rerun` | Regenerate this plan on demand, or once every cluster has 30 days of data, and diff it | XS | `ps-csm` | low |
 | `other` | Escape hatch. Justify the tier in `effort_rationale`, and add a `rationale` field explaining what the finding actually is (e.g. a node pool reporting no autoscaler type — a data-visibility defect, not a right-sizing or tuning action) | — | — | — |
 
 ---

@@ -159,9 +159,11 @@ const C = {
              (earlyB.length > 1 ? 'them' : 'it') + ', from ' + usd(r100(EA.obs)) + ' actually observed.' : '')]] : []),
       ['', gated + '% of what is available now depends on switching automation on. The remainder is ' +
            'configuration your teams change directly.'],
-      ...(oom ? [['', 'Separately, about ' + nOom + ' workloads are being restarted for running out of memory' +
-           (nMem ? ' and ' + nMem + ' have no memory limit' : '') + '. Fixing that costs about ' +
-           usd(r100(oom.savings_monthly_usd)) + ' a month and should proceed whatever is decided commercially.']] : []),
+      ...(oom ? [['', 'Separately, ' + (nOom === '1' ? 'one workload is' : 'about ' + nOom + ' workloads are') +
+           ' being restarted for running out of memory' +
+           (nMem ? ' and ' + nMem + (nMem === '1' ? ' has' : ' have') + ' no memory limit' : '') + '. ' +
+           (r100(oom.savings_monthly_usd) >= 100 ? 'Fixing that costs about ' + usd(r100(oom.savings_monthly_usd)) + ' a month'
+             : 'Fixing that adds little or no spend') + ' and should proceed whatever is decided commercially.']] : []),
       ...(opt ? [['', nOpt + ' pods carry settings that stop nodes draining, holding back node savings.']] : []),
       ...(apShare > 0.3 ? [['', 'Most idle sits on short-lived pools the autoscaler creates, so its cause ' +
            'needs confirming before any of it is claimed.']] : []),
@@ -169,22 +171,90 @@ const C = {
   ],
 
   closing: 'Savings and reliability spend are counted separately and idle capacity is never added to either. ' +
-           'The ' + f + '% view is the conservative planning case. We will re-measure on ' + ld(S.rerun_date) +
-           ' and report what moved.' + (S.early ? ' Costs are scaled from a short window to a 30-day run rate.' : ''),
+           'The ' + f + '% view is the conservative planning case. ' +
+           // A POV runs 30 days: promise a look on demand or at 30-day maturity, never a date months out.
+           ((S.revisit && S.revisit.text) || 'We can revisit these figures on demand and report what moved.') +
+           (S.early ? ' Costs are scaled from a short window to a 30-day run rate.' : ''),
 };
+
+// ----------------------------------------------------- savings goal vs data
+// Present only when the tenant config carries a savings_goal (plan JSON field `goal`, built by
+// psplan/goal.py). Each bar runs from $0: conservative, realistic and theoretical-maximum zones,
+// with the goal drawn over them as a marker (or a band for a range). Cluster rows share one scale
+// so their lengths compare; the all-clusters total gets its own, or it would flatten the rows.
+const G = S.goal && ((S.goal.rows || []).length || S.goal.total) ? S.goal : null;
+const VCLS = {supported: 'ok', stretch: 'st', unlikely: 'un', not_supported: 'no'};
+const goalTxt = r => usd(r.goal_low) + (r.goal_high !== r.goal_low ? '-' + usd(r.goal_high) : '') + '/mo';
+function goalSegs(r, scale) {
+  const g1 = r.goal_low, g2 = Math.max(r.goal_high, r.goal_low + scale * 0.008);
+  const clip = v => Math.min(Math.max(v, 0), scale);
+  const pts = Array.from(new Set([0, r.conservative, r.realistic, r.maximum, g1, g2, scale].map(clip)))
+    .sort((a, b) => a - b);
+  const out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (b - a < scale * 1e-6) continue;
+    const m = (a + b) / 2;
+    const k = (m >= g1 && m <= g2) ? 'goal' : m <= r.conservative ? 'z1' : m <= r.realistic ? 'z2'
+      : m <= r.maximum ? 'z3' : 'z0';
+    if (out.length && out[out.length - 1][1] === k) out[out.length - 1][0] += (b - a) / scale;
+    else out.push([(b - a) / scale, k]);
+  }
+  return out;
+}
+function goalRow(r, scale) {
+  return {
+    name: r.name, goal: 'Goal ' + goalTxt(r), verdict: r.verdict_label, vcls: VCLS[r.verdict],
+    segs: goalSegs(r, scale), sentence: r.sentence,
+    figs: 'Conservative ' + usd(r.conservative) + '  |  Realistic ' + usd(r.realistic) +
+          '  |  Maximum ' + usd(r.maximum) +
+          (r.goal_share_of_bill != null ? '  |  Goal = ' + Math.round(r.goal_share_of_bill * 100) +
+            '% of ' + usd(r.node_cost) + '/mo node bill' : ''),
+  };
+}
+if (G) {
+  const top = r => Math.max(r.maximum, r.goal_high) * 1.08 || 1;
+  const sc = Math.max(1, ...G.rows.map(top));
+  const gf = Math.round(G.adoption_factor * 100);
+  C.goal = {
+    title: 'Savings goal vs what the data supports',
+    takeaway: G.takeaway,
+    rows: G.rows.map(r => goalRow(r, sc)),
+    total: G.total ? goalRow(G.total, top(G.total)) : null,
+    key: [['z1', 'Conservative: ' + gf + '% of right-sizing'], ['z2', 'Realistic: with node scale-down'],
+          ['z3', 'Theoretical maximum'], ['goal', 'Goal']],
+    note: (G.source ? 'Goal: ' + G.source + '. ' : '') +
+          (G.baseline_source ? 'Baseline: ' + G.baseline_source + '. ' : '') +
+          ((G.missing_clusters || []).length ? 'Not collected in this run, so not checked: ' +
+            G.missing_clusters.join(', ') + '. ' : '') + G.method,
+  };
+}
 
 // ------------------------------------------------------------------ HTML
 function renderHtml() {
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const card = ([lab, val, lines]) => `<div class="card"><div class="lab">${esc(lab)}</div><div class="val">${esc(val)}</div>` +
     lines.map(l => `<div class="${l.indexOf('At ') === 0 ? 'ln at' : 'ln'}">${esc(l)}</div>`).join('') + '</div>';
-  const section = ([title, bullets]) => `<h2>${esc(title)}</h2><ul>` +
-    bullets.map(([lead, rest]) => `<li>${lead ? `<b>${esc(lead)}</b>` : ''}${esc(rest)}</li>`).join('') + '</ul>';
+  // Each category is a <details> block, closed by default: the reader sees the decision, the
+  // headline cards and the list of categories, and opens what they came for. Native HTML, so it
+  // works without script; the one script only opens everything for printing.
+  const sec = (title, inner) => `<details class="sec"><summary><h2>${esc(title)}</h2></summary><div class="secb">${inner}</div></details>`;
+  const section = ([title, bullets]) => sec(title, '<ul>' +
+    bullets.map(([lead, rest]) => `<li>${lead ? `<b>${esc(lead)}</b>` : ''}${esc(rest)}</li>`).join('') + '</ul>');
   const bar = `<div class="barwrap"><div class="barlab">${esc(C.bar.title)}<span>${esc(usd(C.bar.total))}/mo</span></div>` +
     `<div class="bar">` + C.bar.parts.map((p, i) =>
       `<span class="seg s${i}" style="width:${p[2]}%" title="${esc(p[0])}: ${esc(usd(p[1]))}"></span>`).join('') + `</div>` +
     `<div class="barkey">` + C.bar.parts.map((p, i) =>
       `<span><i class="sw s${i}"></i>${esc(p[0])} ${esc(usd(p[1]))} (${p[2]}%)</span>`).join('') + `</div></div>`;
+  const gRow = (r, cls) => `<div class="grow${cls || ''}"><div class="gname"><b>${esc(r.name)}</b><span>${esc(r.goal)}</span></div>` +
+    `<div class="gbar" role="img" aria-label="${esc(r.sentence)}">` +
+    r.segs.map(([w, k]) => `<span class="gz ${k}" style="width:${(w * 100).toFixed(2)}%"></span>`).join('') + `</div>` +
+    `<span class="pill v-${r.vcls}">${esc(r.verdict)}</span>` +
+    `<div class="gfig">${esc(r.figs)}</div><div class="gsen">${esc(r.sentence)}</div></div>`;
+  const goal = C.goal ? sec(C.goal.title, `<p class="gtake">${esc(C.goal.takeaway)}</p><div class="goal">` +
+    C.goal.rows.map(r => gRow(r)).join('') + (C.goal.total ? gRow(C.goal.total, ' gtot') : '') +
+    `<div class="gkey">` + C.goal.key.map(([k, l]) => `<span><i class="sw k-${k}"></i>${esc(l)}</span>`).join('') + `</div></div>` +
+    `<p class="gnote">${esc(C.goal.note)}</p>`) : '';
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -217,12 +287,46 @@ function renderHtml() {
   .seg{display:block;height:100%}.s0{background:var(--acc)}.s1{background:#C9D2E4}
   .barkey{display:flex;gap:16px;margin-top:5px;font-size:12px;color:var(--mut)}
   .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
+  .gtake{margin:0 0 9px;font-size:15.5px;font-weight:700}
+  .goal{background:var(--card);border-radius:6px;padding:12px 14px 9px;margin:0 0 6px}
+  .grow{display:grid;grid-template-columns:200px 1fr 112px;column-gap:12px;row-gap:2px;align-items:center;padding:7px 0}
+  .grow+.grow{border-top:1px solid var(--line)}
+  .grow.gtot{border-top:2px solid #AEB8C8;margin-top:2px}
+  .gname b{display:block;font-size:13.5px;word-break:break-word;line-height:1.25}
+  .gname span{font-size:12px;color:var(--mut)}
+  .gbar{display:flex;height:18px;border-radius:3px;overflow:hidden;background:#E6EAF1}
+  .gz{display:block;height:100%}
+  .gz.z1{background:var(--acc)}.gz.z2{background:#7E9BDB}.gz.z3{background:#C9D2E4}.gz.z0{background:#E6EAF1}
+  .gz.goal{background:#B45309}
+  .pill{justify-self:start;font-size:11.5px;font-weight:700;letter-spacing:.03em;border-radius:10px;padding:2px 9px;white-space:nowrap}
+  .v-ok{background:#E3F3EA;color:#1E6B43}.v-st{background:#FDF3DC;color:#8A5A00}
+  .v-un{background:#FDE9D7;color:#9A3D06}.v-no{background:#FBE4E2;color:#A3241B}
+  .gfig,.gsen{grid-column:2 / 4;font-size:11.5px;color:var(--mut);line-height:1.35}
+  .gsen{color:var(--ink)}
+  .gkey{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:6px;font-size:11.5px;color:var(--mut)}
+  .k-z1{background:var(--acc)}.k-z2{background:#7E9BDB}.k-z3{background:#C9D2E4}.k-goal{background:#B45309}
+  .gnote{font-size:11.5px;color:var(--mut);margin:0 0 12px;line-height:1.4}
   .delay{background:var(--warmbg);border-radius:6px;padding:11px 15px;margin:0 0 4px;font-size:15px}
   .delay .k{display:block;font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--warm);font-weight:700;margin-bottom:3px}
   ul{margin:0;padding-left:19px} li{margin-bottom:6px;line-height:1.45}
+  details.sec{border-bottom:1px solid var(--line)}
+  details.sec>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:2px 0}
+  details.sec>summary::-webkit-details-marker{display:none}
+  details.sec>summary::before{content:'';width:7px;height:7px;border-right:2px solid var(--mut);border-bottom:2px solid var(--mut);
+     transform:rotate(-45deg);transition:transform .15s;flex:none;margin-left:2px}
+  details.sec[open]>summary::before{transform:rotate(45deg)}
+  details.sec>summary h2{border:0;margin:12px 0;padding:0;flex:1}
+  details.sec>summary:hover h2{color:var(--ink)}
+  details.sec>summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+  .secb{padding:0 0 12px}
+  .secbar{display:flex;justify-content:flex-end;gap:12px;margin:18px 0 0}
+  .secbar button{background:none;border:0;padding:0;color:var(--acc);font:inherit;font-size:12.5px;cursor:pointer}
+  .secbar button:hover{text-decoration:underline}
   .closing{margin-top:12px;font-size:12.5px;font-style:italic;color:var(--mut);line-height:1.45}
-  @media (max-width:820px){ .cards{grid-template-columns:repeat(2,1fr)} body{padding:22px 16px} }
-  @media print{ body{padding:0;max-width:none} h2{break-after:avoid} li,.card,.ask,.delay{break-inside:avoid} }
+  @media (max-width:820px){ .cards{grid-template-columns:repeat(2,1fr)} body{padding:22px 16px}
+    .grow{grid-template-columns:1fr auto} .pill{grid-row:1;grid-column:2} .gbar{grid-column:1 / 3} .gfig,.gsen{grid-column:1 / 3} }
+  @media print{ body{padding:0;max-width:none} h2{break-after:avoid} .secbar{display:none} details.sec>summary::before{display:none} li,.card,.ask,.delay,.grow{break-inside:avoid}
+    .gz,.pill,.sw{-webkit-print-color-adjust:exact;print-color-adjust:exact} }
 </style></head><body>
 <h1>${esc(C.title)}</h1>
 <p class="meta">${esc(C.meta)}</p>
@@ -232,8 +336,20 @@ ${C.status ? `<p class="status">${esc(C.status)}</p>` : ''}
 <div class="cards">${C.cards.map(card).join('')}</div>
 ${bar}
 <div class="delay"><span class="k">${esc(C.delayLabel)}</span>${esc(C.delay)}</div>
+<div class="secbar"><button type="button" data-open="1">Expand all</button><button type="button" data-open="0">Collapse all</button></div>
 ${C.sections.map(section).join('\n')}
+${goal}
 <p class="closing">${esc(C.closing)}</p>
+<script>
+document.querySelectorAll('.secbar button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    document.querySelectorAll('details.sec').forEach(function (d) { d.open = b.dataset.open === '1'; });
+  });
+});
+window.addEventListener('beforeprint', function () {
+  document.querySelectorAll('details.sec').forEach(function (d) { d.open = true; });
+});
+</script>
 </body></html>
 `;
 }
@@ -287,6 +403,50 @@ function renderDocx() {
       margins: { top: 40, bottom: 40, left: 60, right: 60 },
       children: [p([t(' ', { size: 12 })], { after: 0 })] })) })] });
 
+  // Savings goal vs data: one three-column row per goal (name | bar | verdict). The bar is a nested
+  // single-row table whose cells are the zones, so Word draws it without an image.
+  const GFILL = { z1: ACC, z2: '7E9BDB', z3: 'C9D2E4', z0: 'E6EAF1', goal: 'B45309' };
+  const PILL = { ok: ['E3F3EA', '1E6B43'], st: ['FDF3DC', '8A5A00'], un: ['FDE9D7', '9A3D06'], no: ['FBE4E2', 'A3241B'] };
+  const GW = [2500, 6500, 1800], BARW = 6260;
+  const goalBar = segs => {
+    const ws = segs.map(([w]) => Math.max(24, Math.round(BARW * w)));
+    return new Table({ width: { size: ws.reduce((a, b) => a + b, 0), type: WidthType.DXA }, columnWidths: ws,
+      borders: { top: nb, bottom: nb, left: nb, right: nb, insideHorizontal: nb, insideVertical: nb },
+      rows: [new TableRow({ children: segs.map(([, k], i) => new TableCell({
+        width: { size: ws[i], type: WidthType.DXA }, shading: { type: ShadingType.CLEAR, fill: GFILL[k] },
+        margins: { top: 0, bottom: 0, left: 0, right: 0 }, borders: { top: nb, bottom: nb, left: nb, right: nb },
+        children: [p([t(' ', { size: 14 })], { after: 0 })] })) })] });
+  };
+  const goalRowDocx = (r, isTotal) => new TableRow({ children: [
+    new TableCell({ width: { size: GW[0], type: WidthType.DXA }, margins: { top: 70, bottom: 70, left: 100, right: 80 },
+      borders: { top: isTotal ? { style: BorderStyle.SINGLE, size: 8, color: 'AEB8C8' } : nb, bottom: nb, left: nb, right: nb },
+      shading: { type: ShadingType.CLEAR, fill: CARD },
+      children: [p([t(r.name, { size: 18, bold: true })], { after: 0 }), p([t(r.goal, { size: 16, color: MUT })], { after: 0 })] }),
+    new TableCell({ width: { size: GW[1], type: WidthType.DXA }, margins: { top: 70, bottom: 70, left: 120, right: 120 },
+      borders: { top: isTotal ? { style: BorderStyle.SINGLE, size: 8, color: 'AEB8C8' } : nb, bottom: nb, left: nb, right: nb },
+      shading: { type: ShadingType.CLEAR, fill: CARD },
+      children: [goalBar(r.segs), p([t(r.figs, { size: 15, color: MUT })], { before: 30, after: 10 }),
+                 p([t(r.sentence, { size: 15 })], { after: 0 })] }),
+    new TableCell({ width: { size: GW[2], type: WidthType.DXA }, margins: { top: 70, bottom: 70, left: 80, right: 100 },
+      borders: { top: isTotal ? { style: BorderStyle.SINGLE, size: 8, color: 'AEB8C8' } : nb, bottom: nb, left: nb, right: nb },
+      shading: { type: ShadingType.CLEAR, fill: CARD },
+      children: [new Paragraph({ spacing: { after: 0 }, shading: { type: ShadingType.CLEAR, fill: PILL[r.vcls][0] },
+        children: [t(' ' + r.verdict + ' ', { size: 16, bold: true, color: PILL[r.vcls][1] })] })] }),
+  ] });
+  // Page 1 is the one-pager and is full without this; the goal check takes page 2 whole.
+  const goalBlock = !C.goal ? [] : [
+    new Paragraph({ pageBreakBefore: true, spacing: { before: 0, after: 55 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: LINE, space: 2 } },
+      children: [t(C.goal.title.toUpperCase(), { bold: true, size: 15, color: MUT })] }),
+    p([t(C.goal.takeaway, { size: 19, bold: true })], { after: 70 }),
+    new Table({ width: { size: 10800, type: WidthType.DXA }, columnWidths: GW,
+      borders: { top: nb, bottom: nb, left: nb, right: nb, insideHorizontal: nb, insideVertical: nb },
+      rows: [...C.goal.rows.map(r => goalRowDocx(r, false)), ...(C.goal.total ? [goalRowDocx(C.goal.total, true)] : [])] }),
+    p(C.goal.key.flatMap(([k, l], i) => [t((i ? '     ' : '') + '\u25A0 ', { size: 16, color: GFILL[k] }), t(l, { size: 15, color: MUT })]),
+      { before: 50, after: 30 }),
+    p([t(C.goal.note, { size: 15, color: MUT })], { after: 90 }),
+  ];
+
   const body = [
     new Paragraph({ spacing: { after: 30 }, children: [t(C.title, { size: 32, bold: true })] }),
     p([t(C.meta, { size: 16, color: MUT })], { after: 110 }),
@@ -305,6 +465,7 @@ function renderDocx() {
     p([], { after: 40 }),
     ...C.sections.flatMap(([title, bullets]) => [h(title), ...bullets.map(([lead, rest]) => b(lead, rest))]),
     p([t(C.closing, { size: 16, italics: true, color: MUT })], { before: 110, after: 0 }),
+    ...goalBlock,
   ];
   const doc = new Document({
     numbering: { config: [{ reference: 'b', levels: [{ level: 0, format: LevelFormat.BULLET, text: '•', alignment: AlignmentType.LEFT, style: { paragraph: { indent: { left: 300, hanging: 200 } } } }] }] },

@@ -21,7 +21,6 @@ DEFAULTS = {
     "data_dir": "data/plan-run",
     "out_dir": "reports/v2",
     "version_tag": "v2",
-    "rerun_days": 90,
     "min_history_days": 14,                 # below this => "early baseline", run-rate scaling flagged
     "scale_to_days": 30,
     "status": None,                         # e.g. "Draft for review": adds a banner and a feedback section
@@ -73,6 +72,10 @@ DEFAULTS = {
     "public_api_base": None,                # default https://api.app.perfectscale.io
     "pov_top_n": 50,
     "pov_savings_weight": 0.6,
+    # POV savings goal, set against what the data supports in the executive summary (psplan/goal.py,
+    # references/tenant-config.md). None => the section is left out.
+    "savings_goal": None,
+    "goal_idle_share": 0.5,                 # share of node idle the realistic case assumes bin-packing reclaims
 }
 
 
@@ -147,6 +150,8 @@ class Config(dict):
             raise SystemExit("config: 'clusters' (name + uid) is required")
         _validate_clusters(cfg["clusters"])
         _validate_patterns(cfg)
+        from .goal import validate as _validate_goal
+        _validate_goal(cfg)
         if not cfg["prepared"]:
             from datetime import date
             cfg["prepared"] = date.today().isoformat()

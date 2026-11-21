@@ -12,7 +12,6 @@
   "data_dir": "data/plan-run",
   "out_dir": "reports/v2",
   "version_tag": "v2",
-  "rerun_days": 90,
   "assumptions": {
     "scope": "entire cluster",
     "delivery": null,

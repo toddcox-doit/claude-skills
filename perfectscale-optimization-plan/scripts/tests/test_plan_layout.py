@@ -105,6 +105,40 @@ class T(unittest.TestCase):
         self.assertEqual(render.action_clusters({"cluster": "prod and prod-a"}, facts), ["prod", "prod-a"])
         self.assertEqual(render.action_clusters({"cluster": "tenant-wide"}, facts), [render.TENANT_WIDE])
 
+    # ---- 5. next look: on demand or at 30-day maturity, never a fixed date months past the POV
+    def test_revisit_is_at_30_day_maturity_or_on_demand(self):
+        import copy
+        import math
+        from datetime import date, timedelta
+        rv = self.S["revisit"]
+        lag = [f for f in self.F if f["window_days"] < 29.5]
+        if lag:
+            want = date.fromisoformat(self.cfg["prepared"]) + timedelta(days=max(math.ceil(30 - f["window_days"]) for f in lag))
+            self.assertEqual(rv["maturity_date"], want.isoformat())
+            self.assertIn("once every cluster has 30 days of observation", rv["text"])
+        F2 = copy.deepcopy(self.F)
+        for f in F2:
+            f["window_days"] = 30.0
+        S2 = Plan(self.cfg, F2).build()
+        self.assertIsNone(S2["revisit"]["maturity_date"])
+        self.assertIn("on demand", S2["revisit"]["text"])
+        rr = next(a for a in S2["actions"] if a["key"] == "rerun")
+        self.assertEqual(rr["title"], "Regenerate this plan on demand and diff it")
+        md = render.render_plan_md(self.cfg, self.S)
+        self.assertNotIn("Regenerate on 20", md)                      # no fixed far-off date in the method notes
+        self.assertIn("on demand", md)
+
+    def test_exec_summary_categories_start_closed(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed; executive summary degrades to a warning")
+        es = next(p for p in self.files if p.suffix == ".html" and "executive-summary" in p.name)
+        t = es.read_text()
+        self.assertGreater(t.count('<details class="sec"><summary><h2>'), 0)
+        self.assertEqual(t.count('<details class="sec"><summary><h2>'), t.count("<h2>"))
+        self.assertNotIn('<details class="sec" open', t)
+        self.assertIn("Expand all", t)
+        self.assertNotIn("re-measure on", t.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

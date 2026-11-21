@@ -451,8 +451,16 @@ def render_plan_md(cfg, S):
           "- Reported costs are actual spend over the connected window. Clusters with under 14 days of history are scaled by 30 / window days; full windows are never scaled.",
           "- Savings and node idle come from different measurements and are never added together.",
           "- ROI = savings x confidence / effort weight (XS 1, S 2, M 4, L 8). Prerequisites that release more value than their own are moved one phase earlier.",
-          f"- Regenerate on {S['rerun_date']} and diff against this plan.", ""]
+          "- " + revisit_line(S), ""]
     return "\n".join(L)
+
+
+def revisit_line(S):
+    """The plan's promise about the next look: on demand, or at 30-day maturity - never a fixed
+    date months past a 30-day POV. Older plan JSON (no `revisit`) falls back to on demand."""
+    r = S.get("revisit") or {}
+    return ("Regenerate and diff against this plan on demand" +
+            (f", or {r['when']}." if r.get("when") else "."))
 
 
 def render_cluster_md(cfg, S, f):
@@ -746,7 +754,7 @@ document.querySelectorAll('table').forEach(function(t,ti){
 # the resizer initialises. Collapse happens only once that has finished.
 JS_COLLAPSE = """(function(){
 var main=document.querySelector('main');if(!main)return;
-var CLOSED=/[\s\S]*/; // every section starts collapsed: the reader opens what they came for
+var CLOSED=/[\\s\\S]*/; // every section starts collapsed: the reader opens what they came for
 var hs=[].slice.call(main.children).filter(function(n){return n.tagName==='H2'});
 if(!hs.length)return;
 var secs=[];

@@ -30,3 +30,39 @@ overrides the API host (default `https://api.app.perfectscale.io`).
 kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of
 its 0-100 ranking score; the rest is risk severity. See
 `references/pov-kickoff.md`.
+
+`savings_goal` (default unset) is the POV savings target, set against what the
+data supports. The executive summary carries it as "Savings goal vs what the
+data supports" (page 2 of the `.docx`, so page 1 stays the one-pager), and the
+plan JSON as `goal`. Copy the target from goal #1 of the POV plan doc:
+
+```json
+"savings_goal": {
+  "source": "POV plan v1, 11 Nov 2026, goal #1",
+  "baseline_source": "Billing export or DoiT report (to be agreed)",
+  "clusters": {
+    "prod-a": {"monthly_usd": 9000},
+    "stg":    {"monthly_usd": [15000, 20000]},
+    "dev":    {"pct": 20, "baseline_usd": 30000}
+  },
+  "tenant": {"monthly_usd": 25000}
+}
+```
+
+Each target is `monthly_usd` (a number, or `[low, high]` for a range) or `pct`.
+A percentage needs a baseline: the cluster's `baseline_usd` when given,
+otherwise PerfectScale's measured node cost, and the summary says which. Use
+`clusters`, `tenant`, or both; with two or more cluster goals and no `tenant`,
+an all-clusters row sums them. Cluster names must match `clusters`; a bad name
+or value stops the run at config load. A range is judged on its low end.
+
+Each goal is set against three run-rate numbers built from the plan's own data:
+conservative = right-sizing potential x `adoption_factor`; realistic =
+right-sizing potential + `goal_idle_share` (default 0.5) of node idle, which
+needs bin-packing so the autoscaler can remove nodes; maximum = right-sizing
+potential + all node idle (PerfectScale's ceiling, never reached). Verdict:
+Supported (within conservative), Stretch (within realistic), Unlikely (between
+realistic and maximum), Not supported (above maximum). Each row's sentence says
+exactly what the goal would take, such as "every right-sizing recommendation
+and 56% of node idle". `verify` recomputes the numbers and verdicts from the
+facts. Logic: `psplan/goal.py`.

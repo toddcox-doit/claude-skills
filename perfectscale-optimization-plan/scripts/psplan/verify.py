@@ -223,4 +223,44 @@ def verify(cfg, S, facts, files):
                 ex = [x["doc"] for n in D.get("namespaces", []) for x in n["excl"]]
                 chk(all('      automationMode: "Disabled"' in d and not any("Enabled" in y for y in d) for d in ex),
                     f"{p.name}: every namespace exclusion is a Disabled workload config")
+    # Savings goal vs data (psplan/goal.py): recomputed from the facts, not read back from the plan,
+    # and the executive summary must show it when, and only when, a goal is configured.
+    from . import goal as goalmod
+    G = S.get("goal")
+    es = [Path(p) for p in files if Path(p).suffix == ".html" and "executive-summary" in Path(p).name]
+    es_t = es[0].read_text(encoding="utf-8") if es else ""
+    title = "Savings goal vs what the data supports"
+    if es:
+        # Categories are rolled up: every h2 sits in a <details> that starts closed, with expand/collapse
+        # all, and printing opens them (a closed <details> would otherwise print as headings only).
+        n_h2 = es_t.count("<h2>")
+        chk(n_h2 > 0 and es_t.count('<details class="sec"><summary><h2>') == n_h2,
+            f"{es[0].name}: every section is a collapsible category")
+        chk("<details class=\"sec\" open" not in es_t, f"{es[0].name}: every category starts closed")
+        chk("Expand all" in es_t and "beforeprint" in es_t, f"{es[0].name}: categories expand all at once and open for print")
+        # A POV runs 30 days: the next look is on demand or at 30-day maturity, never a fixed far date.
+        chk("re-measure on" not in es_t.lower() and "revisit these figures on demand" in es_t,
+            f"{es[0].name}: promises a revisit on demand or at 30-day maturity, not a fixed re-run date")
+    if cfg.get("savings_goal"):
+        chk(G is not None, "savings goal: the plan carries the goal check")
+        by = {f["name"]: f for f in facts}
+        for r in (G or {}).get("rows", []):
+            f = by[r["name"]]
+            share = float(cfg.get("goal_idle_share", 0.5))
+            rs, idle = f["pot"], f["pools"]["idle"]
+            chk(abs(r["rightsizing"] - rs) <= 1 and abs(r["idle"] - idle) <= 1,
+                f"savings goal {r['name']}: right-sizing and idle match the cluster facts")
+            chk(r["conservative"] <= r["realistic"] <= r["maximum"],
+                f"savings goal {r['name']}: conservative <= realistic <= maximum")
+            want = goalmod.verdict(r["goal_low"], rs * float(cfg["adoption_factor"]), rs + share * idle, rs + idle)
+            chk(r["verdict"] == want, f"savings goal {r['name']}: verdict '{r['verdict']}' follows from the numbers")
+        if es:
+            blk = es_t.split(f"<h2>{title}</h2>", 1)
+            chk(len(blk) == 2, f"{es[0].name}: carries the savings goal section")
+            if len(blk) == 2:
+                body = blk[1].split("<h2>", 1)[0]
+                chk(all(f"<b>{html.escape(r['name'])}</b>" in body for r in (G or {}).get("rows", [])),
+                    f"{es[0].name}: every goal cluster has its own bar")
+    else:
+        chk(G is None and title not in es_t, "savings goal: none configured, none shown")
     return ok, errs

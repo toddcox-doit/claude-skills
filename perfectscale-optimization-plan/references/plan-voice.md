@@ -173,8 +173,10 @@ estate, never generic best practice.]
 Baseline today: Impact Tracker shows [days] active, $[total] saved, [N] risks
 addressed.
 
-**Re-run this plan on [date].** We'll diff it against today's and the second
-conversation starts from what moved.
+**Revisit this plan on demand, or once every cluster has 30 days of
+observation ([date]).** We'll diff it against today's and the second
+conversation starts from what moved. Never promise a fixed date past the 30-day
+POV.
 
 ---
 

@@ -179,6 +179,13 @@ Set `previous_plan` to the earlier plan JSON, bump `version_tag`/`out_dir`, and
 the change log is written automatically. Keep the previous version's folder
 intact so the two can be compared.
 
+There is no fixed re-run date: a POV runs 30 days, so a date months out is the
+wrong promise. The plan and the summary offer a second look on demand, or once
+every cluster has 30 days of observation (the date the least-observed cluster
+gets there, from the prepared date), when the run-rate scaling drops away. When
+every cluster already has 30 days, it says on demand only. The plan JSON carries
+this as `revisit`. `rerun_days` is retired and ignored if an old config has it.
+
 ### 6. Ship only on a clean verify
 
 The verifier exits 1 on any failure and reports each one. Fix the cause, not the
@@ -240,6 +247,16 @@ module at all. If node or `docx` is missing the run still completes and prints a
 warning rather than failing; install node to get the summary. Confirm the .docx
 still fits one page after any copy change.
 
+When the tenant config carries `savings_goal` (the POV plan's goal #1, per
+cluster or tenant-wide), the summary adds **Savings goal vs what the data
+supports**: one bar per cluster from $0 showing the conservative, realistic and
+theoretical-maximum cases, the goal drawn over them, and a verdict (Supported,
+Stretch, Unlikely, Not supported) with a sentence on what the goal would take.
+It is page 2 of the .docx, so page 1 stays the one-pager. Read the goal from
+the POV plan doc before the run; if the verdict is Unlikely or Not supported,
+take it into the next customer call as a target reset or an ROI reframe, not
+as a surprise at the success review. See `references/tenant-config.md`.
+
 To re-render just the summary (after editing its copy, say):
 
 ```bash
@@ -272,8 +289,13 @@ ordering. The resizer measures with `getBoundingClientRect`, which reads 0 insid
 a hidden section — collapse first and every table in an appendix freezes at
 useless equal-width columns.
 
-The executive summary is exempt: it is a deliberate one-pager with nothing to
-collapse, and the verifier scopes the contract to `*-optimization-plan-*.html`.
+The executive summary HTML rolls its categories up the same way, with a lighter
+mechanism: the decision, the headline cards and the cost of waiting stay open,
+and each category below them (What we recommend first, What we need from you,
+What the numbers rest on, the savings goal) is a native `<details>` block that
+starts closed, with Expand all / Collapse all. It has no column resizer, so no
+ordering constraint; printing opens every category. The `.docx` is unchanged.
+The verifier checks that every summary heading is a closed category.
 
 ## Analysis by namespace
 
