@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Set up a tenant working folder, and write its config from an approved ranking.
+"""Set up a tenant working folder, its credentials, and its config from an approved ranking.
 
-Two steps, in this order.
+Fastest path - one command, one credential entry:
+
+  python3 new_tenant.py onboard --customer "Acme" --profile acme --dir ~/work/Acme_analysis
+      creates the folder, asks for the tenant's PerfectScale API token once (pscli and the API v2
+      step both use it), and ranks every cluster. Add --write-config to take the top --top
+      clusters straight into a config, and --collect to pull their data too.
+
+  python3 new_tenant.py auth --profile acme          # (re)enter the token for an existing tenant
+
+Or step by step, in this order.
 
   # 1. create the folder and copy the library into it
   python3 new_tenant.py init --customer "Acme" --profile acme --dir ~/work/Acme_analysis
@@ -19,12 +28,17 @@ descending savings order, and that order carries through every output.
 """
 import argparse
 import json
+import os
 import shutil
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parent.parent          # the skill folder
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from psplan import credentials  # noqa: E402
+from psplan.apiv2 import load_credentials  # noqa: E402
 COPY = ["scripts", "templates", "references"]
 SKIP = {"__pycache__", ".DS_Store"}
 
@@ -54,6 +68,9 @@ def cmd_init(a):
     for p in dest.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
 
+    if getattr(a, "quiet", False):
+        print(f"created {root}  (library copied into skill/{LIB.name}/)")
+        return 0
     print(f"created {root}")
     print(f"  library -> skill/{LIB.name}/ (scripts, templates, references)")
     print(f"  empty   -> config/ data/ reports/")
@@ -143,6 +160,75 @@ def cmd_config(a):
     return 0
 
 
+def _profile_from_dir(d):
+    cfgs = sorted((Path(d).expanduser() / "config").glob("*.tenant*.json"))
+    for c in cfgs:
+        prof = (json.loads(c.read_text()) or {}).get("profile")
+        if prof:
+            return prof
+    return None
+
+
+def cmd_auth(a):
+    profile = a.profile or (_profile_from_dir(a.dir) if a.dir else None)
+    if not profile:
+        raise SystemExit("name the tenant's pscli profile: --profile <name> (or --dir of a tenant folder with a config)")
+    if not credentials.can_prompt():
+        raise SystemExit("auth needs a terminal to ask for the token; run it in a terminal window")
+    creds = credentials.setup(profile, login_pscli=not a.api_only)
+    if not creds:
+        raise SystemExit("no working token stored; nothing changed")
+    print(f"Profile '{profile}' is ready: pscli and the API v2 step will both use this token.")
+    return 0
+
+
+def _access_ok(profile):
+    ok_pscli, _ = credentials.pscli_status(shutil.which("pscli"), profile)
+    creds, _ = load_credentials({"profile": profile})
+    return ok_pscli, creds is not None
+
+
+def cmd_onboard(a):
+    root = Path(a.dir).expanduser().resolve()
+    if (root / "skill" / LIB.name).exists() and not a.force:
+        print(f"{root} already set up; keeping its library (pass --force to refresh it)")
+    else:
+        cmd_init(argparse.Namespace(customer=a.customer, dir=a.dir, profile=a.profile, force=a.force, quiet=True))
+    ok_pscli, ok_api = _access_ok(a.profile)
+    if not (ok_pscli and ok_api):
+        missing = " and ".join(x for x, ok in (("pscli sign-in", ok_pscli), ("API v2 credentials", ok_api)) if not ok)
+        if credentials.can_prompt():
+            print(f"\nProfile '{a.profile}' needs {missing}. One token covers both.")
+            if not credentials.setup(a.profile, login_pscli=not ok_pscli):
+                raise SystemExit("no working token stored; run `new_tenant.py auth --profile "
+                                 f"{a.profile}` when you have one, then onboard again")
+        elif not ok_pscli:
+            raise SystemExit(f"pscli profile '{a.profile}' is not signed in and there is no terminal to ask for a "
+                             f"token; run `new_tenant.py auth --profile {a.profile}` in a terminal first")
+        else:
+            print(f"note: no API v2 credentials for '{a.profile}'; HPA data will be skipped until "
+                  f"`new_tenant.py auth --profile {a.profile}` is run")
+    lib = root / "skill" / LIB.name / "scripts"
+    env = dict(os.environ, PERFECTSCALE_PROFILE=a.profile)
+    print("\nRanking every cluster in the tenant ...")
+    r = subprocess.run([sys.executable, str(lib / "rank_clusters.py"), "--customer", a.customer,
+                        "--profile", a.profile, "--top", str(a.top), "--root", str(root)], env=env)
+    if r.returncode:
+        raise SystemExit("ranking failed; see the output above")
+    if not (a.write_config or a.collect):
+        print(f"\nReview the ranking with the customer, then:\n  python3 {lib / 'new_tenant.py'} config --dir {root} "
+              f"--top {a.top}\n  (or --clusters a,b,c for an explicit scope)")
+        return 0
+    cmd_config(argparse.Namespace(dir=str(root), customer=a.customer, profile=a.profile, cloud=None, top=a.top,
+                                  clusters=a.clusters, foreign=None, force=a.force))
+    if a.collect:
+        cfg = root / "config" / f"{slug(a.customer)}.tenant.json"
+        print("\nCollecting ...")
+        r = subprocess.run([sys.executable, str(lib / "run_plan.py"), "--config", str(cfg), "--collect"], env=env, cwd=root)
+        return r.returncode
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -153,6 +239,23 @@ def main():
     i.add_argument("--profile")
     i.add_argument("--force", action="store_true")
     i.set_defaults(fn=cmd_init)
+
+    au = sub.add_parser("auth", help="enter the tenant's API token once: pscli sign-in plus the API v2 step")
+    au.add_argument("--profile", help="pscli profile name (else read from --dir's config)")
+    au.add_argument("--dir", help="tenant working folder, to read the profile from its config")
+    au.add_argument("--api-only", action="store_true", help="store for the API v2 step only; leave pscli as it is")
+    au.set_defaults(fn=cmd_auth)
+
+    o = sub.add_parser("onboard", help="folder + credentials + ranking in one go (optionally config and collect)")
+    o.add_argument("--customer", required=True)
+    o.add_argument("--profile", required=True)
+    o.add_argument("--dir", required=True)
+    o.add_argument("--top", type=int, default=10, help="clusters to mark, and to take into the config with --write-config")
+    o.add_argument("--clusters", help="explicit comma-separated names or UIDs for the config, instead of --top")
+    o.add_argument("--write-config", action="store_true", help="write the config from the ranking without stopping to review")
+    o.add_argument("--collect", action="store_true", help="also collect the configured clusters (implies --write-config)")
+    o.add_argument("--force", action="store_true")
+    o.set_defaults(fn=cmd_onboard)
 
     c = sub.add_parser("config", help="write the tenant config from the ranking")
     c.add_argument("--dir", required=True)

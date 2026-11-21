@@ -21,7 +21,8 @@ Absent, HPA status is unconfirmed and the plan says so.
 `PS_ID` and `PS_SECRET` for the public API v2 step; it must be readable by its
 owner only. Without it the collector also checks `PERFECTSCALE_CLIENT_ID` /
 `PERFECTSCALE_CLIENT_SECRET` and then `~/.perfectscale/<profile>.env`
-(`scripts/set_api_credentials.sh` writes that file). No credentials: the v2 step
+(`new_tenant.py auth --profile <name>` writes that file and signs pscli in with
+the same token; `scripts/set_api_credentials.sh` is a bash-only alternative). No credentials: the v2 step
 is skipped, never failed, and HPA status reads Unknown. `public_api_base`
 overrides the API host (default `https://api.app.perfectscale.io`).
 

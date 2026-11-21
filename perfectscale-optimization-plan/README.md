@@ -93,7 +93,7 @@ Both fetch the latest release for your OS/arch from
 Then authenticate:
 
 ```bash
-pscli auth login --client-id … --client-secret …   # never echo the secret
+python3 $SKILL/scripts/new_tenant.py auth --profile <name>   # asks once; signs pscli in and stores the token for API v2
 pscli auth status                                   # confirm it is the right tenant
 ```
 
@@ -118,25 +118,28 @@ pscli auth status    # confirms the right tenant
 
 ## Quickstart
 
+Works for any tenant and any number of clusters, on macOS, Linux or Windows. Each
+tenant needs one PerfectScale **Read Only API token** (app.perfectscale.io >
+avatar > Organization Settings > API Tokens > Generate Token). You enter it once;
+`pscli` and the collector's API v2 step (HPA triggers, automation status) both
+use it.
+
 ```bash
 SKILL=/path/to/perfectscale-optimization-plan
 
-# 0. create a working folder for the tenant (copies the library, nothing else)
-python3 $SKILL/scripts/new_tenant.py init --customer "Acme" --profile acme --dir ~/work/Acme_analysis
+# 0+1. folder + token (asked once, verified, never echoed) + ranking of every cluster
+python3 $SKILL/scripts/new_tenant.py onboard --customer "Acme" --profile acme --dir ~/work/Acme_analysis
 cd ~/work/Acme_analysis
-export PERFECTSCALE_PROFILE=acme
-pscli auth status                      # confirm it is the right tenant
-bash skill/perfectscale-optimization-plan/scripts/set_api_credentials.sh acme   # optional: HPA + automation status (API v2)
-
-# 1. rank every cluster, then agree the scope with the customer
-python3 skill/perfectscale-optimization-plan/scripts/rank_clusters.py --customer "Acme" --top 10
+#    (re-enter or rotate the token later: python3 skill/perfectscale-optimization-plan/scripts/new_tenant.py auth --profile acme)
+#    (skip the review and go straight to config + collect: add --write-config --collect to onboard)
 
 # 2. write the config from the agreed list
 python3 skill/perfectscale-optimization-plan/scripts/new_tenant.py config --dir . --top 10
 #    then edit config/acme.tenant.json: gitops, stateful_patterns, held-out
 #    namespaces, foreign_tenants. Leave anything you have not asked as null.
 
-# 3. collect (resumable; re-run until it says complete)
+# 3. preflight, then collect (resumable; re-run until it says complete)
+python3 skill/perfectscale-optimization-plan/scripts/run_plan.py --config config/acme.tenant.json --check
 python3 skill/perfectscale-optimization-plan/scripts/run_plan.py --config config/acme.tenant.json --collect
 
 # 4. analyse, render, verify

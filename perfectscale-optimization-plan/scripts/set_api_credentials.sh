@@ -1,4 +1,6 @@
 #!/bin/bash
+# Bash-only alternative to `python3 scripts/new_tenant.py auth --profile <profile>` (any OS, verifies
+# the token, and signs pscli in too - prefer it).
 # Store a PerfectScale public API token (client ID + secret) for the collector's v2 step, which
 # pulls HPA triggers, automation status and recommendation maturity that pscli cannot reach.
 #

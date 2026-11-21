@@ -38,7 +38,9 @@ def _read_env_file(path):
     p = Path(os.path.expanduser(str(path)))
     if not p.exists():
         return None, f"{p} not found"
-    if p.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+    # Owner-only is enforceable on macOS/Linux; on Windows the file inherits the user profile's ACL
+    # (other users already excluded) and st_mode cannot express it, so the check is POSIX-only.
+    if os.name == "posix" and p.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         return None, f"{p} is readable by other users; run: chmod 600 {p}"
     vals = {}
     for line in p.read_text().splitlines():
@@ -62,8 +64,8 @@ def load_credentials(cfg):
     default = Path.home() / ".perfectscale" / f"{cfg.get('profile') or 'default'}.env"
     if default.exists():
         return _read_env_file(default)
-    return None, ("no API credentials (set PERFECTSCALE_CLIENT_ID / PERFECTSCALE_CLIENT_SECRET, "
-                  "or run scripts/set_api_credentials.sh)")
+    return None, ("no API credentials for profile '" + str(cfg.get("profile") or "default") + "' "
+                  "(run: new_tenant.py auth --profile " + str(cfg.get("profile") or "default") + ")")
 
 
 class PublicApi:

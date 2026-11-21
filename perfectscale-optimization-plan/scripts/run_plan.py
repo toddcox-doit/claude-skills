@@ -2,6 +2,7 @@
 """One command: collect -> analyze -> render -> verify -> diff.
 
   python3 run_plan.py --config config/<tenant>.tenant.json [--collect] [--max-age-hours 24] [--no-verify]
+  python3 run_plan.py --config config/<tenant>.tenant.json --check     # preflight only: will the run get what it needs?
 """
 import argparse
 import sys
@@ -21,8 +22,14 @@ def main():
     ap.add_argument("--no-verify", action="store_true")
     ap.add_argument("--serial", action="store_true")
     ap.add_argument("--overwrite", action="store_true", help="allow replacing outputs that already exist for this version tag")
+    ap.add_argument("--check", action="store_true", help="preflight only: credentials, data age, enrichments, output folder")
+    ap.add_argument("--no-network", action="store_true", help="with --check: skip the API token test")
     a = ap.parse_args()
     cfg = Config.load(a.config)
+    if a.check:
+        from psplan import preflight
+        print(f"Preflight for {cfg['customer']} ({a.config}):")
+        return preflight.report(preflight.check(cfg, max_age_hours=a.max_age_hours or 24, network=not a.no_network))
     if a.collect:
         from psplan.collect import Collector
         kw = {"max_age_hours": a.max_age_hours} if a.max_age_hours is not None else {}

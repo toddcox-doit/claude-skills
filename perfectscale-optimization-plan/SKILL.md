@@ -72,12 +72,12 @@ copies only the library.
 
 | Need | Check | If missing |
 |---|---|---|
-| `pscli`, authenticated for this tenant | `pscli auth status` | Not vendored here — see README.md "Installing `pscli`"; install from [doitintl/perfectscale-cli](https://github.com/doitintl/perfectscale-cli), then `pscli auth login --client-id … --client-secret …` (never echo the secret) |
+| `pscli`, authenticated for this tenant | `pscli auth status` | Not vendored here — see README.md "Installing `pscli`"; install from [doitintl/perfectscale-cli](https://github.com/doitintl/perfectscale-cli), then `python3 scripts/new_tenant.py auth --profile <name>`: signs pscli in and stores the same token for the v2 step, without putting the secret on a command line |
 | Python 3.10+ | `python3 -V` | — |
 | Node.js 22+ (only for the .docx one-pager or browser enrichment) | `node -v` | `scripts/browser/cdp-chrome.js` needs the native `WebSocket` global, stable only from Node 22 |
 | `docx` npm package (for the .docx one-pager) | `node -e "require('docx')"` from `scripts/` | `cd scripts && npm install`; without it the run still completes and warns |
 | `openpyxl` (for XLSX) | `python3 -c "import openpyxl"` | optional: `python3 -m pip install -r scripts/requirements-optional.txt`; CSV is always written |
-| Public API v2 credentials (optional: HPA triggers, automation status) | `ls ~/.perfectscale/<profile>.env` | `bash scripts/set_api_credentials.sh <profile>` (same Read Only token as pscli; owner-only file, secret never echoed). Without it the v2 step is skipped and HPA status reads Unknown |
+| Public API v2 credentials (optional: HPA triggers, automation status) | `run_plan.py --config … --check` | `python3 scripts/new_tenant.py auth --profile <profile>`: one entry for pscli and the v2 step, verified before it is kept, secret never echoed. Without it the v2 step is skipped and HPA status reads Unknown |
 
 The optional PodFit eligibility browser pass (`references/eligibility-enrichment.md`)
 is macOS-only: `cdp-chrome.js` reads a hard-coded macOS Chrome profile path. On
@@ -92,11 +92,18 @@ Probe with a real call before concluding the token is dead.
 ### 0. Set up the tenant folder
 
 ```bash
-python3 <skill>/scripts/new_tenant.py init --customer "Acme" --profile acme --dir ~/work/Acme_analysis
+python3 <skill>/scripts/new_tenant.py onboard --customer "Acme" --profile acme --dir ~/work/Acme_analysis
 cd ~/work/Acme_analysis
-export PERFECTSCALE_PROFILE=acme
-pscli auth status          # confirm it is the right tenant before anything else
 ```
+
+`onboard` creates the folder, asks for the tenant's Read Only API token once
+(verified against the API before it is kept, never echoed), signs `pscli` in with
+it and stores it for the collector's API v2 step, then ranks every cluster (step 1).
+`new_tenant.py auth --profile <name>` re-enters or rotates the token. The secret
+reaches `pscli` through its own prompt on a pseudo-terminal (macOS/Linux) or its
+`-k` flag (Windows) - never a shared command line. If you run the collector
+later without a token, it asks once when a person is at the terminal and skips
+quietly when not; it never blocks an unattended run.
 
 ### 1. Rank the clusters, and agree the scope
 
@@ -143,8 +150,14 @@ Then set by hand, because guessing them is worse than leaving them null:
 ### 3. Collect
 
 ```bash
+python3 skill/perfectscale-optimization-plan/scripts/run_plan.py --config config/acme.tenant.json --check     # preflight
 python3 skill/perfectscale-optimization-plan/scripts/run_plan.py --config config/acme.tenant.json --collect
 ```
+
+`--check` changes nothing. It lists, as OK / WARN / BLOCK: pscli sign-in, API v2
+credentials (with a live token test), each cluster's data age and whether HPA
+data is collected, where automation status will come from, output-folder
+conflicts, and the optional renderers. Run it before a customer call.
 
 Resumable, globally rate-limited with backoff on 429, skips files still fresh,
 falls back to top unevictable groups if the cluster-wide pull fails. Re-run

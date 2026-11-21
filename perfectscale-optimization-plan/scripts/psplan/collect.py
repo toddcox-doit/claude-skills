@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import credentials
 from .apiv2 import DEFAULT_BASE, ApiError, PublicApi, load_credentials
 from .util import exists, jl, jload
 
@@ -91,7 +92,7 @@ class Collector:
     MAX_BACKOFF = 60  # seconds; cap on the exponential backoff wait, however many retries deep
 
     def __init__(self, cfg, log=print, refresh=False, only=None, max_age_hours=24, top_groups=200, compress=False,
-                 min_interval=0.4, max_retries=7, backoff=15, circuit_breaker=6):
+                 min_interval=0.4, max_retries=7, backoff=15, circuit_breaker=6, interactive=None):
         self.cfg, self.log = cfg, log
         self.refresh, self.only = refresh, set(only or [])
         self.max_age = max_age_hours * 3600
@@ -111,9 +112,31 @@ class Collector:
             self.env["PERFECTSCALE_PROFILE"] = cfg["profile"]
         self.failures = []
         self._print = threading.Lock()
+        # Ask a person for anything missing only when one is at a terminal; unattended runs never block.
+        self.interactive = credentials.can_prompt() if interactive is None else interactive
         creds, self.api_skip = load_credentials(cfg)
-        self.api = PublicApi(creds, base=cfg.get("public_api_base") or DEFAULT_BASE, limiter=self.limiter) if creds else None
+        self.api = self._api(creds) if creds else None
         del creds
+
+    def _api(self, creds):
+        return PublicApi(creds, base=self.cfg.get("public_api_base") or DEFAULT_BASE, limiter=self.limiter)
+
+    def _ensure_access(self, pscli_ok):
+        """Before collecting: pscli must be signed in for the profile; API v2 credentials are wanted
+        for HPA and automation status. One token covers both, so at most one question is asked."""
+        if pscli_ok and self.api:
+            return pscli_ok
+        profile = self.cfg.get("profile") or "default"
+        missing = " and ".join(x for x, ok in (("a pscli sign-in", pscli_ok), ("API v2 credentials (HPA, automation status)", bool(self.api))) if not ok)
+        creds = None
+        if self.interactive:
+            creds = credentials.offer(profile, f"Profile '{profile}' has no {missing}. One PerfectScale API token covers both.",
+                                      pscli=self.pscli, base=self.cfg.get("public_api_base"), login_pscli=not pscli_ok, out=self.say)
+        if creds:
+            self.api = self._api(creds)
+            self.api_skip = None
+            pscli_ok = pscli_ok or credentials.pscli_status(self.pscli, profile)[0]
+        return pscli_ok
 
     # ------------------------------------------------------------------ plumbing
     def say(self, msg):
@@ -289,8 +312,11 @@ class Collector:
     # ------------------------------------------------------------------ entry
     def run(self):
         ok = subprocess.run([self.pscli, "auth", "status"], env=self.env, capture_output=True).returncode == 0
+        ok = self._ensure_access(ok)
         if not ok:
-            raise SystemExit(f"pscli is not authenticated (profile={self.cfg.get('profile') or 'default'}). Run: pscli auth status")
+            prof = self.cfg.get("profile") or "default"
+            raise SystemExit(f"pscli is not signed in for profile '{prof}'. Run in a terminal: "
+                             f"python3 scripts/new_tenant.py auth --profile {prof}")
         clusters = [c for c in self.cfg["clusters"] if not self.only or c["name"] in self.only]
         workers = max(1, min(len(clusters), 3))
         tripped = None

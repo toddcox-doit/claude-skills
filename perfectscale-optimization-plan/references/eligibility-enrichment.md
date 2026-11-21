@@ -8,9 +8,9 @@ workloads endpoint does: `automation.status` (the same `NotEnabled` /
 credentials are available the collector pulls it for every cluster
 (`workloads-v2.json`, see `psplan/apiv2.py`), and the model uses it as the
 eligibility source whenever no `eligibility_file` is set. Store credentials once
-with `bash scripts/set_api_credentials.sh <profile>` (owner-only
-`~/.perfectscale/<profile>.env`), or export `PERFECTSCALE_CLIENT_ID` /
-`PERFECTSCALE_CLIENT_SECRET`. The token is the same Read Only service token
+with `python3 scripts/new_tenant.py auth --profile <profile>` (any OS; also signs
+pscli in; owner-only `~/.perfectscale/<profile>.env`), or export
+`PERFECTSCALE_CLIENT_ID` / `PERFECTSCALE_CLIENT_SECRET`. The token is the same Read Only service token
 `pscli` uses. v2 has no HPA min/max replicas, so a pinned HPA (min == max) looks
 like any CPU/memory HPA there.
 
