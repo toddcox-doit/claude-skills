@@ -36,6 +36,22 @@ const gated = Math.round(S.automation_gated.share * 100);
 const idlePct = Math.round(100 * I.total / I.node_cost);
 const nClusters = S.scope.cluster_names.length;
 const days = Math.round(S.window_days);
+// S.window_days is the LONGEST cluster window. Quoting it alone hides an early baseline: one
+// cluster on 18 days and another on 4 read as "18 days of measured data" while the second is
+// scaled x8. Use the per-cluster baselines; derive them from run_rate_factor for older plan JSON.
+const minHist = S.min_history_days || 14;
+const BASE = (Array.isArray(S.baselines) ? S.baselines
+  : Object.entries(S.run_rate_factor || {}).map(function (kv) {
+      const w = kv[1] > 1.001 ? 30 / kv[1] : S.window_days;
+      return {name: kv[0], factor: kv[1], window_days: w, early: w < minHist};
+    })).slice().sort(function (a, b) { return b.window_days - a.window_days; });
+const dayOf = b => Math.max(1, Math.round(b.window_days));
+const dMin = BASE.length ? dayOf(BASE[BASE.length - 1]) : days;
+const mixed = BASE.length > 1 && dMin !== days;
+const daysLabel = mixed ? dMin + ' to ' + days : String(days);
+const earlyB = BASE.filter(b => b.early);
+const EA = S.early_achievable || {usd: 0, obs: 0};
+const andList = xs => xs.length < 2 ? xs.join('') : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
 const annual = O.maximum.usd * 12;
 const annualAdj = (T.achievable_now_monthly + T.blocked_pending_monthly) * A.factor * 12;
 const inUse = I.node_cost - I.total;
@@ -81,7 +97,7 @@ function move(a) {
 
 const C = {
   title: S.tenant + ': ' + usd(r100(annual)) + ' a year of addressable Kubernetes spend',
-  meta: 'Executive summary  |  ' + nClusters + ' clusters  |  ' + days +
+  meta: 'Executive summary  |  ' + nClusters + ' clusters  |  ' + daysLabel +
         ' days of measured data  |  ' + ld(S.generated),
   status: S.status ? S.status + ': figures and wording are open to change.' : null,
 
@@ -131,8 +147,16 @@ const C = {
       return ['', stripTicks(d.text.replace(/\s+/g, ' ')) +
               (r100(d.usd) >= 100 ? ' Unlocks about ' + usd(r100(d.usd)) + ' a month.' : '')]; })],
     ['What the numbers rest on', [
-      ['', 'Figures come from ' + days + ' days of measured data across ' + nClusters +
-           ' clusters, not a sample or a model.'],
+      ['', mixed
+        ? 'Figures come from measured data, not a sample or a model: ' +
+          andList(BASE.map(b => dayOf(b) + ' days on ' + b.name)) + '.'
+        : 'Figures come from ' + days + ' days of measured data across ' + nClusters +
+          ' clusters, not a sample or a model.'],
+      ...(earlyB.length ? [['', andList(earlyB.map(b => b.name)) + (earlyB.length > 1 ? ' have' : ' has') +
+           ' under ' + minHist + ' days of history, so ' + (earlyB.length > 1 ? 'their' : 'its') +
+           ' figures are scaled up to a monthly rate and are indicative until a full month is measured.' +
+           (r100(EA.usd) >= 100 ? ' At least ' + usd(r100(EA.usd)) + ' a month of the savings available now rests on ' +
+             (earlyB.length > 1 ? 'them' : 'it') + ', from ' + usd(r100(EA.obs)) + ' actually observed.' : '')]] : []),
       ['', gated + '% of what is available now depends on switching automation on. The remainder is ' +
            'configuration your teams change directly.'],
       ...(oom ? [['', 'Separately, about ' + nOom + ' workloads are being restarted for running out of memory' +

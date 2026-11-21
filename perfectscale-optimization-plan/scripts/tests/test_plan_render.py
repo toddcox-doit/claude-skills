@@ -848,6 +848,74 @@ class T(unittest.TestCase):
         self.assertNotIn("`", html)
         self.assertIn("example-ns", html)
 
+    # ---- early baselines: never let the longest window speak for every cluster
+    # Fixture: prod-a has 35 days of history, dev-b 8 (early). Quoting window_days alone
+    # ("35 days of measured data") hides that dev-b's figures are scaled up from 8 days.
+    def _days(self, name):
+        b = next(b for b in self.S["baselines"] if b["name"] == name)
+        return max(1, round(b["window_days"]))
+
+    def test_baselines_record_every_cluster_window(self):
+        B = {b["name"]: b for b in self.S["baselines"]}
+        self.assertEqual(set(B), {"prod-a", "dev-b"})
+        self.assertTrue(B["dev-b"]["early"]); self.assertFalse(B["prod-a"]["early"])
+        self.assertGreater(B["dev-b"]["factor"], 1)
+        self.assertEqual(self.S["min_history_days"], self.cfg["min_history_days"])
+        self.assertAlmostEqual(self.S["window_days"], max(b["window_days"] for b in self.S["baselines"]), places=1)
+
+    def test_early_achievable_counts_only_early_only_actions(self):
+        uid = {f["name"]: f["uid"] for f in self.F}["dev-b"]
+        want = sum(a["savings_monthly_usd"] or 0 for a in self.S["actions"]
+                   if a["savings_basis"] == "achievable_now" and a.get("cluster_uids") and set(a["cluster_uids"]) <= {uid})
+        ea = self.S["early_achievable"]
+        self.assertEqual(ea["usd"], round(want))
+        self.assertEqual(ea["clusters"], ["dev-b"])
+        self.assertLessEqual(ea["usd"], self.S["totals"]["achievable_now_monthly"])
+        self.assertLessEqual(ea["obs"], ea["usd"])            # observed is the unscaled figure
+
+    def test_need_line_names_each_window_and_the_early_cluster(self):
+        txt = json.dumps(self.S)
+        line = next(s for s in re.findall(r'A second look after more data[^"]*', txt))
+        self.assertIn(f"{self._days('prod-a')} days on prod-a", line)
+        self.assertIn(f"{self._days('dev-b')} days on dev-b", line)
+        self.assertIn("early baseline", line)
+        self.assertNotIn("rests on about", line)
+
+    def test_exec_summary_shows_day_range_and_names_early_cluster(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        r, html = self._exec_summary_html(self.S)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lo, hi = self._days("dev-b"), self._days("prod-a")
+        self.assertIn(f"{lo} to {hi} days of measured data", html)
+        self.assertNotIn(f"{hi} days of measured data across", html)   # the old, misleading sentence
+        self.assertIn(f"{hi} days on prod-a and {lo} days on dev-b", html)
+        self.assertIn(f"dev-b has under {self.S['min_history_days']} days of history", html)
+
+    def test_exec_summary_flags_early_cluster_from_older_plan_json(self):
+        # A plan JSON rendered before baselines existed still carries run_rate_factor; the summary
+        # must derive the windows from it rather than fall back to the longest one.
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        plan = copy.deepcopy(self.S)
+        for k in ("baselines", "min_history_days", "early_achievable"):
+            del plan[k]
+        r, html = self._exec_summary_html(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("dev-b has under 14 days of history", html)
+        self.assertIn(f"{self._days('dev-b')} to {self._days('prod-a')} days of measured data", html)
+
+    def test_exec_summary_single_full_cluster_wording_unchanged(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        plan = copy.deepcopy(self.S)
+        plan["baselines"] = [b for b in plan["baselines"] if b["name"] == "prod-a"]
+        plan["run_rate_factor"] = {"prod-a": plan["run_rate_factor"]["prod-a"]}
+        r, html = self._exec_summary_html(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("under 14 days of history", html)
+        self.assertNotIn(" to " + str(self._days("prod-a")) + " days", html)
+
 
     # ---- assumptions.native_vpa: same open-assumption mechanism as assumptions.gitops
     def test_native_vpa_unset_adds_no_caveat(self):

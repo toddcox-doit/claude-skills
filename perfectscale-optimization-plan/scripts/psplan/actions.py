@@ -113,6 +113,36 @@ def effort(base, esc):
 
 
 class Plan:
+    def window_phrase(self):
+        """How much data the plan rests on, per cluster when the windows differ.
+
+        The longest window alone overstates it: a cluster connected for 4 days next to one on 18
+        reads as "about 18 days" and its x8 run-rate scaling disappears from the sentence."""
+        F = self.F
+        if len(F) == 1 or (max(f["window_days"] for f in F) - min(f["window_days"] for f in F) < 1 and not any(f["early"] for f in F)):
+            return f"about {self.window:.0f} days"
+        parts = []
+        for f in sorted(F, key=lambda f: -f["window_days"]):
+            d = max(1, round(f["window_days"]))
+            s = f"{d} day{'s' if d != 1 else ''} on {f['name']}"
+            if f["early"]:
+                s += f" (an early baseline under {self.cfg['min_history_days']} days, scaled x{f['factor']:.2f} to a 30-day run-rate)"
+            parts.append(s)
+        return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+    def early_achievable(self, A):
+        """Achievable-now dollars that rest only on early-baseline clusters.
+
+        Counts actions whose clusters are all early. An action spanning an early and a full cluster
+        cannot be split, so it is left out and the figure is a floor ("at least")."""
+        early = {f["uid"] for f in self.F if f["early"]}
+        if not early:
+            return {"usd": 0, "obs": 0, "clusters": []}
+        rows = [a for a in A if a["savings_basis"] == "achievable_now" and a.get("cluster_uids") and set(a["cluster_uids"]) <= early]
+        return {"usd": round(sum(a["savings_monthly_usd"] or 0 for a in rows)),
+                "obs": round(sum((a["obs"] if a.get("obs") is not None else a["savings_monthly_usd"]) or 0 for a in rows)),
+                "clusters": [f["name"] for f in self.F if f["early"]]}
+
     def __init__(self, cfg, facts, trends=None):
         self.cfg, self.F = cfg, facts
         self.by = {f["name"]: f for f in facts}
@@ -1220,6 +1250,12 @@ class Plan:
             "adoption": adoption, "fit_split": self.fit_split(A),
             "status": self.cfg.get("status"), "tenant": self.cfg["customer"], "generated": self.cfg["prepared"], "cloud": self.cloud, "early": self.early,
             "window_days": round(self.window, 1), "run_rate_factor": {f["name"]: round(f["factor"], 3) for f in self.F},
+            # window_days above is the LONGEST window, kept for older readers. Anything that tells a
+            # reader how much data the plan rests on must use baselines instead: with one cluster on 18
+            # days and another on 4, "18 days of measured data" hides that the second is extrapolated.
+            "min_history_days": self.cfg["min_history_days"],
+            "baselines": [{"name": f["name"], "window_days": round(f["window_days"], 1), "factor": round(f["factor"], 3), "early": bool(f["early"])} for f in self.F],
+            "early_achievable": self.early_achievable(A),
             "scope": {"clusters_analyzed": len(self.F), "cluster_names": [f["name"] for f in self.F]},
             "totals": {"achievable_now_monthly": round(ach), "blocked_pending_monthly": round(tot["blocked_pending"]),
                        "resiliency_investment_monthly": round(tot["resiliency_investment"]),
@@ -1419,7 +1455,7 @@ class Plan:
         know.append(f"{usd(self.pod_pot)}/mo is PerfectScale's computed workload saving in scope.")
         if not any(f["audit"]["n"] for f in self.F):
             know.append("Automation has not yet run on these clusters, so no savings have been realized.")
-        need.append(f"A second look after more data: this plan rests on about {self.window:.0f} days, and we will re-run on {(date.fromisoformat(self.cfg['prepared']) + timedelta(days=self.cfg['rerun_days'])).isoformat()}.")
+        need.append(f"A second look after more data: this plan rests on {self.window_phrase()}, and we will re-run on {(date.fromisoformat(self.cfg['prepared']) + timedelta(days=self.cfg['rerun_days'])).isoformat()}.")
         grouping = None
         if fs:
             jr = {k: sum(f["job_req_vs_rec"][k] for f in fs) for k in ("cpu_cur", "cpu_rec", "mem_cur_gib", "mem_rec_gib")}
