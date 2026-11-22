@@ -848,6 +848,58 @@ class T(unittest.TestCase):
         self.assertNotIn("`", html)
         self.assertIn("example-ns", html)
 
+    # ---- automation actions name the namespaces their value sits in
+    # When one namespace holds a large share of all workload savings, the automation actions used to
+    # say only "N long-running controllers", so that namespace appeared in no action title.
+    def _ns_expect(self, cluster_names):
+        import collections as C
+        agg = C.Counter()
+        for f in self.F:
+            if f["name"] in cluster_names:
+                for c in f["controllers"]:
+                    agg[c["ns"]] += c["pot"] or 0
+        tot = sum(v for v in agg.values() if v > 0)
+        return [(ns, v) for ns, v in agg.most_common(3) if v >= 1], tot
+
+    def _auto_actions(self):
+        return [a for a in self.S["actions"] if a["key"] in ("automation_proof", "automation_w2", "automation_w3")]
+
+    def test_automation_actions_name_top_namespaces_with_dollars(self):
+        acts = self._auto_actions()
+        self.assertTrue(acts)
+        for a in acts:
+            names = [n for n in a["cluster"].replace(" and ", ", ").split(", ") if n]
+            top, tot = self._ns_expect(names)
+            self.assertTrue(top, f"{a['id']}: fixture clusters should have controller savings")
+            for ns, v in top:
+                self.assertIn(f"{ns} ({usd(v)}/mo)", a["evidence"], a["id"])
+            self.assertTrue(any(s.startswith("Agree the rollout with the owners of " + top[0][0]) for s in a["steps"]), a["id"])
+
+    def test_automation_title_names_namespace_only_when_it_holds_half(self):
+        for a in self._auto_actions():
+            names = [n for n in a["cluster"].replace(" and ", ", ").split(", ") if n]
+            top, tot = self._ns_expect(names)
+            lead = top[0][1] / tot
+            if lead >= 0.5:
+                self.assertTrue(a["title"].endswith(f" - mostly {top[0][0]}"), a["title"])
+            else:
+                self.assertNotIn(" - mostly ", a["title"])
+            if lead >= 0.25:
+                self.assertIn(f"of the value in {top[0][0]}", a["scope"])
+
+    def test_namespace_suffix_when_one_namespace_dominates(self):
+        # Force the dominant case on a copy: one namespace carries nearly all controller savings.
+        F2 = copy.deepcopy(self.F)
+        for f in F2:
+            for i, c in enumerate(f["controllers"]):
+                c["ns"] = "nwl-routing" if i == 0 else c["ns"]
+                if i == 0:
+                    c["pot"] = 100000.0
+        S2 = Plan(self.cfg, F2).build()
+        proof = next(a for a in S2["actions"] if a["key"] == "automation_proof")
+        self.assertTrue(proof["title"].endswith(" - mostly nwl-routing"), proof["title"])
+        self.assertIn("of the value in nwl-routing", proof["scope"])
+
     # ---- early baselines: never let the longest window speak for every cluster
     # Fixture: prod-a has 35 days of history, dev-b 8 (early). Quoting window_days alone
     # ("35 days of measured data") hides that dev-b's figures are scaled up from 8 days.

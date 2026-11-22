@@ -265,6 +265,33 @@ class Plan:
         flat = {o for l in owners_lists for o in l if o}
         return len(flat) >= 2
 
+    def ctl_namespaces(self, fs, k=3):
+        """Top namespaces by long-running-controller savings across clusters `fs`.
+
+        Automation actions used to say only "228 long-running controllers", so the namespace holding
+        most of the money (often one namespace carries a large share of all workload savings) never
+        appeared in the action table, the executive summary or a session board built from action titles. Returns (top [(ns, usd)], share of controller savings they hold)."""
+        agg = collections.Counter()
+        for f in fs:
+            for c in f["controllers"]:
+                agg[c["ns"]] += c["pot"] or 0          # already scaled to the 30-day run-rate
+        tot = sum(v for v in agg.values() if v > 0)
+        top = [(ns, v) for ns, v in agg.most_common(k) if v >= 1]
+        return top, (sum(v for _, v in top) / tot if tot else 0.0), (top[0][1] / tot if top and tot else 0.0)
+
+    def ns_texts(self, fs):
+        """(title suffix, scope suffix, evidence sentence, owner step) naming where the value sits."""
+        top, share, lead = self.ctl_namespaces(fs)
+        if not top:
+            return "", "", "", None
+        listed = human_list(f"{ns} ({usd(v)}/mo)" for ns, v in top)
+        title = f" - mostly {top[0][0]}" if lead >= 0.5 else ""
+        scope = f", {pct(lead * 100, 100)} of the value in {top[0][0]}" if lead >= 0.25 else ""
+        ev = (f" By namespace, the largest {'share is' if len(top) == 1 else 'shares are'} {listed}, "
+              f"{pct(share * 100, 100)} of the controller savings, so {'its owners are' if len(top) == 1 else 'the owners of those namespaces are'} the people to bring into the rollout.")
+        step = f"Agree the rollout with the owners of {human_list(ns for ns, _ in top)} first: that is where most of this action's value sits."
+        return title, scope, ev, step
+
     def pot_ctl(self, f):
         L = f["lanes"]["controller"]
         return (L["pot_eligible"], L["pot_eligible_o"]) if L["pot_eligible"] is not None else (L["pot"], L["pot_o"])
@@ -308,19 +335,21 @@ class Plan:
                    f"{proof['name']} is the lowest-risk place to prove the loop" + (" (non-production by name)" if re.search("|".join(self.cfg['nonprod_patterns']), proof['name'], re.I) else " (smallest by cost)") + ".")
         p_pot, p_obs = self.pot_ctl(proof)
         top = [c["name"] for c in proof["controllers"][:3]]
-        pa = self.add("automation_proof", action_type="automation_enable_policy", title=ptitle, cluster=proof["name"],
-                      scope=f"{proof['lanes']['controller']['n']} long-running controllers; managed add-ons held out",
+        p_tsuf, p_ssuf, p_ev, p_step = self.ns_texts([proof])
+        pa = self.add("automation_proof", action_type="automation_enable_policy", title=ptitle + p_tsuf, cluster=proof["name"],
+                      scope=f"{proof['lanes']['controller']['n']} long-running controllers{p_ssuf}; managed add-ons held out",
                       savings_monthly_usd=p_pot, obs=p_obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
                       effort_tier=effort("XS", esc_unconf)[0], effort_rationale=effort("XS", esc_unconf)[1],
                       change_risk="low", owner_role="ps-admin", phase=1, _uids=[proof["uid"]],
-                      owner_hint=[], steps=[
+                      owner_hint=[], steps=[x for x in [
                           f"Open the Automation page for {proof['name']}. If it offers settings, automation is available and this is a toggle; if it offers 'Request Access', that is the first thing to resolve.",
+                          p_step,
                           hold_txt,
                           f"Enable automation on two or three low-risk controllers first - {human_list(top)}." if top else "Enable automation on two or three low-risk controllers first.",
                           "Let one full optimization window run, then widen to the rest of the cluster's controllers.",
-                          "Verify: a new entry appears in the automation audit log within 24h, and it shows in-place resizes rather than evictions."],
+                          "Verify: a new entry appears in the automation audit log within 24h, and it shows in-place resizes rather than evictions."] if x],
                       verification="New automation audit-log entries appear within 24h; in-place resizes, not evictions",
-                      evidence=pev + f" {usd(p_pot)}/mo of its computed savings is on long-running controllers" + (f"; a further {usd(proof['lanes']['managed']['pot'])}/mo sits on platform-managed add-ons that are not claimed." if proof["lanes"]["managed"]["pot"] >= 1 else "."))
+                      evidence=pev + f" {usd(p_pot)}/mo of its computed savings is on long-running controllers" + (f"; a further {usd(proof['lanes']['managed']['pot'])}/mo sits on platform-managed add-ons that are not claimed." if proof["lanes"]["managed"]["pot"] >= 1 else ".") + p_ev)
         rest = sorted([f for f in with_pot if f["name"] != proof["name"]], key=lambda f: -self.pot_ctl(f)[0])
         if rest:
             tot = sum(self.pot_ctl(f)[0] for f in rest)
@@ -351,13 +380,15 @@ class Plan:
                 wave_deps = [prev] + (["replicated_grouping"] if self.has("replicated_grouping") else [])
                 group_step = ("Apply the custom grouping rule first, so the repeated workload copies arrive as one policy decision rather than thousands."
                               if self.has("replicated_grouping") else None)
-                self.add(key, action_type="automation_enable_policy", title=f"{label} - enable automation on {self.names(grp)}",
-                         cluster=self.names(grp), scope=f"{nctl} long-running controllers across {len(grp)} cluster{'s' if multi else ''}; managed add-ons held out",
+                w_tsuf, w_ssuf, w_ev, w_step = self.ns_texts(grp)
+                self.add(key, action_type="automation_enable_policy", title=f"{label} - enable automation on {self.names(grp)}{w_tsuf}",
+                         cluster=self.names(grp), scope=f"{nctl} long-running controllers across {len(grp)} cluster{'s' if multi else ''}{w_ssuf}; managed add-ons held out",
                          savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
                          effort_tier=t, effort_rationale=r, change_risk="medium", owner_role="ps-admin", phase=ph, depends_on=wave_deps,
                          _uids=sorted({f["uid"] for f in grp}),
                          steps=[x for x in [f"Confirm {self.by[proof['name']]['name']} (or the previous wave) has run clean for at least 48 hours.",
                                 group_step,
+                                w_step,
                                 hold_txt,
                                 f"Enable in descending order of value: {prio}.",
                                 "Watch the execution mode on the first window. Expect in-place resizes; if you see evictions instead, pause and re-check.",
@@ -365,7 +396,7 @@ class Plan:
                          verification="Pod waste falls on enabled controllers; audit log shows in-place resizes",
                          evidence=f"{usd(pot)}/mo of computed savings on long-running controllers across {self.names(grp)}, "
                                   f"{pct(pot, self.pod_pot)} of everything PerfectScale found in scope" +
-                                  (" - small beside the job opportunity, which is why automation is not the main lever on this tenant." if self.job_pot_total() > pot * 2 else "."))
+                                  (" - small beside the job opportunity, which is why automation is not the main lever on this tenant." if self.job_pot_total() > pot * 2 else ".") + w_ev)
                 prev = key
 
     def job_pot_total(self):
