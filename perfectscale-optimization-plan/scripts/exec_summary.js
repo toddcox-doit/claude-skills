@@ -33,6 +33,7 @@ const nOom = oom ? (oom.scope.match(/(\d+) workloads/) || [])[1] : null;
 const nMem = mem ? (mem.scope.match(/(\d+) workloads/) || [])[1] : null;
 const nOpt = opt ? (opt.scope.match(/(\d+) pods/) || [])[1] : null;
 const gated = Math.round(S.automation_gated.share * 100);
+const gatedUsd = S.automation_gated.usd, hpaUsd = S.automation_gated.hpa_usd || 0;   // hpa_usd absent in older plan JSON
 const idlePct = Math.round(100 * I.total / I.node_cost);
 const nClusters = S.scope.cluster_names.length;
 const days = Math.round(S.window_days);
@@ -102,7 +103,13 @@ const C = {
   status: S.status ? S.status + ': figures and wording are open to change.' : null,
 
   askLabel: 'The decision',
-  ask: gated >= 50
+  // When most automation-gated money sits behind pod CPU/memory HPAs, switching automation on is not
+  // "that single decision": the HPA answer is the second one, and the summary has to say so.
+  ask: gated >= 50 && r100(hpaUsd) >= 100
+    ? 'Approve switching PerfectScale automation on, starting with one non-production cluster, and confirm whether the ' +
+      'HPAs behind most of the savings are pinned: automation alone reaches ' + usd(r100(gatedUsd - hpaUsd)) +
+      ' a month, and ' + usd(r100(hpaUsd)) + ' a month more needs that answer.'
+    : gated >= 50
     ? 'Approve switching PerfectScale automation on, starting with one non-production cluster. ' +
       usd(r100(S.automation_gated.usd)) + ' a month of the savings below is waiting on that single decision; ' +
       'the rest is configuration work your teams already own.'

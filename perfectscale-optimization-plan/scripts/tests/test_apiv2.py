@@ -47,6 +47,146 @@ V2_PROD_A = [
 ]
 
 
+class HpaHeldNamespace(unittest.TestCase):
+    """A namespace whose every workload sits behind a pod CPU/memory HPA: before, the picker dropped
+    it with no reason on the page (it hid a tenant's largest namespace). Now it is listed greyed and
+    counted with the way out, and hpa_pinned_namespaces releases it once the owner confirms min == max."""
+    NS = "platform"
+
+    @classmethod
+    def build(cls, pinned=None):
+        tmp = Path(tempfile.mkdtemp())
+        cls._tmps.append(tmp)
+        p = fixtures.make(tmp)
+        if pinned is not None:
+            c = json.loads(Path(p).read_text()); c["hpa_pinned_namespaces"] = pinned
+            Path(p).write_text(json.dumps(c))
+        cfg = Config.load(p)
+        rows = [json.loads(l) for l in (cfg.data("prod-a") / "workloads-all.jsonl").read_text().splitlines() if l.strip()]
+        v2 = [{"id": r["id"], "name": r["name"], "namespace": r["namespace"], "type": r["type"],
+               "scaling": {"avgReplicas": 2, "hpaTargets": {"cpu": {"utilization": 90}, "memory": {"utilization": 90}}},
+               "automation": {"automatedBy": "none", "status": "NotEnabled"},
+               "maturity": {"overall": {"isMature": True, "minutesLeftToMature": 0}}, "containers": {}}
+              for r in rows if r["namespace"] == cls.NS]
+        assert v2, "fixture must have workloads in the chosen namespace"
+        (cfg.data("prod-a") / "workloads-v2.json").write_text(json.dumps({"data": v2, "meta": {}}))
+        F = model.load_all(cfg, parallel=False)
+        return cfg, next(f for f in F if f["name"] == "prod-a"), F
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmps = []
+        cls.cfg, cls.prod, cls.F = cls.build()
+        cls.cfg_p, cls.prod_p, cls.F_p = cls.build(pinned=[f"^{cls.NS}$"])
+
+    @classmethod
+    def tearDownClass(cls):
+        for t in cls._tmps:
+            shutil.rmtree(t, ignore_errors=True)
+
+    def ns(self, f):
+        return next((n for n in f["pov"]["namespaces"] if n["ns"] == self.NS), None)
+
+    def test_fully_held_namespace_is_listed_not_dropped(self):
+        n = self.ns(self.prod)
+        self.assertIsNotNone(n, "a namespace held entirely by HPAs must still be listed")
+        self.assertTrue(n["held"]); self.assertEqual(n["auto"], {})
+        self.assertIn("hpa", n["held_reasons"])
+        hh = self.prod["pov"]["hpa_held"]
+        self.assertIn(self.NS, hh["namespaces"]); self.assertGreater(hh["n"], 0)
+
+    def test_page_shows_held_row_and_how_to_release_it_and_verifies(self):
+        S = Plan(self.cfg, self.F).build()
+        files = render.write_all(self.cfg, S, self.F)
+        t = next(p for p in files if "-prod-a-pov-automation-kickoff" in p.name).read_text(encoding="utf-8")
+        self.assertIn(f"class=nsck value='{self.NS}' disabled", t)
+        self.assertIn("Held: pod CPU/memory HPA on every workload", t)
+        self.assertIn("hpa_pinned_namespaces", t)
+        D = json.loads(t.split("id=povdata>")[1].split("</script>")[0].replace("<\\/", "</"))
+        self.assertNotIn(self.NS, {n["ns"] for n in D["namespaces"]})      # never generatable
+        ok, errs = verify.verify(self.cfg, S, self.F, files)
+        self.assertEqual(errs, [])
+
+    def test_pinned_override_releases_the_namespace(self):
+        rows = [r for r in self.prod_p["pov"]["rows"] if r["ns"] == self.NS]
+        self.assertTrue(rows, "fixture namespace should rank once released")
+        self.assertTrue(all(r["hpa_class"] == "pinned" and r["wave"] in ("1", "1b") for r in rows))
+        self.assertTrue(all("pinned (min = max, confirmed)" in r["hpa_detail"] for r in rows))
+        self.assertIn("HPA pinned (min = max, confirmed): a resize cannot make it scale", pov.review_notes(rows[0]))
+        n = self.ns(self.prod_p)
+        self.assertFalse(n["held"]); self.assertTrue(n["auto"])
+        self.assertNotIn(self.NS, self.prod_p["pov"]["hpa_held"]["namespaces"])
+
+    # ---- the plan agrees with the kickoff page: HPA-held savings move out of the waves
+    def test_plan_carries_hpa_held_savings_in_their_own_action(self):
+        S = Plan(self.cfg, self.F).build()
+        by = {a["key"]: a for a in S["actions"]}
+        a = by["hpa_hold"]
+        L = self.prod["lanes"]["controller"]
+        self.assertGreater(L["n_hpa_hold"], 0)
+        self.assertAlmostEqual(a["savings_monthly_usd"], sum(f["lanes"]["controller"]["pot_hpa_hold"] for f in self.F), places=6)
+        self.assertEqual(a["action_type"], "hpa_confirm_pinned")
+        self.assertEqual(a["savings_basis"], "achievable_now")
+        self.assertIn(a["confidence"], ("low", "medium"))                 # never high: min/max is unseen
+        self.assertIn(by["automation_proof"]["id"], a["depends_on"])
+        self.assertIn("hpa_pinned_namespaces", " ".join(a["steps"]))
+        self.assertIn(self.NS, a["title"] + a["scope"] + a["evidence"] + " ".join(a["steps"]))
+
+    def test_waves_no_longer_count_hpa_held_savings(self):
+        S = Plan(self.cfg, self.F).build()
+        waves = [a for a in S["actions"] if a["key"] in ("automation_proof", "automation_w2", "automation_w3")]
+        held_uids = {f["uid"] for f in self.F if f["lanes"]["controller"].get("pot_hpa_hold", 0) >= 1}
+        for w in waves:
+            for f in self.F:
+                if f["uid"] in w["_uids" if "_uids" in w else "cluster_uids"] and f["uid"] in held_uids:
+                    L = f["lanes"]["controller"]
+                    self.assertLessEqual(w["savings_monthly_usd"], L["pot"] - L["pot_hpa_hold"] + 1e-6, w["id"])
+        proof = next(w for w in waves if w["key"] == "automation_proof")
+        if next(f for f in self.F if f["name"] == proof["cluster"])["lanes"]["controller"].get("n_hpa_hold"):
+            self.assertIn("pod CPU/memory HPAs held out", proof["scope"])
+
+    def test_achievable_total_is_moved_not_changed(self):
+        held = Plan(self.cfg, self.F).build()
+        pinned = Plan(self.cfg_p, self.F_p).build()
+        self.assertEqual(held["totals"]["achievable_now_monthly"], pinned["totals"]["achievable_now_monthly"])
+        self.assertNotIn("hpa_hold", {a["key"] for a in pinned["actions"]})   # released: nothing left to confirm
+        self.assertIn("hpa_hold", {a["key"] for a in held["actions"]})
+
+    def test_hpa_question_is_a_decision_valued_at_the_held_savings(self):
+        S = Plan(self.cfg, self.F).build()
+        a = next(x for x in S["actions"] if x["key"] == "hpa_hold")
+        d = next(x for x in S["decision_detail"] if x["text"].startswith("Are the HPAs"))
+        self.assertEqual(d["usd"], round(a["savings_monthly_usd"]))
+        self.assertEqual(d["group"], "Intent")
+        self.assertEqual(S["automation_gated"]["hpa_usd"], round(a["savings_monthly_usd"]))
+        self.assertNotIn("hpa_usd", {k for k, v in Plan(self.cfg_p, self.F_p).build()["automation_gated"].items() if v})
+
+    def test_exec_summary_splits_the_automation_decision_when_hpas_hold_the_money(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        import copy, subprocess
+        S = copy.deepcopy(Plan(self.cfg, self.F).build())
+        S["automation_gated"].update(usd=10000, share=0.9, hpa_usd=8000)    # force the dominant case
+        p = self._tmps[0] / "es.json"; out = self._tmps[0] / "es.html"
+        p.write_text(json.dumps(S))
+        r = subprocess.run([node, str(HERE.parent / "exec_summary.js"), str(p), str(out)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        t = out.read_text(encoding="utf-8")
+        self.assertIn("automation alone reaches $2,000 a month, and $8,000 a month more needs that answer.", t)
+        self.assertNotIn("waiting on that single decision", t)
+        S["automation_gated"]["hpa_usd"] = 0                                # no HPA hold: the old wording stands
+        p.write_text(json.dumps(S))
+        subprocess.run([node, str(HERE.parent / "exec_summary.js"), str(p), str(out)], check=True, capture_output=True)
+        self.assertIn("waiting on that single decision", out.read_text(encoding="utf-8"))
+
+    def test_pinned_override_touches_only_listed_namespaces(self):
+        # The default fixture's own HPA-free namespaces are untouched either way.
+        before = {r["name"]: r["hpa_class"] for r in self.prod["pov"]["rows"] if r["ns"] != self.NS}
+        after = {r["name"]: r["hpa_class"] for r in self.prod_p["pov"]["rows"] if r["ns"] != self.NS}
+        self.assertEqual({k: before[k] for k in before.keys() & after.keys()}, {k: after[k] for k in before.keys() & after.keys()})
+
+
 class FakeResp(io.BytesIO):
     def __init__(self, status, body):
         super().__init__(json.dumps(body).encode())

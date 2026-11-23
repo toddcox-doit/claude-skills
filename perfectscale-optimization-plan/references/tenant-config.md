@@ -26,6 +26,18 @@ the same token; `scripts/set_api_credentials.sh` is a bash-only alternative). No
 is skipped, never failed, and HPA status reads Unknown. `public_api_base`
 overrides the API host (default `https://api.app.perfectscale.io`).
 
+`hpa_pinned_namespaces` (default empty) lists namespace regexes whose pod
+CPU/memory HPAs the customer has **confirmed** are pinned (`minReplicas` equals
+`maxReplicas`). Without it, a workload behind such an HPA is put on Hold: a
+smaller request moves the HPA's scaling point. A namespace where every workload
+is on Hold is shown greyed in the kickoff page's namespace picker, with its
+savings and the reason, and the "Kept out of this table" list counts it. Listing
+the namespace here treats its workloads like ones without an HPA: Wave 1, ticked
+by default, and covered by a namespace config. The public API has no HPA
+min/max, so set this only after asking. Flat replica counts are a hint, not
+proof, because an HPA that never crosses its target looks the same. Anchor the
+patterns: `^payments$`.
+
 `pov_top_n` (default 50) is how many workloads each cluster's POV automation
 kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of
 its 0-100 ranking score; the rest is risk severity. See

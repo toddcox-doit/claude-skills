@@ -109,6 +109,7 @@ flood Phase 1.
 | `policy_headroom_tune` | Adjust ExtraHeadroom or a policy floor that is holding recommendations back | XS | `ps-admin` | medium |
 | `policy_workload_mismatch` | A workload's own Optimization Policy mismatches its risk profile — `MaxSavings` on a workload with real resiliency risk (under-protected), or `ExtraHeadroom`/`MaxHeadroom` on a workload that is clearly non-production by name (over-protected) | S | `app-team` | medium |
 | `custom_grouping` | Create a custom group so N identical workload copies share one policy | S | `ps-csm` | low |
+| `hpa_confirm_pinned` | Confirm whether the HPAs that scale workloads on pod CPU or memory are pinned (minReplicas = maxReplicas) before automating them. A smaller request raises measured utilization, so a real HPA can add replicas and take the saving back. Pinned: list the namespace in `hpa_pinned_namespaces` and they join the waves. Not pinned: keep on hold, or move the trigger to a container-resource metric | S | `app-team` | medium |
 | `rightsize_manual` | Apply recommended requests/limits by hand — for `NotSupported` workloads, or where automation is deliberately held | S | `app-team` | medium |
 | `rightsize_stateful` | Manual right-sizing of a StatefulSet, Kafka/Strimzi, or a database | M | `app-team` | high |
 | `rightsize_runtime_managed` | Right-size a workload whose runtime manages its own memory (JVM heap and similar) — the heap flag and the resource request must change together, in the same PR | M | `app-team` | high |
@@ -249,6 +250,7 @@ add tenant-specific ones from what the data actually shows.
 | `limitrange_adjust` | Every right-sizing action in that namespace bounded by the floor | One namespace-level fix releases a whole set |
 | `policy_headroom_tune` | Right-sizing under that policy | Explains a Potential Max Savings lower than waste + idle |
 | `custom_grouping` | `automation_enable_policy` for the grouped set | Group first, then one policy instead of N |
+| `automation_enable_policy` (the proof cluster) | `hpa_confirm_pinned` | The HPA-held savings still need automation on; confirming the HPAs first changes nothing until it is |
 | `unevictable_*` on a node group | `autoscaler_tune_*` and `nodegroup_consolidate` on that group | Tuning the autoscaler while pods pin the nodes changes nothing. The most common sequencing error in the wild |
 | `autoscaler_tune_*` | `commitment_realignment` | Coverage can only be re-cut once capacity settles |
 | All PodFit right-sizing in a cluster | `nodegroup_consolidate` for that cluster | Pods must shrink and re-pack before nodes can leave — the PodFit → InfraFit flywheel |

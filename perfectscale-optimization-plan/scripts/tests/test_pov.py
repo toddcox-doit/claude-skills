@@ -251,8 +251,13 @@ class T(unittest.TestCase):
     def test_namespace_breakdown_lists_exclusions_and_skips_empty_namespaces(self):
         out = self.mixed_ns()
         by = {n["ns"]: n for n in out["namespaces"]}
-        self.assertEqual(list(by), ["shop", "kube-system"])       # managed listed last; vault only counted
-        self.assertEqual(out["ns_nothing_to_automate"], 1)
+        # vault's only workload is held out by the tenant config: listed, held, after the automatable
+        # ones and before managed - no longer dropped into an unexplained count.
+        self.assertEqual(list(by), ["shop", "vault", "kube-system"])
+        self.assertTrue(by["vault"]["held"]); self.assertFalse(by["shop"]["held"])
+        self.assertEqual(by["vault"]["held_reasons"], {"held_out": 1})
+        self.assertEqual(by["vault"]["auto"], {})
+        self.assertEqual(out["ns_nothing_to_automate"], 0)
         shop = by["shop"]
         self.assertEqual(set(shop["auto"]), {"Deployment", "CronJob", "DaemonSet"})
         self.assertEqual(shop["auto"]["Deployment"]["n"], 1)
@@ -304,8 +309,11 @@ class T(unittest.TestCase):
         in_table = {r["ns"] for r in self.rows}
         self.assertIn("airflow", listed - in_table)               # 250 bare Jobs: never ranked, still a namespace
         # streaming holds only stateful-pattern brokers: ranked one by one, but nothing a namespace
-        # config should switch on, so it is not offered as a namespace.
-        self.assertIn("streaming", in_table - listed)
+        # config should switch on. It is listed as held (greyed, with the reason) and never generatable.
+        st = next(n for n in self.prod["pov"]["namespaces"] if n["ns"] == "streaming")
+        self.assertTrue(st["held"]); self.assertEqual(set(st["held_reasons"]), {"stateful"})
+        self.assertIn("streaming", in_table & listed)
+        self.assertNotIn("streaming", {n["ns"] for n in pov.page_data("prod-a", "2026-11-20", self.rows, self.prod["pov"]["namespaces"])["namespaces"]})
         self.assertIn("kube-system", {n["ns"] for n in self.prod["pov"]["namespaces"] if n["managed"]})
 
     # ------------------------------------------------------------ browser parity

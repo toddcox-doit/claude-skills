@@ -290,7 +290,7 @@ def bundle_ns(cluster, prepared, namespaces, checked, selected):
     heads = file_heads(cluster, prepared)
     out = [(f"{slug(cluster)}-cluster-automation-config.yaml", 1, heads["cluster"] + cluster_doc())]
     for n in namespaces:
-        if n["ns"] not in ck or n["managed"]:
+        if n["ns"] not in ck or n["managed"] or n.get("held"):
             continue
         en = ns_enabled(n, selected)
         if not en:
@@ -316,7 +316,7 @@ def page_data(cluster, prepared, rows, namespaces=()):
                   "wl_doc": L(workload_doc(r))} for r in rows],
         "namespaces": [{"ns": n["ns"], "ns_q": q(n["ns"]), "auto": n["auto"],
                         "excl": [{"type": x["type"], "doc": L(exclusion_doc(n["ns"], x))} for x in n["excl"]]}
-                       for n in namespaces if not n["managed"]],
+                       for n in namespaces if not n["managed"] and not n.get("held")],
     }
 
 
@@ -604,7 +604,9 @@ def review_notes(r):
         n.append("JVM: move the heap flag with memory")
     if (r["policy"] or "").lower() in POLICY_UNDER and r["risk_sev"] >= 3:
         n.append("MaxSavings policy on an at-risk workload")
-    if r.get("hpa_class") == "pod_resource":
+    if r.get("hpa_class") == "pinned":
+        n.append("HPA pinned (min = max, confirmed): a resize cannot make it scale")
+    elif r.get("hpa_class") == "pod_resource":
         n.append("Hold: pod CPU/memory HPA")
         if r.get("replicas_max") is not None and r["replicas_max"] <= r["replicas"]:
             # Constant replicas is a hint, not proof: an HPA that simply never crossed its target looks
@@ -639,6 +641,15 @@ def _held_lines(pv):
     if ho and ho["n"]:
         out.append(f"{plural(ho['n'], 'workload')} held out of automation in this tenant's configuration, "
                    f"{usd(ho['pot'])}/mo of potential savings.")
+    hh = pv.get("hpa_held") or {}
+    if hh.get("n"):
+        names = hh.get("namespaces") or []
+        shown = human_list(names[:4] + ([f"{len(names) - 4} more"] if len(names) > 4 else []))
+        out.append(f"{plural(hh['n'], 'workload')} on hold because an HPA scales them on pod CPU or memory, "
+                   f"{usd(hh['pot'])}/mo of potential savings, in {plural(len(names), 'namespace')}: {shown}. "
+                   "A smaller request moves the HPA's scaling point. They stay in the ranked table, unticked, and out of "
+                   "namespace configs. If the owner confirms an HPA is pinned (minReplicas equals maxReplicas), list its "
+                   "namespace under hpa_pinned_namespaces in the tenant config and regenerate this page.")
     ut = h.get("unsupported_type")
     if ut and ut["n"]:
         kinds = human_list([f"{k} ({v:,})" for k, v in (pv.get("held_types") or {}).items()][:6])
@@ -715,6 +726,10 @@ def render_pov_html(cfg, f):
             f"<script>{JS};{JS_RESIZE};{JS_NSROW};{JS_BUILD};{JS_BUILD_NS};{JS_ZIP};{JS_UI}</script></body></html>")
 
 
+HELD_REASON = {"hpa": "pod CPU/memory HPA", "stateful": "stateful", "jvm": "JVM heap",
+               "held_out": "held out in the tenant config"}
+
+
 def _ns_section(pv, namespaces, in_table):
     """The namespace picker: every namespace with something a namespace config can automate, ticked
     by default when the ranked table touches it; platform-managed namespaces listed last, greyed
@@ -723,9 +738,10 @@ def _ns_section(pv, namespaces, in_table):
     P = ["<h2>Namespace scope</h2><p class=mut>Tick the namespaces to automate as a whole. Each gets its own file with "
          "one NamespaceAutomationConfig enabling the selected controller types it runs, covering every workload of those "
          "types, ranked or not. Workloads that should not ride along - held out in this tenant's configuration, stateful, "
-         "or JVM - get a Disabled workload config in the same file (Kept out). Only namespaces that run one of the "
-         f"selected controller types are shown. Ticked by default: the namespaces the ranked table touches with at least "
-         f"${AUTOMATION_MIN_USD}/mo of waste to act on.</p>"
+         "JVM, or behind an HPA that scales on pod CPU or memory - get a Disabled workload config in the same file (Kept out). "
+         "A namespace where every workload is kept out is listed greyed with the reason, not selectable. Only namespaces "
+         f"that run one of the selected controller types are shown. Ticked by default: the namespaces the ranked table "
+         f"touches with at least ${AUTOMATION_MIN_USD}/mo of waste to act on.</p>"
          "<div class=nsbar><button type=button id=nsall>Select all</button><button type=button id=nsnone>Clear</button>"
          "<button type=button id=nsmatch>Match the table</button>"
          "<button type=button id=genns class=go>Generate namespace CRDs</button><span id=nsscope class=mut></span></div>"
@@ -739,6 +755,17 @@ def _ns_section(pv, namespaces, in_table):
                      f"aria-label='{k} (platform-managed, not selectable)'></td><td>{k}</td><td>-</td>"
                      "<td>Platform-managed: not automated</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>")
             continue
+        if n.get("held"):
+            # data-managed reuses the greyed-row path in the page script: shown while one of its kinds is
+            # selected, never recomputed, never generated.
+            nex = len(n["excl"])
+            why = "; ".join(f"{HELD_REASON.get(k, k)} ({v})" if len(n["held_reasons"]) > 1 else HELD_REASON.get(k, k)
+                            for k, v in n["held_reasons"].items())
+            P.append(f"<tr class=mgd data-managed=1 data-types='{e(','.join(n['types']))}' data-n='{k}'><td><input type=checkbox class=nsck value='{k}' disabled "
+                     f"aria-label='{k} (every workload kept out, not selectable)'></td><td>{k}</td><td class=num data-v='0'>0</td>"
+                     f"<td>Held: {e(why)} on every workload</td><td class=num data-v='{n['held_pot']:.2f}'>{usd(n['held_pot'])}/mo on hold</td>"
+                     f"<td>-</td><td class=num data-v='{nex}'>{nex}</td><td class=num>-</td></tr>")
+            continue
         w = sum(t["n"] for t in n["auto"].values()); r = sum(t["risk"] for t in n["auto"].values())
         tick = n["ns"] in in_table and sum(t.get("waste", 0.0) for t in n["auto"].values()) >= AUTOMATION_MIN_USD
         P.append(f"<tr data-n='{k}'><td><input type=checkbox class=nsck value='{k}'{' checked' if tick else ''} "
@@ -749,7 +776,7 @@ def _ns_section(pv, namespaces, in_table):
     P.append("</tbody></table></div>")
     if pv.get("ns_nothing_to_automate"):
         P.append(f"<p class=fn>{plural(pv['ns_nothing_to_automate'], 'other namespace')} not listed: everything in them is "
-                 "held out, stateful, JVM, or of a kind a namespace config cannot enable.</p>")
+                 "of a kind a namespace config cannot enable.</p>")
     return "".join(P)
 
 

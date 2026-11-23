@@ -140,6 +140,7 @@ Then set by hand, because guessing them is worse than leaving them null:
 | `stateful_patterns` | Add whatever search or streaming engine *this* tenant runs. The defaults are not exhaustive — see `references/methodology.md`. |
 | `held_out_from_automation` | Name or namespace regexes to keep out of the automation ask. Anchor them: `^prod$` does not catch `preprod`. |
 | `managed_namespaces` | Platform add-ons to hold out of the ask. |
+| `hpa_pinned_namespaces` | **Ask.** Namespace regexes whose pod CPU/memory HPAs the owner confirms are pinned (min = max replicas). Releases those workloads from Hold, so a namespace held entirely by such HPAs can be automated. Never infer it from flat replica counts. |
 | `foreign_tenants` | Every other customer name this folder has held, so the leak scan can catch them. |
 | `adoption_factor` | Default `0.7`. Scales savings in the adoption view; never scales spend. |
 | `status` | e.g. `"Draft for review"` adds a banner and a feedback section. |

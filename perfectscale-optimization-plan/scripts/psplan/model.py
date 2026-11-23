@@ -99,7 +99,8 @@ def hpa_class(r2):
     class: "none" (no HPA), "container" (ContainerResource triggers only - a resize keeps the
     trigger on the container it measures), "pod_resource" (pod-level CPU/memory utilization - a
     smaller request moves the scaling point), "custom" (custom/external metrics only). v2 carries no
-    min/max replicas, so an HPA pinned at fixed replicas reads as its trigger type."""
+    min/max replicas, so an HPA pinned at fixed replicas reads as its trigger type. The caller
+    relabels "pod_resource" as "pinned" for namespaces listed in hpa_pinned_namespaces."""
     if not r2:
         return None, None
     t = (r2.get("scaling") or {}).get("hpaTargets") or {}
@@ -276,7 +277,8 @@ def pov_namespaces(w, R):
         reason = ("held_out" if x["_lane"] == "held_out" else "stateful" if x["_lane"] == "stateful"
                   else "jvm" if x.get("_jvm") else "hpa" if x.get("_hpa_class") == "pod_resource" else None)
         if reason:
-            a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason})
+            a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason,
+                              "pot": R(max(x["potential_savings"], 0.0))})
             continue
         t = a["auto"].setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
         t["n"] += 1
@@ -286,9 +288,22 @@ def pov_namespaces(w, R):
     for a in nsd.values():
         a["excl"].sort(key=lambda e: (e["type"], e["name"]))
         a["pot"] = sum(t["pot"] for t in a["auto"].values())
-    listed = [a for a in nsd.values() if (a["managed"] and a["types"]) or a["auto"]]
-    listed.sort(key=lambda a: (a["managed"], -a["pot"], a["ns"]))
-    return {"namespaces": listed, "ns_nothing_to_automate": sum(1 for a in nsd.values() if not a["managed"] and not a["auto"])}
+        # Every automatable workload kept out (all behind a pod CPU/memory HPA, say): there is nothing
+        # for a namespace config to enable, but dropping the row hid the largest namespace of a tenant
+        # whose workloads all sat behind such HPAs. List it, not selectable, with what holds it back.
+        a["held"] = not a["managed"] and not a["auto"] and bool(a["excl"])
+        if a["held"]:
+            a["held_pot"] = sum(e["pot"] for e in a["excl"])
+            a["held_reasons"] = dict(collections.Counter(e["reason"] for e in a["excl"]).most_common())
+            a["types"] = sorted({e["type"] for e in a["excl"]}, key=POV_CR_TYPES.index)
+    listed = [a for a in nsd.values() if (a["managed"] and a["types"]) or a["auto"] or a["held"]]
+    listed.sort(key=lambda a: (a["managed"], a["held"], -(a.get("held_pot") or a["pot"]), a["ns"]))
+    hpa = [e for a in nsd.values() if not a["managed"] for e in a["excl"] if e["reason"] == "hpa"]
+    hpa_ns = collections.Counter(a["ns"] for a in nsd.values() if not a["managed"] for e in a["excl"] if e["reason"] == "hpa")
+    return {"namespaces": listed,
+            "ns_nothing_to_automate": sum(1 for a in nsd.values() if not a["managed"] and not a["auto"] and not a["held"]),
+            "hpa_held": {"n": len(hpa), "pot": sum(e["pot"] for e in hpa),
+                         "namespaces": [ns for ns, _ in hpa_ns.most_common()]}}
 
 
 def primary_issue(w):
@@ -566,6 +581,7 @@ def _load(cfg, cluster, d):
     stateful_rx = re.compile("|".join(cfg["stateful_patterns"]), re.I) if cfg["stateful_patterns"] else None
     held_rx = re.compile("|".join(cfg["held_out_from_automation"]), re.I) if cfg["held_out_from_automation"] else None
     jvm_rx = re.compile("|".join(cfg["jvm_patterns"]), re.I) if cfg["jvm_patterns"] else None
+    pinned_rx = re.compile("|".join(cfg["hpa_pinned_namespaces"]), re.I) if cfg.get("hpa_pinned_namespaces") else None
     nonprod_rx = re.compile("|".join(cfg["nonprod_patterns"]), re.I) if cfg["nonprod_patterns"] else None
     excl = [e.lower() for e in cfg["exclusions"]]
 
@@ -645,6 +661,9 @@ def _load(cfg, cluster, d):
         x["_hpa"] = hpa_map.get(x.get("id"))
         r2 = v2.get(x.get("id"))
         x["_hpa_class"], x["_hpa_detail"] = hpa_class(r2)
+        if x["_hpa_class"] == "pod_resource" and pinned_rx and pinned_rx.search(x["namespace"]):
+            # Customer-confirmed min == max: the HPA cannot scale, so a resize cannot move it.
+            x["_hpa_class"], x["_hpa_detail"] = "pinned", (x["_hpa_detail"] or "CPU/memory") + "; pinned (min = max, confirmed)"
         x["_auto_status"] = (r2.get("automation") or {}).get("status") if r2 else None
         x["_immature"] = bool(r2) and not ((r2.get("maturity") or {}).get("overall") or {}).get("isMature", True)
 
@@ -702,7 +721,13 @@ def _load(cfg, cluster, d):
         ws = [x for x in w if x["_lane"] == ln]
         elig_ok = ("NotEnabled", "DisabledByUser", "Eligible")
         pe = sum(x["potential_savings"] for x in ws if x["_elig"] in elig_ok) if elig_map else None
+        # Behind a pod CPU/memory HPA (public API v2): a smaller request moves the scaling point, so
+        # these savings are not reachable by switching automation on - the POV page puts them on
+        # Hold. Counted within the same eligible set as pot_eligible so the two subtract cleanly.
+        hh = [x for x in ws if x.get("_hpa_class") == "pod_resource" and (not elig_map or x["_elig"] in elig_ok)]
         lanes[ln] = {"pot_eligible_o": pe, "pot_eligible": (R(pe) if pe is not None else None),
+                     "n_hpa_hold": len(hh), "pot_hpa_hold_o": sum(x["potential_savings"] for x in hh),
+                     "pot_hpa_hold": R(sum(x["potential_savings"] for x in hh)),
                      "n": len(ws), "cost": R(sum(x["cost"] for x in ws)), "waste": R(sum(x["waste"] for x in ws)), "pot": R(sum(x["potential_savings"] for x in ws)),
                      "cost_o": sum(x["cost"] for x in ws), "waste_o": sum(x["waste"] for x in ws), "pot_o": sum(x["potential_savings"] for x in ws),
                      "owners": owners(ws, "potential_savings"), "top": [row(x) for x in sorted(ws, key=lambda x: -x["potential_savings"])[:8]]}
@@ -789,7 +814,10 @@ def _load(cfg, cluster, d):
 
     # ---- stateful / held-out detail
     out["stateful"] = {"n": lanes["stateful"]["n"], "pot": lanes["stateful"]["pot"], "names": sorted({short_name(x["name"]) for x in w if x["_lane"] == "stateful"})[:6]}
-    out["controllers"] = [{"name": x["name"], "ns": x["namespace"], "type": x["type"], "pot": R(x["potential_savings"]), "pot_o": x["potential_savings"], "owner": owner_key(x)}
+    out["controllers"] = [{"name": x["name"], "ns": x["namespace"], "type": x["type"], "pot": R(x["potential_savings"]), "pot_o": x["potential_savings"], "owner": owner_key(x),
+                           "hpa": x.get("_hpa_class"),
+                           # never above its average over the window: a hint (not proof) that an HPA is pinned
+                           "flat": x["replicas_counts"].get("max_count", x["replicas_counts"]["avg_count"]) <= x["replicas_counts"]["avg_count"]}
                           for x in sorted([x for x in w if x["_lane"] == "controller"], key=lambda x: -x["potential_savings"])]
     out["managed_names"] = sorted({x["name"] for x in w if x["_lane"] == "managed"})[:8]
     out["names_by_type"] = {}  # kept small: only controllers, used for cross-cluster pairing

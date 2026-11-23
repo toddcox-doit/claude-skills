@@ -9,7 +9,7 @@ from pathlib import Path
 # opposed to e.g. managed_namespaces which looks pattern-shaped but is actually matched by exact set
 # membership, never compiled as a regex.
 REGEX_KEYS = ("held_out_from_automation", "stateful_patterns", "jvm_patterns",
-              "nonprod_patterns", "auto_provisioned_pool_patterns", "gpu_pool_patterns")
+              "nonprod_patterns", "auto_provisioned_pool_patterns", "gpu_pool_patterns", "hpa_pinned_namespaces")
 
 DEFAULTS = {
     "customer": None,
@@ -43,6 +43,12 @@ DEFAULTS = {
     # because the public API carries no image or runtime field. Matched on
     # workload name or namespace. See references/methodology.md.
     "jvm_patterns": [],
+    # Namespaces whose pod CPU/memory HPAs the customer has confirmed are pinned (minReplicas ==
+    # maxReplicas), so a smaller request cannot make them scale. The public API carries no HPA min/max,
+    # so this is only ever set after asking - never inferred from flat replica counts, which an HPA
+    # that simply never crossed its target produces too. Matched on namespace. Workloads there are
+    # treated like workloads without an HPA: wave 1, ticked by default, automated by namespace configs.
+    "hpa_pinned_namespaces": [],
     "runtime_file": None,                   # optional JSON from a PodFit browser pass, if a Runtime column is available
     "nonprod_patterns": ["stage", "staging", "dev", "nonprod", "sbx", "sandbox", "test", "uat", "qa"],
     "managed_namespaces": [],               # extra namespaces treated as platform-managed

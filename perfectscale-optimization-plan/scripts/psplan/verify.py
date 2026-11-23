@@ -218,8 +218,18 @@ def verify(cfg, S, facts, files):
                 chk(not (d_ns & set(managed)), f"{p.name}: no platform-managed namespace can be generated")
                 chk(all(f"class=nsck value='{html.escape(ns)}' disabled" in t for ns in managed),
                     f"{p.name}: platform-managed namespaces are listed with their checkbox disabled")
-                chk(d_ns == {n["ns"] for n in model_ns if not n["managed"]},
+                chk(d_ns == {n["ns"] for n in model_ns if not n["managed"] and not n.get("held")},
                     f"{p.name}: the namespace picker lists every namespace the model found automatable")
+                # A namespace whose every workload is kept out (all behind pod CPU/memory HPAs, say) must
+                # still be visible - greyed, with its reason - and can never be generated. Dropping it hid
+                # a tenant's largest namespace with no explanation on the page.
+                held = [n["ns"] for n in model_ns if n.get("held")]
+                chk(not (d_ns & set(held)), f"{p.name}: no fully kept-out namespace can be generated")
+                chk(all(f"class=nsck value='{html.escape(ns)}' disabled" in t for ns in held),
+                    f"{p.name}: fully kept-out namespaces are listed, greyed, with their checkbox disabled")
+                hh = (f.get("pov") or {}).get("hpa_held") or {}
+                chk(not hh.get("n") or "hpa_pinned_namespaces" in t,
+                    f"{p.name}: workloads held for a pod CPU/memory HPA are counted, with the way to release them")
                 ex = [x["doc"] for n in D.get("namespaces", []) for x in n["excl"]]
                 chk(all('      automationMode: "Disabled"' in d and not any("Enabled" in y for y in d) for d in ex),
                     f"{p.name}: every namespace exclusion is a Disabled workload config")
