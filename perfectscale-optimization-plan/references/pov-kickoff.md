@@ -27,8 +27,8 @@ neither savings nor risk scores 0 and is left out.
 
 The rows are grouped by what automation can do now, each group a collapsible
 section with its own Select all / Clear and a live count, savings and tick
-total: **Ready to automate** (Wave 1 and 1b, open), **Review** and **Hold**
-(collapsed). Within a group the rows keep their rank order. Each row has six
+total: **Ready to automate** (Wave 1 and 1b), **Ready with HPA automation**
+(Wave 1h) and **Review**, all collapsed like every section of the page. Within a group the rows keep their rank order. Each row has six
 columns: in-scope checkbox, Workload (the name, with namespace and **controller
 type** on a second line), Savings/mo, Risk, HPA (first trigger plus a count) and
 a short Note. Click a workload's name for its detail row: rank and score,
@@ -40,8 +40,8 @@ XLSX sheet keeps every column in one flat grid.
 "Review before automating" flags what a cost-only config does not handle on its
 own: stateful workloads (agree a restart window), JVM workloads from
 `jvm_patterns` (move the heap flag with the memory request), MaxSavings policy
-on an at-risk workload, a known HPA (a smaller request moves its scaling point),
-and DaemonSets (decrease-only).
+on an at-risk workload, an HPA on pod CPU/memory (switch on HPA automation with
+it, plus any trigger finding), and DaemonSets (decrease-only).
 
 ### Waves and HPA
 
@@ -53,16 +53,75 @@ from the POV Command Center playbook:
 | Wave 1 | no HPA, or an HPA triggered on the container itself (ContainerResource) | yes |
 | Wave 1b | stateful workloads and service-mesh components (istio, linkerd, envoy): resize with extra headroom | yes |
 | Review | HPA on custom metrics only (a resize does not move the trigger, but confirm with the owner), or PerfectScale reports automation not supported | no |
-| Hold | HPA on pod CPU/memory utilization: a smaller request moves its scaling point, and with injected or native mesh sidecars the HPA math shifts | no |
+| Wave 1h | HPA on pod CPU/memory utilization: automated with PerfectScale's HPA automation alongside. PerfectScale sizes the request from the trigger, and its HPA automation keeps minReplicas and the triggers aligned as requests change | yes |
 
 HPA triggers come from the public API v2 (`scaling.hpaTargets`), shown as, for
-example, "CPU 50%, istio_requests_per_second 20". v2 has no min/max replicas, so
-an HPA pinned at fixed replicas (min == max, safe to resize) also reads as Hold;
-tick it by hand once the owner confirms. Without API credentials the HPA column
-reads Unknown, nothing is held for its HPA, and the page says so. A pod-level-HPA
-workload inside a ticked namespace is kept out of that namespace's config with a
-Disabled workload config (reason `hpa`). Rows also flag recommendations that are
+example, "CPU 50%, istio_requests_per_second 20". Without API credentials the HPA
+column reads Unknown and the page says so. Rows also flag recommendations that are
 not mature yet and workloads PerfectScale cannot automate.
+
+### HPA automation
+
+Earlier versions put pod CPU/memory HPA workloads on Hold. PerfectScale's own
+guidance is the opposite: right-size first (the recommended request already
+accounts for the trigger), then keep the HPA aligned with HPA automation. So these
+workloads ride along in their namespace, and the page has an **HPA automation**
+section that:
+
+- states what HPA automation will change on this cluster, worked out from the
+  data with PerfectScale's documented rules (`model.hpa_analysis`): triggers under
+  80% raised to 80%, triggers above the highest usable one lowered to it, pod-level
+  triggers on multi-container pods moved to the app container (Kubernetes 1.33+),
+  and replica counts held flat at 3 or more as minReplicas hints;
+- states what stays with the owners: maxReplicas and scaling behaviour, and
+  findings PerfectScale reports but will not change;
+- collects what the CRD needs without any script: prerequisite checkboxes
+  (agent v1.0.71+, exporter v1.1.28+, required; Kubernetes 1.33+, optional) and
+  restriction inputs at PerfectScale's defaults (minReplicas floor 2, CPU and
+  memory trigger floor 80%, optional maximums), validated in the page;
+- lists findings in two collapsed rollups: **By namespace** (click a namespace for
+  each workload's changes, as short labels such as "CPU trigger 40% → 80%") and
+  **Findings by workload** (a one-line summary column; click a workload for its
+  full triggers and notes), so long notes never widen the table;
+- keeps the read-only `kubectl get hpa,pdb` / `kubectl version` / agent-image
+  commands folded away, in case the customer agrees to share their HPA specs.
+
+The public API has no HPA min/max, so exact minReplicas changes come from PodFit's
+HPA tab. Each namespace with such workloads has an **HPA automation** checkbox in
+Namespace scope, ticked by default. Once both required prerequisites are ticked,
+generated namespace and workload configs carry the `hpa` block in the same CR,
+since there is one NamespaceAutomationConfig per namespace. Until then they carry a
+"not included" note. The cluster prerequisite sets HPA automation Disabled at
+cluster scope. `hpa_pinned_namespaces` remains as an override for HPAs confirmed
+pinned: those workloads are Wave 1 and need no HPA automation.
+
+### Generated output, one rollup per CRD type
+
+Generated files land in **Generated CRDs**, one collapsible group per type:
+pod automation workload CRDs, pod automation namespace CRDs, and HPA automation.
+Karpenter and bin packing have slots (`KINDS` in the page script) for when the
+page generates them. Each pod group keeps its own files, zip download and "out of
+date" flag, so generating one never replaces the other. The HPA group is
+review-only: it lists the files that carry the `hpa` block and shows just that
+block, because the block is applied as part of those pod automation files. It is
+out of date whenever its source groups are. **Download all** zips every group's
+files, with the shared cluster prerequisite included once.
+
+### CRD history (version control for the configs handed to customers)
+
+With the page opened through `kickoff.py` (the double-click launcher), each
+generated workload or namespace set is saved by `psplan/crdstore.py` under
+`crds/<cluster>/<YYYYMMDD-HHMMSS>-<kind>/`, append-only: the files plus a manifest
+with the plan version, selections, sha256 per file, the objects it creates, the
+changes against the previous set of the same kind, and the handed-to-customer
+mark. Identical sets are not stored twice, and nothing is pruned, since a set is a
+few kilobytes and the history is the record of what each customer was given.
+
+The **CRD history** section lists the last three of each kind, with **Show all**
+for the rest. "Current" for a rollback is the latest set marked handed to the
+customer, or the latest saved. The helper only writes sets for the cluster of the
+page that sent them, with file names and contents of the shapes the page
+generates, and never deletes a set.
 
 ### Kept out, and counted
 
@@ -241,7 +300,9 @@ subdomain, so a Deployment and a StatefulSet sharing a name do not collide.
   and compares it with the same files.
 - A test runs yamllint's default config over every file both generators can
   write, including namespace exclusions.
-- `verify.py` checks every kickoff page: no Hold or Review row is pre-ticked; its rows match the model's ranking,
+- `verify.py` checks every kickoff page: no workload is on Hold and no Review row is pre-ticked;
+  every namespace with pod CPU/memory HPAs offers HPA automation, ticked by default, with the
+  HPA automation section, its prerequisites and the optional read-only commands; its rows match the model's ranking,
   nothing managed or held out is ranked, every config sets `keepLimit: false`
   with the inline REVIEW comment, every config carries the full operational block, no config enables an increase, the namespace
   picker lists exactly the namespaces the model found automatable, every

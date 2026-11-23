@@ -47,10 +47,15 @@ V2_PROD_A = [
 ]
 
 
-class HpaHeldNamespace(unittest.TestCase):
-    """A namespace whose every workload sits behind a pod CPU/memory HPA: before, the picker dropped
-    it with no reason on the page (it hid a tenant's largest namespace). Now it is listed greyed and
-    counted with the way out, and hpa_pinned_namespaces releases it once the owner confirms min == max."""
+def e_html(x):
+    import html
+    return html.escape(x, quote=True)
+
+
+class HpaAutomation(unittest.TestCase):
+    """Workloads whose HPA scales on pod CPU/memory are automated with PerfectScale's HPA automation
+    alongside (PerfectScale sizes the request from the trigger, then keeps the HPA aligned), not held
+    back. The fixture gives every workload in NS a pod CPU and memory HPA at 90%."""
     NS = "platform"
 
     @classmethod
@@ -78,6 +83,7 @@ class HpaHeldNamespace(unittest.TestCase):
         cls._tmps = []
         cls.cfg, cls.prod, cls.F = cls.build()
         cls.cfg_p, cls.prod_p, cls.F_p = cls.build(pinned=[f"^{cls.NS}$"])
+        cls.S = Plan(cls.cfg, cls.F).build()
 
     @classmethod
     def tearDownClass(cls):
@@ -87,176 +93,187 @@ class HpaHeldNamespace(unittest.TestCase):
     def ns(self, f):
         return next((n for n in f["pov"]["namespaces"] if n["ns"] == self.NS), None)
 
-    def test_fully_held_namespace_is_listed_not_dropped(self):
+    # ---- model
+    def test_hpa_workloads_ride_along_in_their_namespace(self):
         n = self.ns(self.prod)
-        self.assertIsNotNone(n, "a namespace held entirely by HPAs must still be listed")
-        self.assertTrue(n["held"]); self.assertEqual(n["auto"], {})
-        self.assertIn("hpa", n["held_reasons"])
-        hh = self.prod["pov"]["hpa_held"]
-        self.assertIn(self.NS, hh["namespaces"]); self.assertGreater(hh["n"], 0)
-
-    def test_page_shows_held_row_and_how_to_release_it_and_verifies(self):
-        S = Plan(self.cfg, self.F).build()
-        files = render.write_all(self.cfg, S, self.F)
-        t = next(p for p in files if "-prod-a-pov-automation-kickoff" in p.name).read_text(encoding="utf-8")
-        self.assertIn(f"class=nsck value='{self.NS}' disabled", t)
-        self.assertIn("Held: pod CPU/memory HPA on every workload", t)
-        self.assertIn("hpa_pinned_namespaces", t)
-        D = json.loads(t.split("id=povdata>")[1].split("</script>")[0].replace("<\\/", "</"))
-        # In the page data so it can be confirmed, flagged held, and never pre-confirmed.
-        self.assertTrue(next(n for n in D["namespaces"] if n["ns"] == self.NS)["held"])
-        self.assertIn(f"class=hpack value='{self.NS}'", t)
-        self.assertNotIn(f"class=hpack value='{self.NS}' checked", t)
-        ok, errs = verify.verify(self.cfg, S, self.F, files)
-        self.assertEqual(errs, [])
-
-    def test_pinned_override_releases_the_namespace(self):
-        rows = [r for r in self.prod_p["pov"]["rows"] if r["ns"] == self.NS]
-        self.assertTrue(rows, "fixture namespace should rank once released")
-        self.assertTrue(all(r["hpa_class"] == "pinned" and r["wave"] in ("1", "1b") for r in rows))
-        self.assertTrue(all("pinned (min = max, confirmed)" in r["hpa_detail"] for r in rows))
-        self.assertIn("HPA pinned (min = max, confirmed): a resize cannot make it scale", pov.review_notes(rows[0]))
-        n = self.ns(self.prod_p)
         self.assertFalse(n["held"]); self.assertTrue(n["auto"])
-        self.assertNotIn(self.NS, self.prod_p["pov"]["hpa_held"]["namespaces"])
+        self.assertNotIn("hpa", {x["reason"] for x in n["excl"]})
+        self.assertGreater(n["hpa"]["n"], 0)
+        self.assertEqual(n["hpa"]["n"], len(n["hpa"]["items"]))
+        sc = self.prod["pov"]["hpa_scope"]
+        self.assertIn(self.NS, sc["namespaces"])
+        self.assertEqual(sc["n"], sum((x.get("hpa") or {}).get("n", 0) for x in self.prod["pov"]["namespaces"]))
+        self.assertTrue(all(r["wave"] == "1h" for r in self.prod["pov"]["rows"] if r["ns"] == self.NS))
 
-    # ---- the plan agrees with the kickoff page: HPA-held savings move out of the waves
-    def test_plan_carries_hpa_held_savings_in_their_own_action(self):
-        S = Plan(self.cfg, self.F).build()
-        by = {a["key"]: a for a in S["actions"]}
-        a = by["hpa_hold"]
-        L = self.prod["lanes"]["controller"]
-        self.assertGreater(L["n_hpa_hold"], 0)
-        self.assertAlmostEqual(a["savings_monthly_usd"], sum(f["lanes"]["controller"]["pot_hpa_hold"] for f in self.F), places=6)
-        self.assertEqual(a["action_type"], "hpa_confirm_pinned")
-        self.assertEqual(a["savings_basis"], "achievable_now")
-        self.assertIn(a["confidence"], ("low", "medium"))                 # never high: min/max is unseen
+    def test_hpa_analysis_follows_perfectscales_rules(self):
+        def c(name, cpu_req, cpu_lim, mem_req, mem_lim):
+            return {"name": name, "resources": {"cpu": {"request": {"recommendedCores": cpu_req}, "limit": {"recommendedCores": cpu_lim}},
+                                                "memory": {"request": {"recommendedMiB": mem_req}, "limit": {"recommendedMiB": mem_lim}}}}
+        def run(cpu, mem, conts, avg=2, mx=2):
+            t = {}
+            if cpu is not None: t["cpu"] = {"utilization": cpu}
+            if mem is not None: t["memory"] = {"utilization": mem}
+            r2 = {"scaling": {"hpaTargets": t}, "containers": {x["name"]: x for x in conts}}
+            return model.hpa_analysis(r2, {"replicas_counts": {"avg_count": avg, "max_count": mx}})
+        text = lambda a: " | ".join(f"{f['kind']}:{f['text']}" for f in a["findings"])  # noqa: E731
+        low = run(60, None, [c("app", 1, 0, 1000, 0)])
+        self.assertIn("change:Raise the CPU trigger from 60% to 80%", text(low))
+        self.assertEqual(low["findings"][0]["short"], "CPU trigger 60% \u2192 80%")     # one-line label for rollups
+        cap = run(120, 90, [c("app", 1, 1, 1000, 1000)])                  # usable: CPU 90%, memory 81%
+        self.assertEqual(cap["usable"], {"cpu": 90, "memory": 81})
+        self.assertIn("change:Lower the CPU trigger from 120% to 90%", text(cap))
+        self.assertIn("change:Lower the memory trigger from 90% to 81%", text(cap))
+        tight = run(90, None, [c("app", 1, 0.8, 1000, 0)])                 # usable 72% < 80%: reported only
+        self.assertIn("report:CPU trigger 90% cannot fire before the limit", text(tight))
+        nolim = run(200, None, [c("app", 1, 0, 1000, 0)])
+        self.assertIn("report:CPU trigger 200% with no limit", text(nolim))
+        ok = run(90, 90, [c("app", 1, 0, 1000, 0)])
+        self.assertEqual(ok["findings"], [])
+        multi = run(90, None, [c("app", 1, 0, 1, 0), c("log-shipper", 0.1, 0, 1, 0), c("istio-proxy", 0.1, 0, 1, 0)])
+        self.assertIn("Move the pod-level trigger to the application container (2 declared containers", text(multi))
+        self.assertEqual(multi["containers"], ["app", "log-shipper"])     # injected istio-proxy ignored
+        self.assertIn("min:Replicas held at 4", text(run(90, None, [c("app", 1, 0, 1, 0)], avg=4, mx=4)))
+        self.assertNotIn("min:", text(run(90, None, [c("app", 1, 0, 1, 0)], avg=2, mx=2)))   # 2 is already the floor
+
+    # ---- plan
+    def test_waves_count_hpa_savings_and_the_action_carries_none(self):
+        by = {a["key"]: a for a in self.S["actions"]}
+        a = by["hpa_automation"]
+        self.assertEqual((a["action_type"], a["savings_monthly_usd"], a["phase"]), ("hpa_automation_enable", 0, 1))
         self.assertIn(by["automation_proof"]["id"], a["depends_on"])
-        self.assertIn("hpa_pinned_namespaces", " ".join(a["steps"]))
-        self.assertIn(self.NS, a["title"] + a["scope"] + a["evidence"] + " ".join(a["steps"]))
+        self.assertIn("v1.0.71", " ".join(a["steps"])); self.assertIn("v1.1.28", " ".join(a["steps"]))
+        self.assertIn("HPA tab", " ".join(a["steps"]))
+        self.assertIn("never changes them", " ".join(a["steps"]))
+        L = self.prod["lanes"]["controller"]
+        pc = Plan(self.cfg, self.F)
+        base = L["pot_eligible"] if L["pot_eligible"] is not None else L["pot"]
+        self.assertEqual(pc.pot_ctl(self.prod)[0], base)                    # nothing subtracted for HPAs any more
+        self.assertNotIn("hpa_hold", by)
+        waves = [x for x in self.S["actions"] if x["key"] in ("automation_proof", "automation_w2", "automation_w3")]
+        self.assertTrue(any("HPA automation" in " ".join(w["steps"]) for w in waves))
 
-    def test_waves_no_longer_count_hpa_held_savings(self):
-        S = Plan(self.cfg, self.F).build()
-        waves = [a for a in S["actions"] if a["key"] in ("automation_proof", "automation_w2", "automation_w3")]
-        held_uids = {f["uid"] for f in self.F if f["lanes"]["controller"].get("pot_hpa_hold", 0) >= 1}
-        for w in waves:
-            for f in self.F:
-                if f["uid"] in w["_uids" if "_uids" in w else "cluster_uids"] and f["uid"] in held_uids:
-                    L = f["lanes"]["controller"]
-                    self.assertLessEqual(w["savings_monthly_usd"], L["pot"] - L["pot_hpa_hold"] + 1e-6, w["id"])
-        proof = next(w for w in waves if w["key"] == "automation_proof")
-        if next(f for f in self.F if f["name"] == proof["cluster"])["lanes"]["controller"].get("n_hpa_hold"):
-            self.assertIn("pod CPU/memory HPAs held out", proof["scope"])
-
-    def test_achievable_total_is_moved_not_changed(self):
-        held = Plan(self.cfg, self.F).build()
+    def test_achievable_total_is_the_same_whether_or_not_hpas_are_pinned(self):
         pinned = Plan(self.cfg_p, self.F_p).build()
-        self.assertEqual(held["totals"]["achievable_now_monthly"], pinned["totals"]["achievable_now_monthly"])
-        self.assertNotIn("hpa_hold", {a["key"] for a in pinned["actions"]})   # released: nothing left to confirm
-        self.assertIn("hpa_hold", {a["key"] for a in held["actions"]})
+        self.assertEqual(self.S["totals"]["achievable_now_monthly"], pinned["totals"]["achievable_now_monthly"])
+        self.assertNotIn("hpa_automation", {a["key"] for a in pinned["actions"]})   # pinned HPAs need no HPA automation
 
-    def test_hpa_question_is_a_decision_valued_at_the_held_savings(self):
-        S = Plan(self.cfg, self.F).build()
-        a = next(x for x in S["actions"] if x["key"] == "hpa_hold")
-        d = next(x for x in S["decision_detail"] if x["text"].startswith("Are the HPAs"))
-        self.assertEqual(d["usd"], round(a["savings_monthly_usd"]))
-        self.assertEqual(d["group"], "Intent")
-        self.assertEqual(S["automation_gated"]["hpa_usd"], round(a["savings_monthly_usd"]))
-        self.assertNotIn("hpa_usd", {k for k, v in Plan(self.cfg_p, self.F_p).build()["automation_gated"].items() if v})
+    def test_hpa_decision_and_the_gated_split(self):
+        pot = sum(f["lanes"]["controller"]["pot_hpa"] for f in self.F)
+        d = next(x for x in self.S["decision_detail"] if x["text"].startswith("Can PerfectScale manage the HPAs"))
+        self.assertEqual(d["usd"], round(pot))
+        self.assertIn("v1.0.71", d["text"])
+        self.assertEqual(self.S["automation_gated"]["hpa_usd"], round(pot))
 
-    def test_exec_summary_splits_the_automation_decision_when_hpas_hold_the_money(self):
+    def test_exec_summary_decision_names_hpa_automation(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("node not installed")
         import copy, subprocess
-        S = copy.deepcopy(Plan(self.cfg, self.F).build())
-        S["automation_gated"].update(usd=10000, share=0.9, hpa_usd=8000)    # force the dominant case
+        S = copy.deepcopy(self.S)
+        S["automation_gated"].update(usd=10000, share=0.9, hpa_usd=8000)
         p = self._tmps[0] / "es.json"; out = self._tmps[0] / "es.html"
         p.write_text(json.dumps(S))
         r = subprocess.run([node, str(HERE.parent / "exec_summary.js"), str(p), str(out)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         t = out.read_text(encoding="utf-8")
-        self.assertIn("automation alone reaches $2,000 a month, and $8,000 a month more needs that answer.", t)
-        self.assertNotIn("waiting on that single decision", t)
-        S["automation_gated"]["hpa_usd"] = 0                                # no HPA hold: the old wording stands
-        p.write_text(json.dumps(S))
-        subprocess.run([node, str(HERE.parent / "exec_summary.js"), str(p), str(out)], check=True, capture_output=True)
-        self.assertIn("waiting on that single decision", out.read_text(encoding="utf-8"))
+        self.assertIn("with HPA automation alongside: $10,000 a month of the savings below waits on it, $8,000 of that on workloads whose HPAs scale on CPU or memory.", t)
+        self.assertNotIn("pinned", t)
 
-    # ---- "HPA pinned" confirmation on the kickoff page
-    def test_confirmed_namespace_is_generated_with_its_hpa_workloads_covered(self):
-        nss = self.prod["pov"]["namespaces"]
-        n = self.ns(self.prod)
-        types = list(n["hpa_auto"])
-        before = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types)
-        self.assertEqual(len(before), 1)                                    # prerequisite only: held, unconfirmed
-        after = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types, hpa_ok=[self.NS])
-        self.assertEqual(len(after), 2)
-        name, docs, text = after[1]
-        nh = sum(1 for x in n["excl"] if x["reason"] == "hpa" and x["type"] in types)
-        self.assertIn("# HPA min = max: confirmed on the kickoff page\n", text)
-        self.assertIn(f"# HPA workloads now covered: {nh}\n", text)
-        self.assertNotIn(pov.EXCL_REASON["hpa"], text)                      # no HPA exclusion survives
-        self.assertEqual(docs, 1 + sum(1 for x in n["excl"] if x["type"] in types and x["reason"] != "hpa"))
-        self.assertTrue(all(len(l) <= pov.WIDTH for l in text.splitlines() if l.startswith("#")))
+    # ---- CRDs
+    def test_namespace_file_gets_the_hpa_block_only_when_ready_and_ticked(self):
+        nss = self.prod["pov"]["namespaces"]; n = self.ns(self.prod); types = list(n["auto"])
+        opts = dict(pov.HPA_DEFAULTS, cpu_max=150, min_max=5)
+        on = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types, hpa={"on": [self.NS], "opts": opts})[1][2]
+        self.assertIn(f"# HPA automation: Enabled for {n['hpa']['n']} workload", on)
+        doc = on.split("kind: NamespaceAutomationConfig", 1)[1].split("\n---", 1)[0]
+        for line in ('    hpa:', '      operational:', '        automationMode: "Enabled"  # PerfectScale HPA automation',
+                     '          minReplicas:', '            min: 2  # lowest minReplicas PerfectScale writes', '            max: 5',
+                     '          cpuTrigger:', '            min: 80  # lowest CPU trigger (%) it writes', '            max: 150',
+                     '          memoryTrigger:'):
+            self.assertIn(line + "\n", doc + "\n")
+        self.assertEqual(doc.count("max:"), 2)                               # memory max left unset
+        self.assertTrue(all(len(l) <= pov.WIDTH for l in on.splitlines()))
+        off = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types, hpa={"on": [], "opts": opts})[1][2]
+        self.assertNotIn("HPA automation", off)                              # unticked: left alone, no note
+        try:
+            import yaml
+        except ImportError:
+            return
+        d = [x for x in yaml.safe_load_all(on) if x][0]
+        self.assertEqual(d["spec"]["automation"]["hpa"]["operational"]["restrictions"]["cpuTrigger"], {"enabled": True, "min": 80, "max": 150})
 
-    def test_confirmation_drops_only_hpa_exclusions_in_a_partly_held_namespace(self):
-        n = {"ns": "mixed", "managed": False, "held": False,
-             "auto": {"Deployment": {"n": 1, "pot": 5.0, "risk": 0, "waste": 6.0}},
-             "hpa_auto": {"Deployment": {"n": 1, "pot": 9.0, "risk": 0, "waste": 9.0}},
-             "excl": [{"name": "h1", "type": "Deployment", "reason": "hpa", "pot": 9.0},
-                      {"name": "j1", "type": "Deployment", "reason": "jvm", "pot": 1.0}]}
-        txt = lambda ok: pov.bundle_ns("c", "2026-11-20", [n], ["mixed"], ["Deployment"], hpa_ok=ok)[1][2]  # noqa: E731
-        self.assertIn("h1", txt([])); self.assertIn("j1", txt([]))
-        self.assertNotIn('name: "h1"', txt(["mixed"]).split("kind: NamespaceAutomationConfig")[1])
-        self.assertIn("j1", txt(["mixed"]))
-        self.assertEqual(pov.ns_auto(n, ["mixed"])["Deployment"]["n"], 2)
-        self.assertEqual(n["auto"]["Deployment"]["n"], 1)                   # the model's figures are untouched
+    def test_cluster_prerequisite_keeps_hpa_automation_off_at_cluster_scope(self):
+        self.assertIn('    hpa:\n      operational:\n        automationMode: "Disabled"\n', pov.cluster_doc())
 
-    def test_workload_file_records_the_confirmation_only_for_confirmed_hpa_rows(self):
+    def test_workload_files_get_the_block_for_hpa_rows_only(self):
         rows = self.prod["pov"]["rows"]
-        hold = next((r for r in rows if r["hpa_class"] == "pod_resource"), None)
-        self.assertIsNotNone(hold, "fixture should rank an HPA-held workload")
-        plain = pov.bundle("prod-a", "2026-11-20", rows, [hold["type"]], {hold["rank"]})[1][2]
-        conf = pov.bundle("prod-a", "2026-11-20", rows, [hold["type"]], {hold["rank"]}, hpa_ok=[hold["ns"]])[1][2]
-        self.assertNotIn("HPA min = max", plain)
-        self.assertIn("# HPA min = max: confirmed on the kickoff page\n", conf)
-        other = next((r for r in rows if r["hpa_class"] != "pod_resource"), None)
-        if other:
-            self.assertNotIn("HPA min = max", pov.bundle("prod-a", "2026-11-20", rows, [other["type"]], {other["rank"]}, hpa_ok=[other["ns"]])[1][2])
+        h = next(r for r in rows if r["hpa_class"] == "pod_resource")
+        o = next(r for r in rows if r["hpa_class"] != "pod_resource")
+        arg = {"on": [h["ns"], o["ns"]], "opts": pov.HPA_DEFAULTS}
+        self.assertIn("    hpa:", pov.bundle("prod-a", "2026-11-20", rows, [h["type"]], {h["rank"]}, hpa=arg)[1][2])
+        self.assertNotIn("HPA automation", pov.bundle("prod-a", "2026-11-20", rows, [o["type"]], {o["rank"]}, hpa=arg)[1][2])
 
-    def test_pinned_line_is_the_tenant_config_entry(self):
-        self.assertEqual(pov.pinned_line(["payments", "a.b"]), '"hpa_pinned_namespaces": ["^payments$", "^a\\\\.b$"]')
-        cfg = json.loads("{" + pov.pinned_line(["payments"]) + "}")
-        self.assertEqual(cfg["hpa_pinned_namespaces"], ["^payments$"])
-
-    def test_browser_builders_match_python_with_confirmations(self):
+    def test_browser_builders_match_python_with_hpa_automation(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("node not installed")
         import subprocess
         nss = self.prod["pov"]["namespaces"]; rows = self.prod["pov"]["rows"]
         D = pov.page_data("prod-a", "2026-11-20", rows, nss)
-        allns = [n["ns"] for n in nss]
-        sel = list(model.POV_CR_TYPES)
-        ns_cases = [(allns, sel, []), (allns, sel, [self.NS]), ([self.NS], ["Deployment"], [self.NS]), (allns, sel, [self.NS, "payments"])]
-        ranks = [r["rank"] for r in rows]
-        wl_cases = [(sel, ranks, []), (sel, ranks, [self.NS, "payments"])]
-        src = (pov.JS_BUILD + ";" + pov.JS_BUILD_NS + ";var D=" + json.dumps(D)
-               + ";var o={ns:" + json.dumps(ns_cases) + ".map(function(c){return psBuildNs(D,c[0],c[1],c[2])}),"
-               + "wl:" + json.dumps(wl_cases) + ".map(function(c){return psBuild(D,c[0],c[1],c[2])}),"
-               + "line:psPinnedLine(['payments','a.b'])};process.stdout.write(JSON.stringify(o))")
+        allns = [n["ns"] for n in nss]; sel = list(model.POV_CR_TYPES); ranks = [r["rank"] for r in rows]
+        full = dict(pov.HPA_DEFAULTS, min_max=4, cpu_max=140, mem_max=120)
+        hpas = [None, {"on": [self.NS], "opts": dict(pov.HPA_DEFAULTS)}, {"on": [self.NS], "opts": None}, {"on": allns, "opts": full}, {"on": [], "opts": full}]
+        src = (pov.JS_HPA + ";" + pov.JS_BUILD + ";" + pov.JS_BUILD_NS + ";var D=" + json.dumps(D) + ";var H=" + json.dumps(hpas)
+               + ";var o={ns:H.map(function(h){return psBuildNs(D," + json.dumps(allns) + "," + json.dumps(sel) + ",h)}),"
+               + "wl:H.map(function(h){return psBuild(D," + json.dumps(sel) + "," + json.dumps(ranks) + ",h)})};process.stdout.write(JSON.stringify(o))")
         got = json.loads(subprocess.run([node, "-e", src], capture_output=True, text=True, check=True).stdout)
-        for (ck, s, ok), js in zip(ns_cases, got["ns"]):
-            py = pov.bundle_ns("prod-a", "2026-11-20", nss, ck, s, hpa_ok=ok)
-            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"ns case {ok}")
-        for (s, tk, ok), js in zip(wl_cases, got["wl"]):
-            py = pov.bundle("prod-a", "2026-11-20", rows, s, set(tk), hpa_ok=ok)
-            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"wl case {ok}")
-        self.assertEqual(got["line"], pov.pinned_line(["payments", "a.b"]))
+        for h, js in zip(hpas, got["ns"]):
+            py = pov.bundle_ns("prod-a", "2026-11-20", nss, allns, sel, hpa=h)
+            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"ns {h}")
+        for h, js in zip(hpas, got["wl"]):
+            py = pov.bundle("prod-a", "2026-11-20", rows, sel, set(ranks), hpa=h)
+            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"wl {h}")
+
+    # ---- page
+    def test_page_has_the_hpa_section_inputs_and_optional_script(self):
+        files = render.write_all(self.cfg, self.S, self.F)
+        t = next(p for p in files if "-prod-a-pov-automation-kickoff" in p.name).read_text(encoding="utf-8")
+        for x in ("<h2>HPA automation</h2>", "<h3>What HPA automation will change</h3>", "<h3>What stays with the owners</h3>",
+                  "id=hpaagent", "id=hpaexporter", "id=hpak133", "id=hpaminfloor value='2'", "id=hpacpumin value='80'",
+                  "id=hpamemmin value='80'", "id=hpacpumax value=''", f"class=hpaon value='{self.NS}' checked",
+                  "If the customer agrees to share their HPA and PDB settings", "kubectl get hpa,pdb --all-namespaces -o json",
+                  "kubectl version", "grep -i perfectscale"):
+            self.assertIn(x, t)
+        for gone in ("hpack", "HPA pinned (min = max)", "Update the plan with these confirmations", "data-g=hold"):
+            self.assertNotIn(gone, t)
+        # By namespace and Findings by workload are collapsed rollups; a row expands to its notes.
+        sec = t.split("<h2>HPA automation</h2>", 1)[1].split("<details class=hpascript>", 1)[0]
+        self.assertIn("<details class=hparoll><summary>By namespace (", sec)
+        has_f = any(x["findings"] for x in self.ns(self.prod)["hpa"]["items"])
+        self.assertEqual("<details class=hparoll><summary>Findings by workload (" in sec, has_f)   # only when there is something to say
+        self.assertNotIn("<details class=hparoll open", sec)
+        byns = sec.split("By namespace (", 1)[1].split("</details>", 1)[0]
+        self.assertIn(f"class=nstog aria-expanded=false>{self.NS}</button>", byns)
+        self.assertRegex(byns, r"<tr class=nsdet data-for='h\d+' hidden>")
+
+        # Generated output: one rollup per CRD type, Karpenter and bin packing ready for when they exist.
+        self.assertIn("<div id=outgroups></div>", t)
+        for title in ("Pod automation - workload CRDs", "Pod automation - namespace CRDs", "'hpa','HPA automation'", "'karpenter','Karpenter'", "'binpacking','Bin packing'"):
+            self.assertIn(title, t)
+        self.assertLess(t.index("<h2>Namespace scope</h2>"), t.index("<h2>HPA automation</h2>"))
+        ok, errs = verify.verify(self.cfg, self.S, self.F, files)
+        self.assertEqual(errs, [])
+        self.assertTrue(any("HPA automation section with prerequisites" in m for m in ok))
+
+    def test_pinned_override_takes_workloads_out_of_hpa_automation(self):
+        rows = [r for r in self.prod_p["pov"]["rows"] if r["ns"] == self.NS]
+        self.assertTrue(rows)
+        self.assertTrue(all(r["hpa_class"] == "pinned" and r["wave"] in ("1", "1b") for r in rows))
+        self.assertTrue(all("pinned (min = max, confirmed)" in r["hpa_detail"] for r in rows))
+        self.assertFalse((self.ns(self.prod_p).get("hpa") or {}).get("n"))
+        self.assertNotIn(self.NS, self.prod_p["pov"]["hpa_scope"]["namespaces"])
 
     def test_pinned_override_touches_only_listed_namespaces(self):
-        # The default fixture's own HPA-free namespaces are untouched either way.
         before = {r["name"]: r["hpa_class"] for r in self.prod["pov"]["rows"] if r["ns"] != self.NS}
         after = {r["name"]: r["hpa_class"] for r in self.prod_p["pov"]["rows"] if r["ns"] != self.NS}
         self.assertEqual({k: before[k] for k in before.keys() & after.keys()}, {k: after[k] for k in before.keys() & after.keys()})
@@ -354,7 +371,7 @@ class Enriched(unittest.TestCase):
 
     def test_waves(self):
         r = self.rows
-        self.assertEqual(r["api-0"]["wave"], "Hold")
+        self.assertEqual(r["api-0"]["wave"], "1h")                     # pod CPU HPA: with HPA automation alongside
         self.assertEqual(r["api-1"]["wave"], "Review")
         self.assertEqual(r["api-3"]["wave"], "Review")                # automation not supported
         self.assertEqual(r["api-2"]["wave"], "1")
@@ -363,14 +380,11 @@ class Enriched(unittest.TestCase):
         sts = next(x for x in self.rows.values() if x["type"] == "StatefulSet")
         self.assertEqual(sts["wave"], "1b")
 
-    def test_constant_replicas_on_a_held_row_is_a_hint_not_a_promotion(self):
-        r = dict(self.rows["api-0"])
-        self.assertEqual(r["wave"], "Hold")
-        r["replicas"], r["replicas_max"] = 2, 2
-        self.assertIn("may be pinned", " ".join(pov.review_notes(r)))
-        self.assertFalse(pov.default_ticked(r))
-        r["replicas_max"] = 5
-        self.assertNotIn("may be pinned", " ".join(pov.review_notes(r)))
+    def test_hpa_row_is_automated_with_hpa_automation(self):
+        r = self.rows["api-0"]
+        self.assertIn("HPA on pod CPU/memory: switch on HPA automation with it", pov.review_notes(r))
+        self.assertEqual(pov.default_ticked(r), r["waste"] >= pov.AUTOMATION_MIN_USD)
+        self.assertEqual(pov.wave_label(r), "Wave 1 + HPA automation")
 
     def test_automation_status_becomes_eligibility_without_a_browser_file(self):
         self.assertEqual(self.prod["eligibility"]["source"], "api_v2")
@@ -378,31 +392,44 @@ class Enriched(unittest.TestCase):
         self.assertFalse(self.dev["eligibility"]["provided"])          # no v2 file for dev-b
         self.assertTrue(self.prod["api_v2"]["provided"])
 
-    def test_pod_level_hpa_is_kept_out_of_its_namespace_config(self):
-        ns = next(n for n in self.prod["pov"]["namespaces"] if n["ns"] == "payments")
-        self.assertIn(("api-0", "hpa"), {(x["name"], x["reason"]) for x in ns["excl"]})
-        files = pov.bundle_ns("prod-a", "2026-11-20", self.prod["pov"]["namespaces"], ["payments"], ["Deployment"])
-        self.assertIn("pod-level CPU/memory HPA", files[1][2])
+    def test_pod_level_hpa_rides_along_with_an_hpa_block(self):
+        nss = self.prod["pov"]["namespaces"]
+        ns = next(n for n in nss if n["ns"] == "payments")
+        self.assertNotIn("api-0", {x["name"] for x in ns["excl"]})      # no longer kept out
+        self.assertIn("api-0", {i["name"] for i in ns["hpa"]["items"]})
+        on = pov.bundle_ns("prod-a", "2026-11-20", nss, ["payments"], ["Deployment"], hpa={"on": ["payments"], "opts": pov.HPA_DEFAULTS})[1][2]
+        self.assertIn("# HPA automation: Enabled for 1 workload with a pod CPU/memory HPA", on)
+        self.assertIn('    hpa:\n      operational:\n        automationMode: "Enabled"', on)
+        off = pov.bundle_ns("prod-a", "2026-11-20", nss, ["payments"], ["Deployment"], hpa={"on": ["payments"], "opts": None})[1][2]
+        self.assertIn("# HPA automation: not included for 1 workload", off)
+        self.assertNotIn("    hpa:", off)
+        bare = pov.bundle_ns("prod-a", "2026-11-20", nss, ["payments"], ["Deployment"])[1][2]
+        self.assertNotIn("HPA automation", bare)
 
-    def test_page_holds_and_reviews_start_unticked_and_verify_passes(self):
+    def test_page_ticks_hpa_rows_reviews_start_unticked_and_verify_passes(self):
         S = Plan(self.cfg, self.F).build()
         files = render.write_all(self.cfg, S, self.F)
         page = next(p for p in files if "-prod-a-pov-automation-kickoff" in p.name).read_text()
-        for name in ("api-0", "api-1", "api-3"):
+        for name in ("api-1", "api-3"):
             self.assertNotIn(f"class=wlck value='{self.rows[name]['rank']}' checked", page, name)
         self.assertIn(f"class=wlck value='{self.rows['billing']['rank']}' checked", page)
         self.assertIn("public API v2", page)
-        # Each wave group holds only its own rows, Review and Hold start collapsed.
-        self.assertIn("<details class=wgrp data-g=hold>", page)
-        hold = page.split("<details class=wgrp data-g=hold>", 1)[1].split("</details>", 1)[0]
-        self.assertIn(">api-0</button>", hold)
-        self.assertNotIn(">billing</button>", hold)
+        # Each wave group holds only its own rows; HPA rows sit under "Ready with HPA automation".
+        self.assertIn("<details class=wgrp data-g=hpa>", page)
+        grp = page.split("<details class=wgrp data-g=hpa>", 1)[1].split("</details>", 1)[0]
+        self.assertIn(">api-0</button>", grp)
+        self.assertNotIn(">billing</button>", grp)
+        self.assertNotIn("data-g=hold", page)
         self.assertIn("HPA triggers: CPU 70%", page)                      # full triggers in the detail row
+        self.assertIn("Raise the CPU trigger from 70% to 80%", page)       # a finding worked out from the data
+        fbw = page.split("<details class=hparoll><summary>Findings by workload (", 1)[1].split("</details>", 1)[0]
+        self.assertIn("<td class=wnote>CPU trigger 70% \u2192 80%</td>", fbw)   # summary column: the short label
+        self.assertRegex(fbw, r"<tr class=nsdet data-for='f\d+' hidden>.*Raise the CPU trigger from 70% to 80%")   # full note on click
         dev_page = next(p for p in files if "-dev-b-pov-automation-kickoff" in p.name).read_text()
         self.assertIn("HPA data was not collected", dev_page)
         ok, errs = verify.verify(self.cfg, S, self.F, files)
         self.assertEqual(errs, [])
-        self.assertTrue(any("no Hold or Review workload" in m for m in ok))
+        self.assertTrue(any("no workload is put on Hold" in m for m in ok))
 
     def test_v2_file_change_invalidates_the_model_cache(self):
         c = self.cfg.data("prod-a")

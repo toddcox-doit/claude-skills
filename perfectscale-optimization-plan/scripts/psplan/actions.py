@@ -26,9 +26,9 @@ FIT = {"automation_proof": "PodFit", "automation_w2": "PodFit", "automation_w3":
        "stale_optout": "InfraFit", "pdb": "InfraFit", "unevictable_affinity": "InfraFit", "local_storage": "InfraFit", "pool_shrink_blocked": "InfraFit", "pool_shrink_free": "InfraFit",
        "pool_machine_recs": "InfraFit", "autoprov_review": "InfraFit", "gpu_cap": "InfraFit", "commitments": "InfraFit", "review_cadence": "Governance", "rerun": "Governance",
        "pool_flex": "InfraFit", "autoscaler_labels": "InfraFit", "jvm_rightsize": "PodFit", "pool_karpenter_tuning": "InfraFit",
-       "binpacking": "InfraFit", "hpa_hold": "PodFit"}
+       "binpacking": "InfraFit", "hpa_automation": "PodFit"}
 # What an action is about, for the reader: the plan's Actions table filters on this.
-TOPIC = {"automation_proof": "Automation", "automation_w2": "Automation", "automation_w3": "Automation", "default_policy": "Automation", "hpa_hold": "Automation",
+TOPIC = {"automation_proof": "Automation", "automation_w2": "Automation", "automation_w3": "Automation", "default_policy": "Automation", "hpa_automation": "Automation",
          "replicated_grouping": "Automation", "job_grouping": "Automation",
          "job_rightsize": "Right-sizing", "stateful_manual": "Right-sizing", "heldout_manual": "Right-sizing", "jvm_rightsize": "Right-sizing",
          "oom_fix": "Resiliency", "underprov_other": "Resiliency", "memory_limits": "Resiliency",
@@ -41,7 +41,7 @@ TOPIC = {"automation_proof": "Automation", "automation_w2": "Automation", "autom
 # Question groups for the customer conversation, matched on the start of each question.
 DECISION_GROUPS = [("Who owns", "Ownership"), ("Are the minimum sizes", "Ownership"), ("Are the do-not-evict", "Intent"), ("Does every environment", "Intent"),
                    ("Is the headroom", "Intent"), ("The workloads kept out", "Intent"), ("Is automation enabled", "Access and constraints"), ("Do the node pools", "Ownership"),
-                   ("Which of these workloads", "Intent"), ("Are the HPAs", "Intent")]
+                   ("Which of these workloads", "Intent"), ("Can PerfectScale manage the HPAs", "Access and constraints")]
 # How the dollar figure was produced: computed = PerfectScale workload savings; estimate = PerfectScale machine-type estimate;
 # ceiling = a pool's total idle cost (assumes idle falls to zero, which never fully happens); spend = money to add.
 KIND = {"pool_machine_recs": "estimate", "pool_shrink_blocked": "ceiling", "pool_shrink_free": "ceiling", "oom_fix": "spend", "underprov_other": "spend"}
@@ -265,18 +265,18 @@ class Plan:
         flat = {o for l in owners_lists for o in l if o}
         return len(flat) >= 2
 
-    def ctl_namespaces(self, fs, k=3, held=False):
+    def ctl_namespaces(self, fs, k=3, hpa_only=False):
         """Top namespaces by long-running-controller savings across clusters `fs`.
 
         Automation actions used to say only "228 long-running controllers", so the namespace holding
         most of the money (often one namespace carries a large share of all workload savings) never
         appeared in the action table, the executive summary or a session board built from action
-        titles. `held=False` covers what automation can reach now; `held=True` covers only workloads
-        behind a pod CPU/memory HPA. Returns (top [(ns, usd)], share of the total, lead share)."""
+        titles. `hpa_only=True` covers only workloads behind a pod CPU/memory HPA.
+        Returns (top [(ns, usd)], share of the total, lead share)."""
         agg = collections.Counter()
         for f in fs:
             for c in f["controllers"]:
-                if (c.get("hpa") == "pod_resource") != held:
+                if hpa_only and c.get("hpa") != "pod_resource":
                     continue
                 agg[c["ns"]] += c["pot"] or 0          # already scaled to the 30-day run-rate
         tot = sum(v for v in agg.values() if v > 0)
@@ -297,20 +297,19 @@ class Plan:
         return title, scope, ev, step
 
     def pot_ctl(self, f):
-        """Controller savings automation can reach by switching on: eligible ones, less those behind a
-        pod CPU/memory HPA. Those are carried by the HPA confirmation action instead, so the waves and
-        the POV kickoff page agree on what is held."""
+        """Controller savings automation can reach by switching on. Workloads behind a pod CPU/memory
+        HPA count too: they are automated with PerfectScale's HPA automation alongside (see
+        r_hpa_automation), as PerfectScale's own guidance is to right-size first, then keep the HPA
+        aligned - not to hold them back."""
         L = f["lanes"]["controller"]
-        pot, obs = (L["pot_eligible"], L["pot_eligible_o"]) if L["pot_eligible"] is not None else (L["pot"], L["pot_o"])
-        return pot - L.get("pot_hpa_hold", 0.0), obs - L.get("pot_hpa_hold_o", 0.0)
+        return (L["pot_eligible"], L["pot_eligible_o"]) if L["pot_eligible"] is not None else (L["pot"], L["pot_o"])
 
     def n_ctl(self, f):
-        L = f["lanes"]["controller"]
-        return L["n"] - L.get("n_hpa_hold", 0)
+        return f["lanes"]["controller"]["n"]
 
     # ------------------------------------------------------------------ rules
     def build(self):
-        for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_replicated_grouping, self.r_automation, self.r_hpa_hold,
+        for rule in (self.r_autoscaler_labels, self.r_pool_flex, self.r_replicated_grouping, self.r_automation, self.r_hpa_automation,
                      self.r_memory_limits, self.r_oom, self.r_jvm,
                      self.r_grouping, self.r_stale_optout, self.r_pdb, self.r_unevictable_affinity,
                      self.r_job_rightsize, self.r_stateful, self.r_pool_actions, self.r_pool_karpenter_tuning, self.r_binpacking, self.r_autoprov, self.r_gpu, self.r_underprov,
@@ -335,10 +334,10 @@ class Plan:
         hold_txt = "Hold out the platform-managed add-ons (kube-system and similar - the platform reconciles those manifests, so any change is reverted)"
         if stateful_n:
             hold_txt += f" and the {stateful_n} stateful search and streaming workloads (see the manual right-sizing action)"
-        hpa_n = sum(f["lanes"]["controller"].get("n_hpa_hold", 0) for f in self.F)
-        if hpa_n:
-            hold_txt += f"{',' if stateful_n else ''} and the {hpa_n} workloads behind an HPA that scales on pod CPU or memory (see the HPA confirmation action)"
         hold_txt += "."
+        hpa_n = sum(f["lanes"]["controller"].get("n_hpa", 0) for f in self.F)
+        hpa_step = (f"Switch on PerfectScale's HPA automation in the same configs for the {hpa_n} workloads whose HPA scales on pod CPU or memory, "
+                    "so their triggers and minReplicas stay aligned as requests shrink (see the HPA automation action)." if hpa_n else None)
         if proven:
             a = proof["audit"]
             ptitle = f"Widen automation beyond {proof['name']}, where it has already run"
@@ -352,7 +351,7 @@ class Plan:
         top = [c["name"] for c in proof["controllers"][:3]]
         p_tsuf, p_ssuf, p_ev, p_step = self.ns_texts([proof])
         pa = self.add("automation_proof", action_type="automation_enable_policy", title=ptitle + p_tsuf, cluster=proof["name"],
-                      scope=f"{self.n_ctl(proof)} long-running controllers{p_ssuf}; managed add-ons" + (" and pod CPU/memory HPAs" if proof["lanes"]["controller"].get("n_hpa_hold") else "") + " held out",
+                      scope=f"{self.n_ctl(proof)} long-running controllers{p_ssuf}; managed add-ons"  + " held out",
                       savings_monthly_usd=p_pot, obs=p_obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
                       effort_tier=effort("XS", esc_unconf)[0], effort_rationale=effort("XS", esc_unconf)[1],
                       change_risk="low", owner_role="ps-admin", phase=1, _uids=[proof["uid"]],
@@ -360,13 +359,14 @@ class Plan:
                           f"Open the Automation page for {proof['name']}. If it offers settings, automation is available and this is a toggle; if it offers 'Request Access', that is the first thing to resolve.",
                           p_step,
                           hold_txt,
+                          hpa_step if proof["lanes"]["controller"].get("n_hpa") else None,
                           f"Enable automation on two or three low-risk controllers first - {human_list(top)}." if top else "Enable automation on two or three low-risk controllers first.",
                           "Let one full optimization window run, then widen to the rest of the cluster's controllers.",
                           "Verify: a new entry appears in the automation audit log within 24h, and it shows in-place resizes rather than evictions."] if x],
                       verification="New automation audit-log entries appear within 24h; in-place resizes, not evictions",
                       evidence=pev + f" {usd(p_pot)}/mo of its computed savings is on long-running controllers automation can reach now" + (f"; a further {usd(proof['lanes']['managed']['pot'])}/mo sits on platform-managed add-ons that are not claimed." if proof["lanes"]["managed"]["pot"] >= 1 else ".")
-                      + (f" Another {usd(proof['lanes']['controller']['pot_hpa_hold'])}/mo is behind HPAs that scale on pod CPU or memory and is carried by the HPA confirmation action, not this one."
-                         if proof["lanes"]["controller"].get("pot_hpa_hold", 0) >= 1 else "") + p_ev)
+                      + (f" {usd(proof['lanes']['controller']['pot_hpa'])}/mo of it is on workloads whose HPA scales on pod CPU or memory, automated with HPA automation alongside."
+                         if proof["lanes"]["controller"].get("pot_hpa", 0) >= 1 else "") + p_ev)
         rest = sorted([f for f in with_pot if f["name"] != proof["name"]], key=lambda f: -self.pot_ctl(f)[0])
         if rest:
             tot = sum(self.pot_ctl(f)[0] for f in rest)
@@ -407,6 +407,7 @@ class Plan:
                                 group_step,
                                 w_step,
                                 hold_txt,
+                                hpa_step if any(f["lanes"]["controller"].get("n_hpa") for f in grp) else None,
                                 f"Enable in descending order of value: {prio}.",
                                 "Watch the execution mode on the first window. Expect in-place resizes; if you see evictions instead, pause and re-check.",
                                 "Verify: pod waste falls on the enabled controllers and the audit log shows in-place resizes."] if x],
@@ -416,49 +417,56 @@ class Plan:
                                   (" - small beside the job opportunity, which is why automation is not the main lever on this tenant." if self.job_pot_total() > pot * 2 else ".") + w_ev)
                 prev = key
 
-    def r_hpa_hold(self):
-        """Savings on long-running controllers behind an HPA that scales on pod CPU or memory.
+    def r_hpa_automation(self):
+        """Workloads whose HPA scales on pod CPU or memory ride in the automation waves, with
+        PerfectScale's HPA automation switched on alongside. PerfectScale sizes their request from
+        the HPA trigger (about 1.25x observed usage at an 80% trigger), so right-sizing keeps the
+        scaling point where the load is, and its HPA automation then keeps minReplicas and the
+        CPU/memory triggers aligned as requests change. PerfectScale's own guidance: right-size first,
+        then keep the HPA aligned - not hold the workload back.
 
-        A smaller request raises measured utilization, so the HPA can add replicas and eat the saving;
-        the POV kickoff page puts these on Hold. The automation waves claim only what switching on can
-        reach (pot_ctl), and this action carries the rest, so the plan and the page tell one story and
-        the achievable total is unchanged. The public API has no HPA min/max: flat replica counts lift
-        confidence to medium, never higher, because an HPA that never crosses its target looks the same."""
-        fs = [f for f in self.F if f["lanes"]["controller"].get("pot_hpa_hold", 0) >= 1]
+        Carries no dollars of its own - the savings are in the waves - and names what the HPA
+        automation will change, worked out from the data (model.hpa_analysis). The HPA's
+        minReplicas/maxReplicas are not in the public API: minReplicas is flagged as a hint only and
+        PodFit's HPA tab has the exact value. maxReplicas and scaling behaviour are never changed."""
+        fs = [f for f in self.F if f["lanes"]["controller"].get("n_hpa", 0)]
         if not fs:
             return
-        pot = sum(f["lanes"]["controller"]["pot_hpa_hold"] for f in fs)
-        obs = sum(f["lanes"]["controller"]["pot_hpa_hold_o"] for f in fs)
-        n = sum(f["lanes"]["controller"]["n_hpa_hold"] for f in fs)
-        held = [c for f in fs for c in f["controllers"] if c.get("hpa") == "pod_resource"]
-        flat = sum(1 for c in held if c.get("flat"))
-        flat_share = flat / len(held) if held else 0.0
-        conf = "medium" if flat_share >= 0.8 else "low"
-        top, share, lead = self.ctl_namespaces(fs, held=True)
-        ns_all = sorted({c["ns"] for c in held})
-        owners = [[c["owner"] for c in held]]
-        t, r = effort("S", ["cross-team - the HPAs belong to several namespace owners"] if len(ns_all) >= 3 and self.cross_team(owners) else [])
-        listed = human_list(f"{ns} ({usd(v)}/mo)" for ns, v in top)
+        pot = sum(f["lanes"]["controller"]["pot_hpa"] for f in fs)
+        n = sum(f["lanes"]["controller"]["n_hpa"] for f in fs)
+        items = [i for f in fs for ns in (f.get("pov") or {}).get("namespaces", []) if ns.get("hpa") for i in ns["hpa"]["items"]]
+        kinds = lambda i: {x["kind"] for x in i["findings"]}  # noqa: E731
+        ch = sum(1 for i in items if "change" in kinds(i))
+        rp = sum(1 for i in items if "report" in kinds(i))
+        mn = sum(1 for i in items if "min" in kinds(i))
+        top, share, lead = self.ctl_namespaces(fs, hpa_only=True)
         lead_ns = top[0][0] if top else None
-        title = "Confirm whether the pod CPU/memory HPAs are pinned before automating the workloads behind them" + (f" - mostly {lead_ns}" if lead >= 0.5 else "")
-        deps = ["automation_proof"] if self.has("automation_proof") else []
-        self.add("hpa_hold", action_type="hpa_confirm_pinned", title=title, cluster=self.names(fs),
-                 scope=f"{n} long-running controllers in {plural(len(ns_all), 'namespace')}" + (f", {pct(lead * 100, 100)} of the value in {lead_ns}" if lead_ns and lead >= 0.25 else ""),
-                 savings_monthly_usd=pot, obs=obs, savings_basis="achievable_now", confidence=conf, lane="toggle", gated_on_automation=True,
-                 effort_tier=t, effort_rationale=r + " - a configuration question per namespace, then the same toggle as the waves",
-                 change_risk="medium", owner_role="app-team", phase=2, depends_on=deps,
+        t, r = effort("S", [])
+        title = ("Switch on PerfectScale HPA automation with pod automation for the workloads whose HPA scales on CPU or memory"
+                 + (f" - mostly {lead_ns}" if lead >= 0.5 else ""))
+        found = (f"From the data, {plural(ch, 'workload')} would have a trigger changed, {plural(rp, 'workload')} "
+                 f"{'carries' if rp == 1 else 'carry'} a finding to review yourself, and {plural(mn, 'workload')} "
+                 f"{'holds' if mn == 1 else 'hold'} replicas flat at 3 or more, a minReplicas hint. ")
+        self.add("hpa_automation", action_type="hpa_automation_enable", title=title, cluster=self.names(fs),
+                 scope=f"{n} long-running controllers whose HPA scales on pod CPU or memory" + (f", {pct(lead * 100, 100)} of their value in {lead_ns}" if lead_ns and lead >= 0.25 else ""),
+                 savings_monthly_usd=0, savings_basis="achievable_now", confidence="high", lane="toggle", gated_on_automation=True,
+                 effort_tier=t, effort_rationale=r + " - a prerequisite check, then an hpa block in the same configs as pod automation",
+                 change_risk="medium", owner_role="ps-admin", phase=1,
+                 depends_on=["automation_proof"] if self.has("automation_proof") else [],
                  owner_hint=[ns for ns, _ in top], _uids=sorted({f["uid"] for f in fs}),
-                 steps=[f"List the HPAs in {human_list(ns_all[:4] + ([f'{len(ns_all) - 4} more namespaces'] if len(ns_all) > 4 else []))} and read each one's minReplicas and maxReplicas - start with {human_list(ns for ns, _ in top)}.",
-                        "Where minReplicas equals maxReplicas the HPA cannot scale, so a smaller request cannot move it: add the namespace to hpa_pinned_namespaces in the tenant config and regenerate, and its workloads join the automation waves.",
-                        "Where the HPA really scales, keep the workloads on hold, or agree with the owner to move the trigger to a container-resource metric or reset the utilization target alongside the resize.",
-                        "Verify: after the next plan run these workloads appear in an automation wave, and once automated their replica counts stay where they were."],
-                 verification="Released workloads appear in an automation wave on the next run; replica counts unchanged once automated",
-                 evidence=(f"{usd(pot)}/mo of computed savings ({pct(pot, self.pod_pot)} of everything PerfectScale found in scope) sits on {n} long-running controllers "
-                           "whose HPA scales on pod CPU or memory. A smaller request raises measured utilization, so the HPA can add replicas and take the saving back; "
-                           "that is why the POV kickoff page holds them and the automation waves do not count them. "
-                           + (f"By namespace, the largest shares are {listed}. " if top else "")
-                           + f"{pct(flat * 100, len(held) * 100)} of them kept a constant replica count over the window, a hint that the HPAs may be pinned (min = max) - "
-                           "the data cannot see the HPA's limits, so it has to be confirmed."))
+                 steps=["Confirm the prerequisites with the customer: the PerfectScale automation agent v1.0.71 or later and the exporter v1.1.28 or later on each cluster. "
+                        "HPA automation acts only on a workload running a revision PerfectScale automation created, so it follows pod automation.",
+                        "Turn it on in the same namespace and workload configs as pod automation: the POV kickoff page's HPA automation section adds the hpa block "
+                        "(minReplicas floor 2, CPU and memory trigger floor 80% by default) once the prerequisites are ticked.",
+                        "Before widening, read the HPA tab in PodFit for these workloads: it shows the exact minReplicas and triggers PerfectScale will write, "
+                        "including the minReplicas changes the public API cannot show.",
+                        "Leave maxReplicas and scaling behaviour with the owners: PerfectScale never changes them. A workload that stays at maxReplicas is a scaling question, not a sizing one.",
+                        "Verify: kubectl describe hpa shows HpaAutomationApplied events, and replica counts follow load after the new requests roll out."],
+                 verification="HpaAutomationApplied events on the HPAs; replica counts follow load after the new requests",
+                 evidence=(f"{usd(pot)}/mo of the automation waves' savings ({pct(pot, self.pod_pot)} of everything PerfectScale found in scope) is on {n} long-running controllers "
+                           "whose HPA scales on pod CPU or memory. PerfectScale sizes their requests from the HPA trigger, so right-sizing keeps the scaling point where the load is; "
+                           "its HPA automation then keeps minReplicas and the triggers aligned as requests change. " + found
+                           + "This action carries no dollars of its own: the savings are counted in the automation waves."))
 
     def job_pot_total(self):
         return sum(f["lanes"]["job"]["pot"] for f in self.F)
@@ -1362,7 +1370,7 @@ class Plan:
         gated = sum(by[i]["savings_monthly_usd"] or 0 for i in gated_ids if by[i]["savings_basis"] == "achievable_now")
         # Of the automation-gated savings, the part that also waits on confirming pod CPU/memory HPAs
         # are pinned: switching automation on alone does not reach it.
-        gated_hpa = sum(a["savings_monthly_usd"] or 0 for a in A if a["key"] == "hpa_hold" and a["savings_basis"] == "achievable_now")
+        gated_hpa = sum(f["lanes"]["controller"].get("pot_hpa", 0) for f in self.F) if any(a["key"] == "hpa_automation" for a in A) else 0
         ach = tot["achievable_now"]
         lanes = collections.Counter()
         for a in A:
@@ -1510,10 +1518,10 @@ class Plan:
         if "automation_proof" in by_key:
             add("Is automation enabled for the clusters in scope, and who can switch it on? " + ("The audit log is empty everywhere. " if not any(f["audit"]["n"] for f in self.F) else "") + "If the Automation page offers 'Request Access', that is the gate.",
                 val(["automation_proof", "automation_w2", "automation_w3"]))
-        if "hpa_hold" in by_key:
-            h = by_key["hpa_hold"]
-            add(f"Are the HPAs that scale workloads on pod CPU or memory pinned (minReplicas = maxReplicas)? They cover {h['scope']}.",
-                val(["hpa_hold"]), "saving", "computed savings that also need automation switched on")
+        if "hpa_automation" in by_key:
+            h = by_key["hpa_automation"]
+            add(f"Can PerfectScale manage the HPAs on {h['scope']}? HPA automation needs the automation agent v1.0.71 or later and the exporter v1.1.28 or later.",
+                sum(f["lanes"]["controller"].get("pot_hpa", 0) for f in self.F), "saving", "savings in the automation waves that HPA automation keeps safe")
         if "job_rightsize" in by_key or "oom_fix" in by_key:
             add("Who owns the job resource configuration, and who approves memory increases? The OOM fix is spend; the likely figure is the place to start and the literal recommendation is a ceiling.",
                 val(["job_rightsize"]), "saving", "plus the resiliency spend, which is protection rather than saving")

@@ -100,6 +100,8 @@ class RunPlanPin(unittest.TestCase):
         try:
             cfgp = tenant(tmp)
             r = run(cfgp); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            v2 = json.loads(next((tmp / "reports" / "v2").glob("**/*-optimization-plan-*-v2.json")).read_text())
+            self.assertIn("hpa_automation", {a["key"] for a in v2["actions"]})       # unpinned: HPA automation needed
             r = run(cfgp, "--pin-hpa", HPA_NS)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn(f"HPA confirmed pinned: {HPA_NS}", r.stdout)
@@ -107,7 +109,7 @@ class RunPlanPin(unittest.TestCase):
             out = tmp / "reports" / "v3"
             self.assertTrue(list(out.glob("*-change-log-vs-previous-*-v3.md")))
             plan = json.loads(next(out.glob("**/*-optimization-plan-*-v3.json")).read_text())
-            self.assertNotIn("hpa_hold", {a["key"] for a in plan["actions"]})   # released: counted in the waves
+            self.assertNotIn("hpa_automation", {a["key"] for a in plan["actions"]})   # pinned: no HPA automation needed
             self.assertTrue(list((tmp / "reports" / "v2").glob("*")))           # the old version is untouched
             bad = run(cfgp, "--pin-hpa", "Not_A_Namespace")
             self.assertEqual(bad.returncode, 2); self.assertIn("not a Kubernetes namespace name", bad.stderr)
@@ -291,6 +293,177 @@ class TenantFolder(unittest.TestCase):
         self.assertTrue(L.is_file())
         r = subprocess.run([sys.executable, str(self.NEW_TENANT), "launcher", "--dir", str(self.tmp)], capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)                 # not a tenant folder
+
+
+def cr(kind, name, ns=None, extra=""):
+    meta = f'  name: "{name}"\n' + (f'  namespace: "{ns}"\n' if ns else "")
+    return f"apiVersion: perfectscale.io/v1\nkind: {kind}\nmetadata:\n{meta}spec:\n  automation: {{}}\n{extra}"
+
+
+def crd_set(nss, wl_extra=""):
+    """A namespace CRD set like the page generates: the cluster prerequisite plus one file per namespace."""
+    fs = [{"name": "acme-prod-a-cluster-automation-config.yaml", "text": "---\n" + cr("ClusterAutomationConfig", "cluster-automation-config")}]
+    for n in nss:
+        fs.append({"name": f"namespaces/{n}-namespace-automation-config.yaml",
+                   "text": "---\n" + cr("NamespaceAutomationConfig", "namespace-automation-config", n, wl_extra)})
+    return fs
+
+
+class CrdStore(unittest.TestCase):
+    """CRD history: append-only, every set kept, identical sets not stored twice, exact rollback deletes."""
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_save_history_changes_and_rollback_deletes(self):
+        from datetime import datetime, timezone
+        from psplan import crdstore as C
+        t = lambda h: datetime(2026, 11, 23, h, 0, 0, tzinfo=timezone.utc)  # noqa: E731
+        a = C.save(self.root, "acme-prod-a", "ns", crd_set(["shop", "pay"]), {"types": ["Deployment"]}, now=t(9))
+        self.assertFalse(a["unchanged"]); self.assertEqual(a["id"], "20261123-090000-ns")
+        self.assertTrue((self.root / "crds" / "acme-prod-a" / a["id"] / "namespaces" / "shop-namespace-automation-config.yaml").is_file())
+        same = C.save(self.root, "acme-prod-a", "ns", crd_set(["shop", "pay"]), now=t(10))
+        self.assertEqual(same, {"id": a["id"], "unchanged": True})                    # identical: not stored twice
+        b = C.save(self.root, "acme-prod-a", "ns", crd_set(["shop", "pay", "risk"], "  # tweak\n"), now=t(11))
+        c = C.save(self.root, "acme-prod-a", "ns", crd_set(["shop"]), now=t(12))
+        h = C.history(self.root, "acme-prod-a")
+        self.assertEqual([x["id"] for x in h], [c["id"], b["id"], a["id"]])          # newest first
+        mb = next(x for x in h if x["id"] == b["id"])
+        self.assertEqual(mb["previous"], a["id"])
+        self.assertEqual(mb["changes"]["added"], ["namespaces/risk-namespace-automation-config.yaml"])
+        self.assertEqual(len(mb["changes"]["changed"]), 2)                            # shop and pay picked up the tweak
+        mc = next(x for x in h if x["id"] == c["id"])
+        self.assertEqual(sorted(o[1] for o in mc["removed_objects"]), ["pay", "risk"])
+        self.assertNotIn("objects", mc)                                                # the listing stays light
+        # Rolling back from c (1 namespace) to b (3) deletes nothing; from b to a deletes risk's config only.
+        gb, ga, gc = (C.get(self.root, "acme-prod-a", x["id"]) for x in (b, a, c))
+        self.assertEqual(C.rollback_deletes(gb["objects"], gc["objects"]), [])
+        self.assertEqual(C.rollback_deletes(ga["objects"], gb["objects"]),
+                         ["kubectl delete namespaceautomationconfig namespace-automation-config -n risk"])
+        self.assertIn("apiVersion: perfectscale.io/v1", gb["texts"]["namespaces/risk-namespace-automation-config.yaml"])
+        r = C.mark(self.root, "acme-prod-a", b["id"], True)
+        self.assertTrue(r["handed"]); self.assertTrue(r["handed_at"])
+        self.assertTrue(next(x for x in C.history(self.root, "acme-prod-a") if x["id"] == b["id"])["handed"])
+        self.assertFalse(C.mark(self.root, "acme-prod-a", b["id"], False)["handed"])
+
+    def test_cluster_prerequisite_is_never_in_a_delete_list(self):
+        from psplan import crdstore as C
+        cur = [["ClusterAutomationConfig", "", "cluster-automation-config"], ["NamespaceAutomationConfig", "x", "namespace-automation-config"]]
+        self.assertEqual(C.rollback_deletes([], cur), ["kubectl delete namespaceautomationconfig namespace-automation-config -n x"])
+
+    def test_only_sets_the_page_generates_are_accepted(self):
+        from psplan import crdstore as C
+        ok = crd_set(["shop"])
+        bad = [("ns", [{"name": "../x.yaml", "text": ok[0]["text"]}]),
+               ("ns", [{"name": "/etc/passwd", "text": ok[0]["text"]}]),
+               ("ns", [{"name": "namespaces/../../x.yaml", "text": ok[0]["text"]}]),
+               ("ns", [{"name": "notes.txt", "text": ok[0]["text"]}]),
+               ("ns", [{"name": ok[1]["name"], "text": "hello"}]),               # not a PerfectScale CR
+               ("ns", [ok[1], ok[1]]),                                           # duplicate name
+               ("rm", ok), ("ns", [])]
+        for kind, files in bad:
+            with self.assertRaises(ValueError, msg=str(files)[:80]):
+                C.save(self.root, "acme-prod-a", kind, files)
+        for slug in ("../x", "Acme", ""):
+            with self.assertRaises(ValueError):
+                C.save(self.root, slug, "ns", ok)
+        with self.assertRaises(ValueError):
+            C.get(self.root, "acme-prod-a", "../../config")
+        self.assertFalse((self.root / "crds").exists() and any((self.root / "crds").rglob("*.yaml")))
+
+
+class CrdHistoryApi(unittest.TestCase):
+    """The helper's history endpoints: token and page required, cluster always from the page."""
+    @classmethod
+    def setUpClass(cls):
+        import kickoff
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.cfgp = tenant(cls.tmp)
+        r = run(cls.cfgp); assert r.returncode == 0, r.stdout + r.stderr
+        cls.h = kickoff.Helper(cls.cfgp)
+        threading.Thread(target=cls.h.httpd.serve_forever, daemon=True).start()
+        cls.page = cls.h.url_for(next(p for p in cls.h.pages() if "prod-a" in p.name))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.h.httpd.shutdown(); cls.h.httpd.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def req(self, method, path, body=None, token=True):
+        c = http.client.HTTPConnection("127.0.0.1", self.h.port, timeout=30)
+        hd = {"Host": f"127.0.0.1:{self.h.port}"}
+        if token:
+            hd["X-PS-Token"] = self.h.token
+        data = json.dumps(body).encode() if body is not None else None
+        if data:
+            hd["Content-Type"] = "application/json"
+        c.request(method, path, body=data, headers=hd)
+        r = c.getresponse(); out = r.read(); c.close()
+        return r.status, json.loads(out or b"{}")
+
+    def test_save_list_get_mark_and_rollback_through_the_helper(self):
+        from urllib.parse import quote
+        q = "page=" + quote(self.page)
+        s, r = self.req("POST", "/api/crd-save", {"page": self.page, "kind": "ns", "files": crd_set(["shop", "pay"]), "meta": {"types": ["Deployment"]}})
+        self.assertEqual(s, 200, r); first = r["id"]
+        slug = self.h.page_data(self.h.file_for(self.page))["slug"]
+        self.assertTrue((self.tmp / "crds" / slug / first / "manifest.json").is_file())   # filed under the page's cluster
+        s, r = self.req("POST", "/api/crd-save", {"page": self.page, "kind": "ns", "files": crd_set(["shop", "pay"])})
+        self.assertEqual(r, {"id": first, "unchanged": True})
+        import time as _t; _t.sleep(1.1)
+        s, r = self.req("POST", "/api/crd-save", {"page": self.page, "kind": "ns", "files": crd_set(["shop", "pay", "risk"])})
+        second = r["id"]
+        s, hist = self.req("GET", "/api/crd-history?" + q)
+        self.assertEqual(s, 200); self.assertEqual([x["id"] for x in hist["sets"]][:2], [second, first])
+        self.assertEqual(hist["sets"][0]["meta"]["plan_version"], "v2")                       # the helper adds the plan version
+        s, one = self.req("GET", f"/api/crd-set?{q}&id={first}")
+        self.assertEqual(sorted(one["texts"]), sorted(f["name"] for f in crd_set(["shop", "pay"])))
+        s, rb = self.req("GET", f"/api/crd-rollback?{q}&id={first}&from={second}")
+        self.assertEqual(rb["delete"], ["kubectl delete namespaceautomationconfig namespace-automation-config -n risk"])
+        s, mk = self.req("POST", "/api/crd-mark", {"page": self.page, "id": first, "handed": True})
+        self.assertEqual(s, 200); self.assertTrue(mk["handed"])
+
+    def test_refuses_without_token_page_or_with_bad_files(self):
+        good = {"page": self.page, "kind": "ns", "files": crd_set(["shop"])}
+        self.assertEqual(self.req("POST", "/api/crd-save", good, token=False)[0], 403)
+        self.assertEqual(self.req("GET", "/api/crd-history?page=x", token=False)[0], 403)
+        self.assertEqual(self.req("POST", "/api/crd-save", dict(good, page="/../config/acme.tenant.json"))[0], 400)
+        self.assertEqual(self.req("POST", "/api/crd-save", dict(good, files=[{"name": "../../evil.yaml", "text": good["files"][0]["text"]}]))[0], 400)
+        self.assertEqual(self.req("GET", "/api/crd-set?page=" + self.page + "&id=../../config")[0], 400)
+        self.assertFalse(any((self.tmp / "crds").rglob("evil.yaml")) if (self.tmp / "crds").exists() else False)
+
+
+class PageScriptNames(unittest.TestCase):
+    def test_no_function_is_shadowed_by_a_variable_of_the_same_name(self):
+        # A `var btn=...` and a `function btn(){}` in the same scope: the var wins at runtime, and every
+        # call to the function throws - silently, inside a promise. It once emptied the CRD history.
+        import re
+        sys.path.insert(0, str(HERE.parent))
+        from psplan import pov
+        js = pov.JS_UI
+        funcs = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)\s*\(", js))
+        vars_ = set(re.findall(r"\bvar\s+([A-Za-z_$][\w$]*)", js)) | set(re.findall(r",\s*([A-Za-z_$][\w$]*)\s*=(?!=)", js))
+        self.assertEqual(funcs & vars_, set())
+
+
+class DiffJs(unittest.TestCase):
+    def test_line_and_file_diff(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        sys.path.insert(0, str(HERE.parent))
+        from psplan import pov
+        a = "\n".join(f"line {i}" for i in range(20)); b = a.replace("line 10", "line ten")
+        src = (pov.JS_DIFF + ";var o={d:psDiff(" + json.dumps(a) + "," + json.dumps(b) + "),f:psFileDiff("
+               + json.dumps([{"name": "x", "text": "1"}, {"name": "y", "text": "2"}]) + ","
+               + json.dumps([{"name": "x", "text": "1"}, {"name": "y", "text": "3"}, {"name": "z", "text": "4"}])
+               + ")};delete o.f.o;delete o.f.n;process.stdout.write(JSON.stringify(o))")
+        got = json.loads(subprocess.run([node, "-e", src], capture_output=True, text=True, check=True).stdout)
+        self.assertIn(["-", "line 10"], got["d"]); self.assertIn(["+", "line ten"], got["d"])
+        self.assertEqual(got["d"][0], ["~", "8 unchanged lines"])                       # context, not the whole file
+        self.assertEqual(got["f"], {"added": ["z"], "removed": [], "changed": ["y"]})
 
 
 if __name__ == "__main__":

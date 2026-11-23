@@ -12,6 +12,7 @@ Design rules (each one is a lesson from a real run):
 import collections
 import hashlib
 import json
+import math
 import re
 import statistics
 from concurrent.futures import ProcessPoolExecutor
@@ -120,16 +121,95 @@ def hpa_class(r2):
     return cls, ", ".join(parts)
 
 
+# Sidecars an admission webhook injects at runtime. PerfectScale's HPA automation ignores them on its
+# own, so they never count as a second "declared" container when deciding where a trigger belongs.
+INJECTED_RX = re.compile(r"^(istio-proxy|istio-validation|istio-init|linkerd-proxy|linkerd-init)$")
+
+
+def _cres(c, kind, which):
+    """A container's recommended request or limit (cores / MiB), falling back to the current value.
+    A recommended limit of 0 means the limit is removed (the generated CRs set keepLimit false)."""
+    r = (((c or {}).get("resources") or {}).get(kind) or {}).get(which) or {}
+    unit = "Cores" if kind == "cpu" else "MiB"
+    rec, cur = r.get(f"recommended{unit}"), r.get(f"current{unit}")
+    if which == "limit":
+        return None if rec == 0 else (rec if rec is not None else cur)
+    return rec if rec else cur
+
+
+def hpa_analysis(r2, x):
+    """What PerfectScale's HPA automation would change on a workload whose HPA scales on pod CPU or
+    memory, worked out from public API v2 data with the rules PerfectScale documents:
+
+      - a CPU/memory trigger under 80% inflates requests: raised to 80%
+      - a trigger above the highest usable one cannot fire before throttling or OOM: lowered to it.
+        Highest usable = limit / request * 100 / 1.1 (CPU), * 0.9 for memory; recommended values,
+        summed over the pod's containers since a pod-level trigger averages them. No limit: no cap,
+        and a trigger above 150% is reported only. Never written below 80%: then reported only.
+      - a pod-level trigger on a pod with several declared containers moves to the app container
+        (Kubernetes 1.33 or later)
+
+    minReplicas needs the HPA's own min/max, which the API does not carry: a replica count that
+    never moved above 2 is flagged as a hint only. maxReplicas and scaling behaviour are never
+    recommended, by PerfectScale or here."""
+    t = (r2.get("scaling") or {}).get("hpaTargets") or {}
+    conts = r2.get("containers") or {}
+    conts = list(conts.values()) if isinstance(conts, dict) else list(conts)
+    trig = {m: v.get("utilization") for m, v in t.items()
+            if m in ("cpu", "memory") and isinstance(v, dict) and isinstance(v.get("utilization"), (int, float))}
+    usable = {}
+    for m in ("cpu", "memory"):
+        reqs = [_cres(c, m, "request") for c in conts]
+        lims = [_cres(c, m, "limit") for c in conts]
+        if not reqs or any(not r for r in reqs) or any(not l for l in lims):
+            usable[m] = None
+            continue
+        usable[m] = sum(lims) / sum(reqs) * 100 / 1.1 * (0.9 if m == "memory" else 1.0)
+    label = {"cpu": "CPU", "memory": "memory"}
+    F = []   # (kind, short label for one-line summaries, the full sentence for the detail notes)
+    for m, v in sorted(trig.items()):
+        u = usable[m]
+        if v < 80:
+            F.append(("change", f"{label[m]} trigger {v:g}% \u2192 80%", f"Raise the {label[m]} trigger from {v:g}% to 80%: a low trigger inflates requests")
+                     if u is None or u >= 80 else
+                     ("report", f"{label[m]} trigger {v:g}%: low, capped at {math.floor(u)}%",
+                      f"{label[m]} trigger {v:g}% is low, but the highest it can reach is {math.floor(u)}%: reported only"))
+        elif u is not None and v > u:
+            F.append(("change", f"{label[m]} trigger {v:g}% \u2192 {math.floor(u)}%",
+                      f"Lower the {label[m]} trigger from {v:g}% to {math.floor(u)}%, the highest it can reach before the limit")
+                     if u >= 80 else
+                     ("report", f"{label[m]} trigger {v:g}%: unreachable (max {math.floor(u)}%)",
+                      f"{label[m]} trigger {v:g}% cannot fire before the limit (highest usable {math.floor(u)}%): adjust the limit or trigger yourself"))
+        elif u is None and v > 150:
+            F.append(("report", f"{label[m]} trigger {v:g}%: no limit, reported only", f"{label[m]} trigger {v:g}% with no limit: reported only"))
+    declared = [c.get("name") for c in conts if c.get("name") and not INJECTED_RX.match(c["name"])]
+    if trig and len(declared) > 1:
+        F.append(("change", "trigger \u2192 app container (K8s 1.33+)",
+                  f"Move the pod-level trigger to the application container ({len(declared)} declared containers; "
+                  "needs Kubernetes 1.33 or later)"))
+    rc = x.get("replicas_counts") or {}
+    avg = rc.get("avg_count") or 0
+    mx = rc.get("max_count", avg)
+    if avg >= 3 and mx <= avg:
+        F.append(("min", f"minReplicas hint: flat at {avg:g}",
+                  f"Replicas held at {avg:g} all window: minReplicas may sit above need, or equal maxReplicas. "
+                  "HPA automation lowers minReplicas to 2 when maxReplicas allows; PodFit's HPA tab shows the exact value"))
+    return {"triggers": trig, "usable": {k: (math.floor(v) if v is not None else None) for k, v in usable.items()},
+            "containers": declared, "findings": [{"kind": k, "short": sh, "text": t} for k, sh, t in F]}
+
+
 def pov_wave(x):
     """The Command Center's automation waves. Wave 1: no HPA or container-level triggers. Wave 1b:
-    stateful or mesh components (extra headroom). Review: HPA on custom metrics only, or automation
-    not supported. Hold: pod-level CPU/memory HPA. Workloads with no HPA data fall in Wave 1/1b and
-    the page says the HPA is unknown."""
+    stateful or mesh components (extra headroom). Wave 1h: an HPA on pod CPU/memory - automated with
+    PerfectScale's HPA automation alongside, since PerfectScale sizes the request from the trigger
+    and the HPA automation keeps triggers and minReplicas right as requests change. Review: HPA on
+    custom metrics only, or automation not supported. Workloads with no HPA data fall in Wave 1/1b
+    and the page says the HPA is unknown."""
     if x.get("_auto_status") == "NotSupported":
         return "Review"
     h = x.get("_hpa_class")
     if h == "pod_resource":
-        return "Hold"
+        return "1h"
     if h == "custom":
         return "Review"
     if x["_lane"] == "stateful" or x["type"] == "StatefulSet" or MESH_RX.search(x["name"]):
@@ -231,7 +311,7 @@ def pov_rank(w, R, T, top_n=50, savings_weight=0.6):
             "policy": x.get("optimization_policy") or "unset", "jvm": bool(x.get("_jvm")),
             "hpa": x.get("_hpa"), "replicas": x["replicas_counts"]["avg_count"],
             "replicas_max": x["replicas_counts"].get("max_count", x["replicas_counts"]["avg_count"]),
-            "hpa_class": x.get("_hpa_class"), "hpa_detail": x.get("_hpa_detail"), "wave": pov_wave(x),
+            "hpa_class": x.get("_hpa_class"), "hpa_detail": x.get("_hpa_detail"), "hpa_info": x.get("_hpa_info"), "wave": pov_wave(x),
             "auto_status": x.get("_auto_status"), "immature": bool(x.get("_immature")),
             "cpu_cur": dd["current_cpu_request_cores_total"], "cpu_rec": dd["recommended_cpu_request_cores_total"],
             "mem_cur_gib": dd["current_memory_request_mib_total"] / 1024, "mem_rec_gib": dd["recommended_memory_request_mib_total"] / 1024,
@@ -275,19 +355,23 @@ def pov_namespaces(w, R):
                 a["types"].append(x["type"])
             continue
         reason = ("held_out" if x["_lane"] == "held_out" else "stateful" if x["_lane"] == "stateful"
-                  else "jvm" if x.get("_jvm") else "hpa" if x.get("_hpa_class") == "pod_resource" else None)
+                  else "jvm" if x.get("_jvm") else None)
         if reason:
             a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason,
                               "pot": R(max(x["potential_savings"], 0.0))})
-            if reason == "hpa":
-                # What the namespace would add if the reviewer confirms these HPAs are pinned on the
-                # kickoff page: the page folds it into `auto` and drops the HPA exclusions.
-                h = a.setdefault("hpa_auto", {}).setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
-                h["n"] += 1
-                h["pot"] += R(max(x["potential_savings"], 0.0))
-                h["waste"] += R(max(x["waste"], 0.0))
-                h["risk"] += 1 if risk_sev(x) >= 3 else 0
             continue
+        if x.get("_hpa_class") == "pod_resource":
+            # Rides along like any other workload; the namespace's config also gets an hpa block so
+            # PerfectScale's HPA automation keeps this HPA aligned as the request shrinks.
+            h = a.setdefault("hpa", {"n": 0, "pot": 0.0, "types": [], "items": []})
+            h["n"] += 1
+            h["pot"] += R(max(x["potential_savings"], 0.0))
+            if x["type"] not in h["types"]:
+                h["types"].append(x["type"])
+            info = x.get("_hpa_info") or {}
+            h["items"].append({"name": x["name"], "type": x["type"], "detail": x.get("_hpa_detail") or "",
+                               "pot": R(max(x["potential_savings"], 0.0)), "findings": info.get("findings") or [],
+                               "usable": info.get("usable") or {}, "containers": info.get("containers") or []})
         t = a["auto"].setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
         t["n"] += 1
         t["pot"] += R(max(x["potential_savings"], 0.0))
@@ -296,22 +380,24 @@ def pov_namespaces(w, R):
     for a in nsd.values():
         a["excl"].sort(key=lambda e: (e["type"], e["name"]))
         a["pot"] = sum(t["pot"] for t in a["auto"].values())
-        # Every automatable workload kept out (all behind a pod CPU/memory HPA, say): there is nothing
-        # for a namespace config to enable, but dropping the row hid the largest namespace of a tenant
-        # whose workloads all sat behind such HPAs. List it, not selectable, with what holds it back.
+        # Every automatable workload kept out (stateful, JVM, held out): there is nothing for a namespace
+        # config to enable, but dropping the row once hid a tenant's largest namespace with no reason on
+        # the page. List it, not selectable, with what holds it back.
         a["held"] = not a["managed"] and not a["auto"] and bool(a["excl"])
         if a["held"]:
             a["held_pot"] = sum(e["pot"] for e in a["excl"])
             a["held_reasons"] = dict(collections.Counter(e["reason"] for e in a["excl"]).most_common())
             a["types"] = sorted({e["type"] for e in a["excl"]}, key=POV_CR_TYPES.index)
+        if a.get("hpa"):
+            a["hpa"]["items"].sort(key=lambda i: (-len(i["findings"]), -i["pot"], i["name"]))
     listed = [a for a in nsd.values() if (a["managed"] and a["types"]) or a["auto"] or a["held"]]
     listed.sort(key=lambda a: (a["managed"], a["held"], -(a.get("held_pot") or a["pot"]), a["ns"]))
-    hpa = [e for a in nsd.values() if not a["managed"] for e in a["excl"] if e["reason"] == "hpa"]
-    hpa_ns = collections.Counter(a["ns"] for a in nsd.values() if not a["managed"] for e in a["excl"] if e["reason"] == "hpa")
+    hs = sorted((a for a in nsd.values() if a.get("hpa")), key=lambda a: -a["hpa"]["pot"])
     return {"namespaces": listed,
             "ns_nothing_to_automate": sum(1 for a in nsd.values() if not a["managed"] and not a["auto"] and not a["held"]),
-            "hpa_held": {"n": len(hpa), "pot": sum(e["pot"] for e in hpa),
-                         "namespaces": [ns for ns, _ in hpa_ns.most_common()]}}
+            # Workloads that need PerfectScale's HPA automation switched on alongside pod automation.
+            "hpa_scope": {"n": sum(a["hpa"]["n"] for a in hs), "pot": sum(a["hpa"]["pot"] for a in hs),
+                          "namespaces": [a["ns"] for a in hs]}}
 
 
 def primary_issue(w):
@@ -674,6 +760,7 @@ def _load(cfg, cluster, d):
         if x["_hpa_class"] == "pod_resource" and pinned_rx and pinned_rx.search(x["namespace"]):
             # Customer-confirmed min == max: the HPA cannot scale, so a resize cannot move it.
             x["_hpa_class"], x["_hpa_detail"] = "pinned", (x["_hpa_detail"] or "CPU/memory") + "; pinned (min = max, confirmed)"
+        x["_hpa_info"] = hpa_analysis(r2, x) if x["_hpa_class"] == "pod_resource" else None
         x["_auto_status"] = (r2.get("automation") or {}).get("status") if r2 else None
         x["_immature"] = bool(r2) and not ((r2.get("maturity") or {}).get("overall") or {}).get("isMature", True)
 
@@ -731,13 +818,12 @@ def _load(cfg, cluster, d):
         ws = [x for x in w if x["_lane"] == ln]
         elig_ok = ("NotEnabled", "DisabledByUser", "Eligible")
         pe = sum(x["potential_savings"] for x in ws if x["_elig"] in elig_ok) if elig_map else None
-        # Behind a pod CPU/memory HPA (public API v2): a smaller request moves the scaling point, so
-        # these savings are not reachable by switching automation on - the POV page puts them on
-        # Hold. Counted within the same eligible set as pot_eligible so the two subtract cleanly.
+        # Behind a pod CPU/memory HPA (public API v2): reachable, with PerfectScale's HPA automation
+        # switched on alongside pod automation. Counted within the same eligible set as pot_eligible.
         hh = [x for x in ws if x.get("_hpa_class") == "pod_resource" and (not elig_map or x["_elig"] in elig_ok)]
         lanes[ln] = {"pot_eligible_o": pe, "pot_eligible": (R(pe) if pe is not None else None),
-                     "n_hpa_hold": len(hh), "pot_hpa_hold_o": sum(x["potential_savings"] for x in hh),
-                     "pot_hpa_hold": R(sum(x["potential_savings"] for x in hh)),
+                     "n_hpa": len(hh), "pot_hpa_o": sum(x["potential_savings"] for x in hh),
+                     "pot_hpa": R(sum(x["potential_savings"] for x in hh)),
                      "n": len(ws), "cost": R(sum(x["cost"] for x in ws)), "waste": R(sum(x["waste"] for x in ws)), "pot": R(sum(x["potential_savings"] for x in ws)),
                      "cost_o": sum(x["cost"] for x in ws), "waste_o": sum(x["waste"] for x in ws), "pot_o": sum(x["potential_savings"] for x in ws),
                      "owners": owners(ws, "potential_savings"), "top": [row(x) for x in sorted(ws, key=lambda x: -x["potential_savings"])[:8]]}

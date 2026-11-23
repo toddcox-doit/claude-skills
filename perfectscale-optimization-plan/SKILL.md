@@ -140,7 +140,7 @@ Then set by hand, because guessing them is worse than leaving them null:
 | `stateful_patterns` | Add whatever search or streaming engine *this* tenant runs. The defaults are not exhaustive — see `references/methodology.md`. |
 | `held_out_from_automation` | Name or namespace regexes to keep out of the automation ask. Anchor them: `^prod$` does not catch `preprod`. |
 | `managed_namespaces` | Platform add-ons to hold out of the ask. |
-| `hpa_pinned_namespaces` | **Ask.** Namespace regexes whose pod CPU/memory HPAs the owner confirms are pinned (min = max replicas). Releases those workloads from Hold, so a namespace held entirely by such HPAs can be automated. Never infer it from flat replica counts. |
+| `hpa_pinned_namespaces` | **Rarely needed.** Namespace regexes whose pod CPU/memory HPAs the owner confirms are pinned (min = max replicas): treated as having no HPA, so no HPA automation. By default those workloads are automated with HPA automation alongside. Never infer it from flat replica counts. |
 | `foreign_tenants` | Every other customer name this folder has held, so the leak scan can catch them. |
 | `adoption_factor` | Default `0.7`. Scales savings in the adoption view; never scales spend. |
 | `status` | e.g. `"Draft for review"` adds a banner and a feedback section. |
@@ -186,7 +186,7 @@ python3 .../run_plan.py --config config/acme.tenant.json --next-version
 config as it was is kept beside it as `config/<tenant>.tenant.<old tag>.json`. Add
 `--collect` to pull fresh data first. Earlier versions stay intact for comparison.
 
-### 5a. Confirm HPAs from the kickoff page (one click)
+### 5a. Open the kickoff pages (double-click), and HPA automation
 
 **Double-click `Open kickoff pages.command`** at the top of the tenant folder
 (`new_tenant.py init` writes it; `new_tenant.py launcher --dir <tenant folder>`
@@ -200,20 +200,44 @@ Either opens the current version's kickoff pages in the browser and keeps runnin
 until the Terminal window is closed or Ctrl+C. No `--config` is needed: a tenant
 folder's copy of the library finds that folder's one `config/<name>.tenant.json`
 by itself (`run_plan.py` does the same). Pass `--config` only if a folder holds
-more than one config. When a namespace owner confirms their pod CPU/memory HPAs are
-pinned (min = max), tick **HPA pinned** for that namespace and click **Update the
-plan with these confirmations**. It saves the confirmation into the tenant
-config (`hpa_pinned_namespaces`), renders the next version, and opens it, with
-those workloads counted in the automation waves. A page opened straight from disk
-shows the same step as one command to copy:
+more than one config. `kickoff.py` serves only the reports folder, on 127.0.0.1,
+behind a per-run token, and never touches the cluster.
 
-```bash
-python3 .../run_plan.py --config config/acme.tenant.json --pin-hpa model-a model-b
-```
+**CRD history.** Opened through the launcher, every CRD set the kickoff page
+generates is saved, append-only, under `crds/<cluster>/<date-time>-<kind>/` in the
+tenant folder, with a manifest: plan version, selections, a fingerprint per file,
+the Kubernetes objects it creates, and what changed against the previous set. An
+identical re-generation isn't stored twice, and nothing is ever pruned. The page's
+**CRD history** section shows the last three sets of each kind, each with:
 
-`kickoff.py` serves only the reports folder, on 127.0.0.1, behind a per-run
-token, and its single action is `--pin-hpa` with namespace names the page
-offers. It never runs anything else and never touches the cluster.
+- a zip download
+- a diff against the previous set, or against what's on screen
+- **Mark handed to the customer**
+- **Roll back to this**, which lists the exact `kubectl delete` commands for
+  objects added since: applying older files never removes them. It also points to
+  `stopAllAutomation` / `cleanupAllAutomation` for undoing resource changes
+  automation already made.
+
+The customer's own Git repository stays the source of truth for what's applied;
+this is the SE-side record. A page opened straight from disk explains that
+history needs the launcher.
+
+**HPA automation on the kickoff page.** Workloads whose HPA scales on pod CPU or
+memory are automated with PerfectScale's HPA automation alongside, not held back:
+PerfectScale sizes the request from the trigger, and HPA automation keeps
+minReplicas and the triggers aligned. The page's HPA automation section works
+without the customer running anything:
+
+- **What HPA automation will change** is worked out from the data with
+  PerfectScale's documented rules (triggers, container-level moves, minReplicas
+  hints). Exact minReplicas changes come from PodFit's HPA tab, because the
+  public API has no HPA min/max.
+- **Tick the prerequisites after asking the customer:** agent v1.0.71+ and
+  exporter v1.1.28+ (both required), plus Kubernetes 1.33+ (optional).
+- **Restrictions** start at PerfectScale's defaults. Generated configs carry the
+  `hpa` block once both required prerequisites are ticked.
+- **The read-only commands** that would give the exact HPA and PDB settings are
+  folded away at the bottom, in case the customer agrees later.
 
 There is no fixed re-run date: a POV runs 30 days, so a date months out is the
 wrong promise. The plan and the summary offer a second look on demand, or once

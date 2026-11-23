@@ -103,12 +103,12 @@ const C = {
   status: S.status ? S.status + ': figures and wording are open to change.' : null,
 
   askLabel: 'The decision',
-  // When most automation-gated money sits behind pod CPU/memory HPAs, switching automation on is not
-  // "that single decision": the HPA answer is the second one, and the summary has to say so.
+  // When automation-gated money sits on workloads whose HPA scales on pod CPU/memory, the decision
+  // is pod automation with PerfectScale's HPA automation alongside, and the summary says so.
   ask: gated >= 50 && r100(hpaUsd) >= 100
-    ? 'Approve switching PerfectScale automation on, starting with one non-production cluster, and confirm whether the ' +
-      'HPAs behind most of the savings are pinned: automation alone reaches ' + usd(r100(gatedUsd - hpaUsd)) +
-      ' a month, and ' + usd(r100(hpaUsd)) + ' a month more needs that answer.'
+    ? 'Approve switching PerfectScale automation on, starting with one non-production cluster, with HPA automation ' +
+      'alongside: ' + usd(r100(gatedUsd)) + ' a month of the savings below waits on it, ' + usd(r100(hpaUsd)) +
+      ' of that on workloads whose HPAs scale on CPU or memory.'
     : gated >= 50
     ? 'Approve switching PerfectScale automation on, starting with one non-production cluster. ' +
       usd(r100(S.automation_gated.usd)) + ' a month of the savings below is waiting on that single decision; ' +

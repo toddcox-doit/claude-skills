@@ -5,17 +5,21 @@
   python3 <tenant folder>/skill/perfectscale-optimization-plan/scripts/kickoff.py
 
 Starts a small web server on this computer only (127.0.0.1), opens the current version's kickoff
-page in the browser, and keeps running until Ctrl+C. Ticking "HPA pinned" on the page and clicking
-"Update the plan with these confirmations" saves the confirmations into the tenant config, renders
-the next version (plan, executive summary, kickoff pages, verify) and opens it.
+page in the browser, and keeps running until Ctrl+C. Opened this way, every CRD set the page
+generates is saved, append-only, under crds/<cluster>/ in the tenant folder (psplan/crdstore.py),
+and the page's CRD history section lists, diffs, downloads and marks them, with the exact objects
+to delete for a rollback. It also accepts `run_plan.py --pin-hpa` requests for namespaces the page
+offers HPA automation for.
 
 A kickoff page opened straight from disk cannot run anything - browsers forbid it - so this helper
 is what makes the button work. It is deliberately narrow:
   - listens on 127.0.0.1 only, never on the network
   - serves only the reports folder, read-only
   - accepts requests only with this run's secret token, from its own origin and host name
-  - does one thing: `run_plan.py --pin-hpa`, with namespace names that are valid Kubernetes names
-    AND appear as HPA-held on the page that sent them - never an arbitrary command
+  - writes only CRD sets under crds/<cluster>/, for the cluster of the page that sent them, with
+    file names and contents of the shapes the page generates
+  - runs only `run_plan.py --pin-hpa`, with valid Kubernetes namespace names the page offers -
+    never an arbitrary command
   - runs one update at a time
 """
 import argparse
@@ -32,7 +36,7 @@ from urllib.parse import unquote, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from psplan import versioning  # noqa: E402
+from psplan import crdstore, versioning  # noqa: E402
 
 TYPES = {".html": "text/html; charset=utf-8", ".md": "text/markdown; charset=utf-8", ".json": "application/json",
          ".csv": "text/csv; charset=utf-8", ".yaml": "text/yaml; charset=utf-8",
@@ -40,6 +44,7 @@ TYPES = {".html": "text/html; charset=utf-8", ".md": "text/markdown; charset=utf
          ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
 KICKOFF = "-pov-automation-kickoff-"
 MAX_BODY = 64 * 1024
+MAX_SAVE = 32 * 1024 * 1024        # a generated CRD set: thousands of small YAML files at most
 
 
 def page_prefix(name):
@@ -82,13 +87,24 @@ class Helper:
         p = (base / unquote(url_path).lstrip("/")).resolve()
         return p if p.is_file() and p.is_relative_to(base) else None
 
-    def allowed_ns(self, page):
-        """Namespaces the page offers an HPA confirmation for, read from the page's own data."""
+    def page_data(self, page):
         m = re.search(r"<script type=application/json id=povdata>(.*?)</script>", page.read_text(encoding="utf-8"), re.S)
-        if not m:
-            return set()
-        D = json.loads(m.group(1).replace("<\\/", "</"))
-        return {n["ns"] for n in D.get("namespaces", []) if n.get("hpa_auto")}
+        return json.loads(m.group(1).replace("<\\/", "</")) if m else {}
+
+    def allowed_ns(self, page):
+        """Namespaces the page offers HPA automation for, read from the page's own data."""
+        return {n["ns"] for n in self.page_data(page).get("namespaces", []) if n.get("hpa_n")}
+
+    def cluster_of(self, page_path):
+        """The cluster a kickoff page belongs to (its data's slug), so CRD history is always filed
+        under the page that generated it, never under a name a request makes up."""
+        page = self.file_for(str(page_path or ""))
+        if page is None or KICKOFF not in page.name:
+            raise ValueError("need the kickoff page the request came from")
+        slug = self.page_data(page).get("slug") or ""
+        if not crdstore.SLUG_RX.match(slug):
+            raise ValueError("that page carries no cluster")
+        return slug
 
     # ---- the one job
     def start(self, namespaces, page):
@@ -187,6 +203,23 @@ class Helper:
                         return
                     job = helper.jobs.get(m.group(1))
                     return self.send(200, job) if job else self.send(404, {"error": "no such job"})
+                if path in ("/api/crd-history", "/api/crd-set", "/api/crd-rollback"):
+                    if not self.api_ok():
+                        return
+                    from urllib.parse import parse_qs
+                    q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                    try:
+                        slug = helper.cluster_of(q.get("page"))
+                        if path == "/api/crd-history":
+                            return self.send(200, {"cluster": slug, "sets": crdstore.history(helper.root, slug)})
+                        if path == "/api/crd-set":
+                            return self.send(200, crdstore.get(helper.root, slug, q.get("id")))
+                        target = crdstore.get(helper.root, slug, q.get("id"))
+                        cur = crdstore.get(helper.root, slug, q.get("from")) if q.get("from") else None
+                        return self.send(200, {"id": target["id"], "from": cur["id"] if cur else None,
+                                               "delete": crdstore.rollback_deletes(target["objects"], cur["objects"]) if cur else []})
+                    except ValueError as e:
+                        return self.send(400, {"error": str(e)})
                 f = helper.file_for(path)
                 if f is None:
                     return self.send(404, "Not found", "text/plain; charset=utf-8")
@@ -199,13 +232,30 @@ class Helper:
             def do_POST(self):
                 if not self.host_ok():
                     return
-                if urlparse(self.path).path != "/api/pin-hpa":
+                path = urlparse(self.path).path
+                if path not in ("/api/pin-hpa", "/api/crd-save", "/api/crd-mark"):
                     return self.send(404, {"error": "not found"})
                 if not self.api_ok():
                     return
                 n = int(self.headers.get("Content-Length") or 0)
-                if n <= 0 or n > MAX_BODY:
+                if n <= 0 or n > (MAX_SAVE if path == "/api/crd-save" else MAX_BODY):
                     return self.send(400, {"error": "bad request body"})
+                if path in ("/api/crd-save", "/api/crd-mark"):
+                    try:
+                        req = json.loads(self.rfile.read(n))
+                        slug = helper.cluster_of(req.get("page"))
+                        meta = dict(req.get("meta") or {}, plan_version=helper.raw().get("version_tag"),
+                                    page=Path(urlparse(str(req.get("page"))).path).name)
+                        with helper.lock:            # one writer at a time: ids and "unchanged" stay exact
+                            if path == "/api/crd-save":
+                                r = crdstore.save(helper.root, slug, req.get("kind"), req.get("files"), meta)
+                                if not r["unchanged"]:
+                                    print(f"kickoff: saved CRD set {slug}/{r['id']}", flush=True)
+                            else:
+                                r = crdstore.mark(helper.root, slug, req.get("id"), req.get("handed"))
+                        return self.send(200, r)
+                    except (ValueError, AttributeError, TypeError) as e:
+                        return self.send(400, {"error": str(e)})
                 try:
                     req = json.loads(self.rfile.read(n))
                     names = versioning.validate_namespaces(list(req.get("namespaces") or []))

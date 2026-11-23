@@ -366,7 +366,13 @@ class T(unittest.TestCase):
         self.assertIn("GroupedJob (6)", t)
         self.assertEqual(t.count("<tr data-type="), 50)
         self.assertEqual(len(re.findall(r"class=wlck value='\d+' checked", t)), 50)   # every ranked row ticked by default
-        self.assertIn("<details class=wgrp data-g=ready open>", t)        # Ready opens; others start collapsed
+        # Everything starts collapsed: every wave group, and every section (rolled up by JS_COLLAPSE,
+        # which must run after JS_RESIZE so column widths are measured while still visible).
+        self.assertIn("<details class=wgrp data-g=ready>", t)
+        self.assertNotRegex(t, r"<details class=wgrp[^>]* open>")
+        self.assertIn("every section starts collapsed", t)
+        self.assertLess(t.index("var MIN=44"), t.index("every section starts collapsed"))
+        self.assertIn("beforeprint", t)
         self.assertIn("class=gsel data-g=ready data-v=1", t)              # per-group Select all
         self.assertEqual(len(re.findall(r"<tr class=nsdet data-for='r\d+' hidden>", t)), 50)   # a detail row per workload
         self.assertNotIn("line-through", t)
