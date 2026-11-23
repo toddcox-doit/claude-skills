@@ -36,7 +36,9 @@ the namespace here treats its workloads like ones without an HPA: Wave 1, ticked
 by default, and covered by a namespace config. The public API has no HPA
 min/max, so set this only after asking. Flat replica counts are a hint, not
 proof, because an HPA that never crosses its target looks the same. Anchor the
-patterns: `^payments$`.
+patterns: `^payments$`. You rarely edit this by hand: `run_plan.py --pin-hpa
+<namespace>...`, or the kickoff page's update button under `kickoff.py`, adds the
+anchored entries and renders the next version.
 
 `pov_top_n` (default 50) is how many workloads each cluster's POV automation
 kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of

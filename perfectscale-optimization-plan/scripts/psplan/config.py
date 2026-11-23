@@ -142,6 +142,7 @@ def _merge(base, over):
 
 class Config(dict):
     root: Path
+    src: Path = None
 
     @classmethod
     def load(cls, path):
@@ -150,6 +151,7 @@ class Config(dict):
             raw = json.load(fh)
         cfg = cls(_merge(DEFAULTS, raw))
         cfg.root = path.parent.parent if path.parent.name == "config" else path.parent
+        cfg.src = path                         # the file itself: pages print a re-run command relative to root
         if not cfg["customer"]:
             raise SystemExit("config: 'customer' is required")
         if not cfg["clusters"]:

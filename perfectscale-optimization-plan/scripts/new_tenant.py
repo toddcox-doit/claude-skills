@@ -9,6 +9,7 @@ Fastest path - one command, one credential entry:
       clusters straight into a config, and --collect to pull their data too.
 
   python3 new_tenant.py auth --profile acme          # (re)enter the token for an existing tenant
+  python3 new_tenant.py launcher --dir ~/work/Acme_analysis   # add the double-click kickoff launcher
 
 Or step by step, in this order.
 
@@ -47,6 +48,49 @@ def slug(s):
     return "".join(c if c.isalnum() else "-" for c in s.lower()).strip("-")
 
 
+LAUNCHER = "Open kickoff pages.command"     # .command: macOS opens it in Terminal on double-click
+
+
+def launcher_text():
+    return f"""#!/bin/bash
+# Double-click to open this customer's POV kickoff pages, with the one-click
+# "Update the plan" button. Keep this window open while you use the pages;
+# close it, or press Ctrl+C, when you are done.
+cd "$(dirname "$0")" || exit 1
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 was not found. Install Python 3.10 or newer, then double-click this again."
+  read -n 1 -s -r -p "Press any key to close this window."
+  exit 1
+fi
+python3 skill/{LIB.name}/scripts/kickoff.py "$@"
+status=$?
+if [ $status -ne 0 ]; then
+  echo
+  read -n 1 -s -r -p "kickoff stopped with an error (see above). Press any key to close this window."
+fi
+exit $status
+"""
+
+
+def write_launcher(root):
+    """Put the double-click launcher at the top of a tenant folder. Rewritten every time, so a library
+    refresh also refreshes it; executable, since Finder runs a .command file only if it is."""
+    p = Path(root) / LAUNCHER
+    p.write_text(launcher_text())
+    p.chmod(0o755)
+    return p
+
+
+def cmd_launcher(a):
+    root = Path(a.dir).expanduser().resolve()
+    if not (root / "skill" / LIB.name / "scripts" / "kickoff.py").is_file():
+        raise SystemExit(f"{root} has no copy of the library with kickoff.py; refresh it first "
+                         f"(new_tenant.py init --dir {root} --customer <name> --force)")
+    p = write_launcher(root)
+    print(f"wrote {p}\n  double-click it in Finder to open the kickoff pages with the update button")
+    return 0
+
+
 def cmd_init(a):
     root = Path(a.dir).expanduser().resolve()
     dest = root / "skill" / LIB.name
@@ -67,6 +111,7 @@ def cmd_init(a):
     # a stray __pycache__ from the source tree would shadow edits made here
     for p in dest.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
+    write_launcher(root)
 
     if getattr(a, "quiet", False):
         print(f"created {root}  (library copied into skill/{LIB.name}/)")
@@ -74,6 +119,7 @@ def cmd_init(a):
     print(f"created {root}")
     print(f"  library -> skill/{LIB.name}/ (scripts, templates, references)")
     print(f"  empty   -> config/ data/ reports/")
+    print(f"  {LAUNCHER} -> double-click to open the kickoff pages once a plan has run")
     print()
     print("Next:")
     print(f"  cd {root}")
@@ -256,6 +302,10 @@ def main():
     o.add_argument("--collect", action="store_true", help="also collect the configured clusters (implies --write-config)")
     o.add_argument("--force", action="store_true")
     o.set_defaults(fn=cmd_onboard)
+
+    lp = sub.add_parser("launcher", help=f"add the double-click '{LAUNCHER}' to an existing tenant folder")
+    lp.add_argument("--dir", required=True)
+    lp.set_defaults(fn=cmd_launcher)
 
     c = sub.add_parser("config", help="write the tenant config from the ranking")
     c.add_argument("--dir", required=True)

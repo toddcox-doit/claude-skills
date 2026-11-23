@@ -3,6 +3,8 @@
 
   python3 run_plan.py --config config/<tenant>.tenant.json [--collect] [--max-age-hours 24] [--no-verify]
   python3 run_plan.py --config config/<tenant>.tenant.json --check     # preflight only: will the run get what it needs?
+  python3 run_plan.py --config config/<tenant>.tenant.json --next-version            # re-render as the next version
+  python3 run_plan.py --config config/<tenant>.tenant.json --pin-hpa model-a model-b # save HPA confirmations, re-render
 """
 import argparse
 import sys
@@ -16,7 +18,7 @@ from psplan.actions import Plan  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", help="the tenant config (default: the one config in the tenant folder this copy lives in)")
     ap.add_argument("--collect", action="store_true", help="run the pscli collector first (resumable, rate-limited)")
     ap.add_argument("--max-age-hours", type=float, default=None)
     ap.add_argument("--no-verify", action="store_true")
@@ -24,7 +26,25 @@ def main():
     ap.add_argument("--overwrite", action="store_true", help="allow replacing outputs that already exist for this version tag")
     ap.add_argument("--check", action="store_true", help="preflight only: credentials, data age, enrichments, output folder")
     ap.add_argument("--no-network", action="store_true", help="with --check: skip the API token test")
+    ap.add_argument("--next-version", action="store_true",
+                    help="move the config to the next version (tag, output folder, previous plan) before rendering")
+    ap.add_argument("--pin-hpa", nargs="+", metavar="NAMESPACE",
+                    help="save namespaces whose pod CPU/memory HPAs the owner confirmed pinned (min = max), "
+                         "then render the next version - the same as ticking 'HPA pinned' on the kickoff page")
     a = ap.parse_args()
+    from psplan import versioning
+    a.config = str(versioning.find_config(__file__, a.config))   # works from any folder
+    if a.pin_hpa or a.next_version:
+        try:
+            ch = versioning.bump(a.config, pin=a.pin_hpa or ())
+        except ValueError as e:
+            print(f"--pin-hpa: {e}", file=sys.stderr)
+            return 2
+        if a.pin_hpa:
+            print(f"HPA confirmed pinned: {', '.join(a.pin_hpa)}"
+                  + (f" (newly saved: {', '.join(ch['pinned_added'])})" if ch["pinned_added"] else " (already saved)"))
+        print(f"version {ch['previous_version']} -> {ch['version']}: outputs go to {ch['out_dir']}; "
+              f"previous config kept as {ch['backup']}")
     cfg = Config.load(a.config)
     if a.check:
         from psplan import preflight

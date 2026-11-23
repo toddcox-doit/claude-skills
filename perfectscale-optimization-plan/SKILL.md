@@ -176,9 +176,44 @@ outputs for a version tag are never replaced: bump `version_tag` **and**
 
 ### 5. Re-run later, and diff
 
-Set `previous_plan` to the earlier plan JSON, bump `version_tag`/`out_dir`, and
-the change log is written automatically. Keep the previous version's folder
-intact so the two can be compared.
+```bash
+python3 .../run_plan.py --config config/acme.tenant.json --next-version
+```
+
+`--next-version` moves the config to the next version: `version_tag` and
+`out_dir` (v5.3 to v5.4, never into a folder that already exists), with
+`previous_plan` set to the plan it replaces, so the change log is written. The
+config as it was is kept beside it as `config/<tenant>.tenant.<old tag>.json`. Add
+`--collect` to pull fresh data first. Earlier versions stay intact for comparison.
+
+### 5a. Confirm HPAs from the kickoff page (one click)
+
+**Double-click `Open kickoff pages.command`** at the top of the tenant folder
+(`new_tenant.py init` writes it; `new_tenant.py launcher --dir <tenant folder>`
+adds it to an older folder). Or, from any folder:
+
+```bash
+python3 ~/work/Acme_analysis/skill/perfectscale-optimization-plan/scripts/kickoff.py
+```
+
+Either opens the current version's kickoff pages in the browser and keeps running
+until the Terminal window is closed or Ctrl+C. No `--config` is needed: a tenant
+folder's copy of the library finds that folder's one `config/<name>.tenant.json`
+by itself (`run_plan.py` does the same). Pass `--config` only if a folder holds
+more than one config. When a namespace owner confirms their pod CPU/memory HPAs are
+pinned (min = max), tick **HPA pinned** for that namespace and click **Update the
+plan with these confirmations**. It saves the confirmation into the tenant
+config (`hpa_pinned_namespaces`), renders the next version, and opens it, with
+those workloads counted in the automation waves. A page opened straight from disk
+shows the same step as one command to copy:
+
+```bash
+python3 .../run_plan.py --config config/acme.tenant.json --pin-hpa model-a model-b
+```
+
+`kickoff.py` serves only the reports folder, on 127.0.0.1, behind a per-run
+token, and its single action is `--pin-hpa` with namespace names the page
+offers. It never runs anything else and never touches the cluster.
 
 There is no fixed re-run date: a POV runs 30 days, so a date months out is the
 wrong promise. The plan and the summary offer a second look on demand, or once

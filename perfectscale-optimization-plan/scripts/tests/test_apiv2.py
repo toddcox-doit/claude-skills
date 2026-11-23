@@ -103,7 +103,10 @@ class HpaHeldNamespace(unittest.TestCase):
         self.assertIn("Held: pod CPU/memory HPA on every workload", t)
         self.assertIn("hpa_pinned_namespaces", t)
         D = json.loads(t.split("id=povdata>")[1].split("</script>")[0].replace("<\\/", "</"))
-        self.assertNotIn(self.NS, {n["ns"] for n in D["namespaces"]})      # never generatable
+        # In the page data so it can be confirmed, flagged held, and never pre-confirmed.
+        self.assertTrue(next(n for n in D["namespaces"] if n["ns"] == self.NS)["held"])
+        self.assertIn(f"class=hpack value='{self.NS}'", t)
+        self.assertNotIn(f"class=hpack value='{self.NS}' checked", t)
         ok, errs = verify.verify(self.cfg, S, self.F, files)
         self.assertEqual(errs, [])
 
@@ -179,6 +182,78 @@ class HpaHeldNamespace(unittest.TestCase):
         p.write_text(json.dumps(S))
         subprocess.run([node, str(HERE.parent / "exec_summary.js"), str(p), str(out)], check=True, capture_output=True)
         self.assertIn("waiting on that single decision", out.read_text(encoding="utf-8"))
+
+    # ---- "HPA pinned" confirmation on the kickoff page
+    def test_confirmed_namespace_is_generated_with_its_hpa_workloads_covered(self):
+        nss = self.prod["pov"]["namespaces"]
+        n = self.ns(self.prod)
+        types = list(n["hpa_auto"])
+        before = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types)
+        self.assertEqual(len(before), 1)                                    # prerequisite only: held, unconfirmed
+        after = pov.bundle_ns("prod-a", "2026-11-20", nss, [self.NS], types, hpa_ok=[self.NS])
+        self.assertEqual(len(after), 2)
+        name, docs, text = after[1]
+        nh = sum(1 for x in n["excl"] if x["reason"] == "hpa" and x["type"] in types)
+        self.assertIn("# HPA min = max: confirmed on the kickoff page\n", text)
+        self.assertIn(f"# HPA workloads now covered: {nh}\n", text)
+        self.assertNotIn(pov.EXCL_REASON["hpa"], text)                      # no HPA exclusion survives
+        self.assertEqual(docs, 1 + sum(1 for x in n["excl"] if x["type"] in types and x["reason"] != "hpa"))
+        self.assertTrue(all(len(l) <= pov.WIDTH for l in text.splitlines() if l.startswith("#")))
+
+    def test_confirmation_drops_only_hpa_exclusions_in_a_partly_held_namespace(self):
+        n = {"ns": "mixed", "managed": False, "held": False,
+             "auto": {"Deployment": {"n": 1, "pot": 5.0, "risk": 0, "waste": 6.0}},
+             "hpa_auto": {"Deployment": {"n": 1, "pot": 9.0, "risk": 0, "waste": 9.0}},
+             "excl": [{"name": "h1", "type": "Deployment", "reason": "hpa", "pot": 9.0},
+                      {"name": "j1", "type": "Deployment", "reason": "jvm", "pot": 1.0}]}
+        txt = lambda ok: pov.bundle_ns("c", "2026-11-20", [n], ["mixed"], ["Deployment"], hpa_ok=ok)[1][2]  # noqa: E731
+        self.assertIn("h1", txt([])); self.assertIn("j1", txt([]))
+        self.assertNotIn('name: "h1"', txt(["mixed"]).split("kind: NamespaceAutomationConfig")[1])
+        self.assertIn("j1", txt(["mixed"]))
+        self.assertEqual(pov.ns_auto(n, ["mixed"])["Deployment"]["n"], 2)
+        self.assertEqual(n["auto"]["Deployment"]["n"], 1)                   # the model's figures are untouched
+
+    def test_workload_file_records_the_confirmation_only_for_confirmed_hpa_rows(self):
+        rows = self.prod["pov"]["rows"]
+        hold = next((r for r in rows if r["hpa_class"] == "pod_resource"), None)
+        self.assertIsNotNone(hold, "fixture should rank an HPA-held workload")
+        plain = pov.bundle("prod-a", "2026-11-20", rows, [hold["type"]], {hold["rank"]})[1][2]
+        conf = pov.bundle("prod-a", "2026-11-20", rows, [hold["type"]], {hold["rank"]}, hpa_ok=[hold["ns"]])[1][2]
+        self.assertNotIn("HPA min = max", plain)
+        self.assertIn("# HPA min = max: confirmed on the kickoff page\n", conf)
+        other = next((r for r in rows if r["hpa_class"] != "pod_resource"), None)
+        if other:
+            self.assertNotIn("HPA min = max", pov.bundle("prod-a", "2026-11-20", rows, [other["type"]], {other["rank"]}, hpa_ok=[other["ns"]])[1][2])
+
+    def test_pinned_line_is_the_tenant_config_entry(self):
+        self.assertEqual(pov.pinned_line(["payments", "a.b"]), '"hpa_pinned_namespaces": ["^payments$", "^a\\\\.b$"]')
+        cfg = json.loads("{" + pov.pinned_line(["payments"]) + "}")
+        self.assertEqual(cfg["hpa_pinned_namespaces"], ["^payments$"])
+
+    def test_browser_builders_match_python_with_confirmations(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        import subprocess
+        nss = self.prod["pov"]["namespaces"]; rows = self.prod["pov"]["rows"]
+        D = pov.page_data("prod-a", "2026-11-20", rows, nss)
+        allns = [n["ns"] for n in nss]
+        sel = list(model.POV_CR_TYPES)
+        ns_cases = [(allns, sel, []), (allns, sel, [self.NS]), ([self.NS], ["Deployment"], [self.NS]), (allns, sel, [self.NS, "payments"])]
+        ranks = [r["rank"] for r in rows]
+        wl_cases = [(sel, ranks, []), (sel, ranks, [self.NS, "payments"])]
+        src = (pov.JS_BUILD + ";" + pov.JS_BUILD_NS + ";var D=" + json.dumps(D)
+               + ";var o={ns:" + json.dumps(ns_cases) + ".map(function(c){return psBuildNs(D,c[0],c[1],c[2])}),"
+               + "wl:" + json.dumps(wl_cases) + ".map(function(c){return psBuild(D,c[0],c[1],c[2])}),"
+               + "line:psPinnedLine(['payments','a.b'])};process.stdout.write(JSON.stringify(o))")
+        got = json.loads(subprocess.run([node, "-e", src], capture_output=True, text=True, check=True).stdout)
+        for (ck, s, ok), js in zip(ns_cases, got["ns"]):
+            py = pov.bundle_ns("prod-a", "2026-11-20", nss, ck, s, hpa_ok=ok)
+            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"ns case {ok}")
+        for (s, tk, ok), js in zip(wl_cases, got["wl"]):
+            py = pov.bundle("prod-a", "2026-11-20", rows, s, set(tk), hpa_ok=ok)
+            self.assertEqual([[f["name"], f["docs"], f["text"]] for f in js], [list(x) for x in py], f"wl case {ok}")
+        self.assertEqual(got["line"], pov.pinned_line(["payments", "a.b"]))
 
     def test_pinned_override_touches_only_listed_namespaces(self):
         # The default fixture's own HPA-free namespaces are untouched either way.

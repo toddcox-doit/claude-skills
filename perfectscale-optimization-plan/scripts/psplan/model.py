@@ -279,6 +279,14 @@ def pov_namespaces(w, R):
         if reason:
             a["excl"].append({"name": x["name"], "type": x["type"], "reason": reason,
                               "pot": R(max(x["potential_savings"], 0.0))})
+            if reason == "hpa":
+                # What the namespace would add if the reviewer confirms these HPAs are pinned on the
+                # kickoff page: the page folds it into `auto` and drops the HPA exclusions.
+                h = a.setdefault("hpa_auto", {}).setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
+                h["n"] += 1
+                h["pot"] += R(max(x["potential_savings"], 0.0))
+                h["waste"] += R(max(x["waste"], 0.0))
+                h["risk"] += 1 if risk_sev(x) >= 3 else 0
             continue
         t = a["auto"].setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
         t["n"] += 1
@@ -535,7 +543,9 @@ def fingerprint(cfg, cluster, files):
     relevant = {k: cfg[k] for k in ("exclusions", "held_out_from_automation", "stateful_patterns", "managed_namespaces",
                                     "auto_provisioned_pool_patterns", "gpu_pool_patterns", "thresholds", "scale_to_days",
                                     "min_history_days", "cloud", "eligibility_file", "hpa_file",
-                                    "jvm_patterns", "nonprod_patterns", "pov_top_n", "pov_savings_weight")}
+                                    "jvm_patterns", "nonprod_patterns", "pov_top_n", "pov_savings_weight",
+                                    # changes each workload's HPA class: a stale cache would keep pinned workloads on Hold
+                                    "hpa_pinned_namespaces")}
     h.update(json.dumps(relevant, sort_keys=True).encode())
     return h.hexdigest()[:16]
 

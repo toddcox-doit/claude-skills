@@ -218,15 +218,24 @@ def verify(cfg, S, facts, files):
                 chk(not (d_ns & set(managed)), f"{p.name}: no platform-managed namespace can be generated")
                 chk(all(f"class=nsck value='{html.escape(ns)}' disabled" in t for ns in managed),
                     f"{p.name}: platform-managed namespaces are listed with their checkbox disabled")
-                chk(d_ns == {n["ns"] for n in model_ns if not n["managed"] and not n.get("held")},
-                    f"{p.name}: the namespace picker lists every namespace the model found automatable")
+                chk(d_ns == {n["ns"] for n in model_ns if not n["managed"] and (not n.get("held") or n.get("hpa_auto"))},
+                    f"{p.name}: the namespace picker lists every namespace the model found automatable, or releasable by an HPA confirmation")
                 # A namespace whose every workload is kept out (all behind pod CPU/memory HPAs, say) must
-                # still be visible - greyed, with its reason - and can never be generated. Dropping it hid
-                # a tenant's largest namespace with no explanation on the page.
-                held = [n["ns"] for n in model_ns if n.get("held")]
-                chk(not (d_ns & set(held)), f"{p.name}: no fully kept-out namespace can be generated")
-                chk(all(f"class=nsck value='{html.escape(ns)}' disabled" in t for ns in held),
+                # still be visible - greyed, with its reason - and starts not selectable. Dropping it hid
+                # a tenant's largest namespace with no explanation on the page. Only an HPA confirmation
+                # on the page can make it selectable; one held for any other reason never can.
+                held = [n for n in model_ns if n.get("held")]
+                chk(not (d_ns & {n["ns"] for n in held if not n.get("hpa_auto")}),
+                    f"{p.name}: no namespace kept out for a reason other than its HPAs can be generated")
+                chk(all(f"class=nsck value='{html.escape(n['ns'])}' disabled" in t for n in held),
                     f"{p.name}: fully kept-out namespaces are listed, greyed, with their checkbox disabled")
+                D_by = {n["ns"]: n for n in D.get("namespaces", [])}
+                chk(all(D_by[n["ns"]]["held"] for n in held if n["ns"] in D_by),
+                    f"{p.name}: fully kept-out namespaces stay flagged held in the page data until confirmed")
+                hpa_ns = [n["ns"] for n in model_ns if not n["managed"] and n.get("hpa_auto")]
+                chk(all(f"class=hpack value='{html.escape(ns)}'" in t for ns in hpa_ns) and " checked" not in
+                    "".join(re.findall(r"<input type=checkbox class=hpack[^>]*>", t)),
+                    f"{p.name}: every namespace with HPA-held workloads has an unticked HPA confirmation")
                 hh = (f.get("pov") or {}).get("hpa_held") or {}
                 chk(not hh.get("n") or "hpa_pinned_namespaces" in t,
                     f"{p.name}: workloads held for a pod CPU/memory HPA are counted, with the way to release them")

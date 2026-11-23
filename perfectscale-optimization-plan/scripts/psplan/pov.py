@@ -233,6 +233,14 @@ def file_heads(cluster, prepared):
                            "alone automates only this workload. With namespace configs applied as well, apply "
                            "this file after them: it replaces a namespace exclusion of the same name.")
                    + cost + tail),
+        # Added after a file's header when the reviewer ticked "HPA pinned" for its namespace on the page.
+        "hpa_ns": ("# HPA min = max: confirmed on the kickoff page\n# HPA workloads now covered: __NHPA__\n"
+                   + _para("The reviewer confirmed these HPAs are pinned; PerfectScale data cannot show it, as the "
+                           "public API carries no HPA min/max. If one can scale, a smaller request moves its "
+                           "scaling point: untick its confirmation and generate again.")),
+        "hpa_wl": ("# HPA min = max: confirmed on the kickoff page\n"
+                   + _para("The reviewer confirmed this workload's HPA is pinned; PerfectScale data cannot show it. "
+                           "If it can scale, a smaller request moves its scaling point.")),
     }
 
 
@@ -241,19 +249,30 @@ def wl_file(r):
     return f"workloads/{r['ns']}-{cr_name(r)}-workload-automation-config.yaml"
 
 
-def bundle(cluster, prepared, rows, selected, ticked=None):
+def bundle(cluster, prepared, rows, selected, ticked=None, hpa_ok=()):
     """Workload scope: the cluster prerequisite, then one file per ranked workload that is both of a
     selected controller type and ticked (ticked = set of ranks; None = every row), in rank order.
-    [(filename, n_docs, text)]. JS_BUILD reproduces this exactly from the pieces in the page."""
-    on = set(selected)
+    hpa_ok = namespaces whose pod CPU/memory HPAs the reviewer confirmed pinned on the page: their HPA
+    workloads' files record that. [(filename, n_docs, text)]. JS_BUILD reproduces this exactly."""
+    on, ok = set(selected), set(hpa_ok)
     rs = [r for r in rows if r["type"] in on and (ticked is None or r["rank"] in ticked)]
     heads = file_heads(cluster, prepared)
     out = [(f"{slug(cluster)}-cluster-automation-config.yaml", 1, heads["cluster"] + cluster_doc())]
     for r in rs:
         head = (heads["wlfile"].replace("__WLKIND__", r["type"]).replace("__WLNAME__", r["name"])
                 .replace("__WLNS__", r["ns"]).replace("__WLRANK__", str(r["rank"])))
+        if r.get("hpa_class") == "pod_resource" and r["ns"] in ok:
+            head += heads["hpa_wl"]
         out.append((wl_file(r), 1, head + "---\n" + workload_doc(r)))
     return out
+
+
+def pinned_line(names):
+    """The tenant-config entry for namespaces confirmed pinned on the page, so the next plan run moves
+    their savings out of the HPA action and into the automation waves. Kubernetes namespace names are
+    DNS labels, so only a dot (never legal, but cheap to guard) needs escaping."""
+    pats = ", ".join(json.dumps("^" + n.replace(".", "\\.") + "$") for n in names)
+    return f'"hpa_pinned_namespaces": [{pats}]'
 
 
 EXCL_REASON = {
@@ -275,73 +294,131 @@ def exclusion_doc(ns, x):
             "  automation:\n    operational:\n      automationMode: \"Disabled\"\n")
 
 
-def ns_enabled(n, selected):
+def hpa_confirmed(n, hpa_ok):
+    """The reviewer ticked "HPA pinned" for this namespace and it has HPA-held workloads to release."""
+    return n["ns"] in set(hpa_ok) and bool(n.get("hpa_auto"))
+
+
+def ns_auto(n, hpa_ok=()):
+    """`auto` per kind, plus the HPA-held workloads when their HPAs are confirmed pinned."""
+    if not hpa_confirmed(n, hpa_ok):
+        return n["auto"]
+    out = {t: dict(v) for t, v in n["auto"].items()}
+    for t, v in n["hpa_auto"].items():
+        a = out.setdefault(t, {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
+        for k in ("n", "pot", "risk", "waste"):
+            a[k] += v[k]
+    return out
+
+
+def ns_enabled(n, selected, hpa_ok=()):
     """The kinds a namespace's config enables: selected AND automatable in that namespace, so a
     namespace with no StatefulSets never gets StatefulSet automation switched on for later."""
-    return [t for t in POV_CR_TYPES if t in set(selected) and t in n["auto"]]
+    au = ns_auto(n, hpa_ok)
+    return [t for t in POV_CR_TYPES if t in set(selected) and t in au]
 
 
-def bundle_ns(cluster, prepared, namespaces, checked, selected):
+def bundle_ns(cluster, prepared, namespaces, checked, selected, hpa_ok=()):
     """Namespace scope: the cluster prerequisite, then one file per checked namespace holding its
     NamespaceAutomationConfig and a Disabled config for each workload kept out of it. Platform-
     managed namespaces are never written, and a namespace with none of the selected kinds is
-    skipped. JS_BUILD_NS reproduces this exactly."""
+    skipped. A fully held namespace is written only once its HPAs are confirmed pinned (hpa_ok), and
+    a confirmed namespace's HPA workloads ride along instead of being kept out. JS_BUILD_NS
+    reproduces this exactly."""
     ck = set(checked)
     heads = file_heads(cluster, prepared)
     out = [(f"{slug(cluster)}-cluster-automation-config.yaml", 1, heads["cluster"] + cluster_doc())]
     for n in namespaces:
-        if n["ns"] not in ck or n["managed"] or n.get("held"):
+        if n["ns"] not in ck or n["managed"]:
             continue
-        en = ns_enabled(n, selected)
+        conf = hpa_confirmed(n, hpa_ok)
+        if n.get("held") and not conf:
+            continue
+        en = ns_enabled(n, selected, hpa_ok)
         if not en:
             continue
-        ex = [x for x in n["excl"] if x["type"] in en]
+        ex = [x for x in n["excl"] if x["type"] in en and not (conf and x["reason"] == "hpa")]
+        nh = sum(1 for x in n["excl"] if conf and x["reason"] == "hpa" and x["type"] in en)
         head = (heads["nsfile"].replace("__NSNAME__", n["ns"]).replace("__TYPES__", ", ".join(en))
                 .replace("__NEX__", str(len(ex))))
+        if nh:
+            head += heads["hpa_ns"].replace("__NHPA__", str(nh))
         text = head + "---\n" + namespace_doc(n["ns"], en) + "".join("---\n" + exclusion_doc(n["ns"], x) for x in ex)
         out.append((f"namespaces/{n['ns']}-namespace-automation-config.yaml", 1 + len(ex), text))
     return out
 
 
-def page_data(cluster, prepared, rows, namespaces=()):
+LIB = "skill/perfectscale-optimization-plan/scripts"   # where new_tenant.py init puts the library in a tenant folder
+
+
+def rerun_commands(cfg):
+    """The commands an SE runs from the tenant folder, with this tenant's config path filled in -
+    relative, so the page carries no local filesystem path."""
+    src = getattr(cfg, "src", None)
+    try:
+        rel = src.relative_to(cfg.root).as_posix() if src else None
+    except ValueError:
+        rel = None
+    rel = rel or f"config/{slug(cfg['customer'])}.tenant.json"
+    return {"pin": f"python3 {LIB}/run_plan.py --config {rel} --pin-hpa",
+            "helper": f"python3 {LIB}/kickoff.py --config {rel}"}
+
+
+def page_data(cluster, prepared, rows, namespaces=(), rerun=None):
     """Everything JS_BUILD/JS_BUILD_NS need, every text piece as a list of lines (see the module
     docstring). Platform-managed namespaces are left out: they cannot be generated."""
     L = lambda s: s.split("\n")  # noqa: E731
     return {
+        "rerun": rerun or {"pin": f"python3 {LIB}/run_plan.py --config config/<tenant>.tenant.json --pin-hpa",
+                           "helper": f"python3 {LIB}/kickoff.py --config config/<tenant>.tenant.json"},
         "slug": slug(cluster), "types": list(POV_CR_TYPES),
         "head": {k: L(v) for k, v in file_heads(cluster, prepared).items()},
         "cluster_doc": L(cluster_doc()), "ns_head": L(NS_HEAD),
         "type_block": {t: L(ns_type_block(t)) for t in POV_CR_TYPES},
         "rows": [{"rank": r["rank"], "ns": r["ns"], "name": r["name"], "type": r["type"], "file": wl_file(r),
-                  "wl_doc": L(workload_doc(r))} for r in rows],
-        "namespaces": [{"ns": n["ns"], "ns_q": q(n["ns"]), "auto": n["auto"],
-                        "excl": [{"type": x["type"], "doc": L(exclusion_doc(n["ns"], x))} for x in n["excl"]]}
-                       for n in namespaces if not n["managed"] and not n.get("held")],
+                  "hpa_hold": r.get("hpa_class") == "pod_resource", "wl_doc": L(workload_doc(r))} for r in rows],
+        # A fully held namespace is included only when its HPAs could be confirmed pinned on the page.
+        "namespaces": [{"ns": n["ns"], "ns_q": q(n["ns"]), "auto": n["auto"], "hpa_auto": n.get("hpa_auto") or {},
+                        "held": bool(n.get("held")), "held_pot": n.get("held_pot") or 0.0,
+                        "excl": [{"type": x["type"], "hpa": x["reason"] == "hpa", "doc": L(exclusion_doc(n["ns"], x))} for x in n["excl"]]}
+                       for n in namespaces if not n["managed"] and (not n.get("held") or n.get("hpa_auto"))],
     }
 
 
 # Pure: no DOM, no globals beyond their arguments. JS_BUILD mirrors bundle() and JS_BUILD_NS mirrors
 # bundle_ns() line for line; tests run both under node and compare the output byte-for-byte.
-JS_BUILD = """function psBuild(D,sel,ticked){
+JS_BUILD = """function psBuild(D,sel,ticked,hpaok){
 var J=function(a){return a.join('\\n')};
 var on={};sel.forEach(function(t){on[t]=1});
+var ok={};(hpaok||[]).forEach(function(n){ok[n]=1});
 var tk=null;if(ticked){tk={};ticked.forEach(function(k){tk[k]=1})}
 var out=[{name:D.slug+'-cluster-automation-config.yaml',docs:1,text:J(D.head.cluster)+J(D.cluster_doc)}];
 D.rows.forEach(function(r){if(!on[r.type]||(tk&&!tk[r.rank]))return;
 var head=J(D.head.wlfile).split('__WLKIND__').join(r.type).split('__WLNAME__').join(r.name).split('__WLNS__').join(r.ns).split('__WLRANK__').join(String(r.rank));
+if(r.hpa_hold&&ok[r.ns])head+=J(D.head.hpa_wl);
 out.push({name:r.file,docs:1,text:head+'---\\n'+J(r.wl_doc)})});
 return out}"""
 
-JS_BUILD_NS = """function psEnabled(D,n,sel){var on={};sel.forEach(function(t){on[t]=1});
-return D.types.filter(function(t){return on[t]&&n.auto[t]})}
-function psBuildNs(D,checked,sel){
+JS_BUILD_NS = """function psConf(n,ok){return !!ok[n.ns]&&Object.keys(n.hpa_auto||{}).length>0}
+function psAuto(n,ok){if(!psConf(n,ok))return n.auto;var o={};
+Object.keys(n.auto).forEach(function(t){var a=n.auto[t];o[t]={n:a.n,pot:a.pot,risk:a.risk,waste:a.waste}});
+Object.keys(n.hpa_auto).forEach(function(t){var v=n.hpa_auto[t],a=o[t]||(o[t]={n:0,pot:0,risk:0,waste:0});a.n+=v.n;a.pot+=v.pot;a.risk+=v.risk;a.waste+=v.waste});
+return o}
+function psEnabled(D,n,sel,ok){var on={};sel.forEach(function(t){on[t]=1});var au=psAuto(n,ok||{});
+return D.types.filter(function(t){return on[t]&&au[t]})}
+function psPinnedLine(names){return '"hpa_pinned_namespaces": ['+names.map(function(n){return JSON.stringify('^'+n.split('.').join('\\\\.')+'$')}).join(', ')+']'}
+function psBuildNs(D,checked,sel,hpaok){
 var J=function(a){return a.join('\\n')};
 var ck={};checked.forEach(function(n){ck[n]=1});
+var ok={};(hpaok||[]).forEach(function(n){ok[n]=1});
 var out=[{name:D.slug+'-cluster-automation-config.yaml',docs:1,text:J(D.head.cluster)+J(D.cluster_doc)}];
 D.namespaces.forEach(function(n){if(!ck[n.ns])return;
-var en=psEnabled(D,n,sel);if(!en.length)return;
-var ex=n.excl.filter(function(x){return en.indexOf(x.type)>=0});
+var conf=psConf(n,ok);if(n.held&&!conf)return;
+var en=psEnabled(D,n,sel,ok);if(!en.length)return;
+var ex=n.excl.filter(function(x){return en.indexOf(x.type)>=0&&!(conf&&x.hpa)});
+var nh=n.excl.filter(function(x){return conf&&x.hpa&&en.indexOf(x.type)>=0}).length;
 var head=J(D.head.nsfile).split('__NSNAME__').join(n.ns).split('__TYPES__').join(en.join(', ')).split('__NEX__').join(String(ex.length));
+if(nh)head+=J(D.head.hpa_ns).split('__NHPA__').join(String(nh));
 var text=head+'---\\n'+J(D.ns_head).split('__NS__').join(n.ns_q)+en.map(function(t){return J(D.type_block[t])}).join('')
 +ex.map(function(x){return '---\\n'+J(x.doc)}).join('');
 out.push({name:'namespaces/'+n.ns+'-namespace-automation-config.yaml',docs:1+ex.length,text:text})});
@@ -369,18 +446,23 @@ var box=document.getElementById('typemenu'),btn=document.getElementById('typebtn
 if(!box)return;
 var NS={};D.namespaces.forEach(function(n){NS[n.ns]=n});
 var cbs=[].slice.call(box.querySelectorAll('input[type=checkbox]'));
-var nck=[].slice.call(document.querySelectorAll('#povns input.nsck:not([disabled])'));
+// Managed rows are never selectable; a held row's checkbox is enabled only while its HPAs are confirmed.
+var nck=[].slice.call(document.querySelectorAll('#povns tr:not([data-managed]) input.nsck'));
+var hck=[].slice.call(document.querySelectorAll('#povns input.hpack'));
 var wck=[].slice.call(document.querySelectorAll('table.povgrp input.wlck'));
+document.querySelectorAll('#povns tr[data-held]').forEach(function(tr){tr.dataset.why=tr.cells[3].textContent});
 function vis(c){var tr=c.closest('tr');return !tr.hidden&&!tr.classList.contains('off')}
 function sel(){return cbs.filter(function(c){return c.checked}).map(function(c){return c.value})}
+function hpaok(){return hck.filter(function(c){return c.checked}).map(function(c){return c.value})}
+function okmap(){var o={};hpaok().forEach(function(n){o[n]=1});return o}
 // Only what is on screen counts: a row hidden by the controller-type filter keeps its tick for when
 // the type comes back, but is never generated and never counted.
-function ticked(){return nck.filter(function(c){return c.checked&&vis(c)}).map(function(c){return c.value})}
+function ticked(){return nck.filter(function(c){return c.checked&&!c.disabled&&vis(c)}).map(function(c){return c.value})}
 function wticked(){return wck.filter(function(c){return c.checked&&vis(c)}).map(function(c){return +c.value})}
 function m(v){return '$'+Math.round(v).toLocaleString('en-US')}
 function pl(n,w){return n+' '+w+(n===1?'':'s')}
 var last=null,inview={};
-function key(kind){return kind==='wl'?'wl|'+sel().join(',')+'|'+wticked().join(','):'ns|'+sel().join(',')+'|'+ticked().join(',')}
+function key(kind){return (kind==='wl'?'wl|'+sel().join(',')+'|'+wticked().join(','):'ns|'+sel().join(',')+'|'+ticked().join(','))+'|hpa:'+hpaok().join(',')}
 function stale(){var o=document.getElementById('out');if(last&&!o.hidden)document.getElementById('stale').hidden=key(last)===o.dataset.key}
 function apply(){
  var s=sel(),on={};s.forEach(function(t){on[t]=1});
@@ -397,22 +479,61 @@ function apply(){
  document.getElementById('typesum').textContent=s.length===cbs.length?'All ('+s.length+')':(s.length?s.join(', '):'None');
  document.getElementById('scope').textContent=shown?(n+' of '+pl(shown,'workload')+' ticked across '+pl(k,'namespace')+' \\u00b7 '+m(pot)+'/mo potential savings \\u00b7 '+risk+' at High or Critical risk'):'No ranked workloads match. Pick at least one controller type.';
  document.getElementById('genwl').disabled=!n;
- var nShown=0,nGen=0,npot=0,nex=0;
+ var nShown=0,nGen=0,npot=0,nex=0,ok=okmap();
  document.querySelectorAll('#povns tbody tr').forEach(function(tr){
   if(tr.dataset.managed){tr.hidden=!tr.dataset.types.split(',').some(function(t){return on[t]});return}
   var x=NS[tr.dataset.n];if(!x)return;
-  var en=psEnabled(D,x,s);tr.hidden=!en.length;if(!en.length)return;nShown++;
-  var w=0,p=0,r=0;en.forEach(function(t){var a=x.auto[t];w+=a.n;p+=a.pot;r+=a.risk});
-  var ex=x.excl.filter(function(y){return en.indexOf(y.type)>=0}).length,iv=inview[x.ns]||0,c=tr.cells;
+  var conf=psConf(x,ok),nc=tr.querySelector('input.nsck'),c=tr.cells;
+  if(x.held&&!conf){
+   nc.disabled=true;nc.checked=false;tr.classList.add('held');
+   tr.hidden=!tr.dataset.types.split(',').some(function(t){return on[t]});
+   c[2].textContent='0';c[3].textContent=tr.dataset.why;c[4].textContent=m(x.held_pot)+'/mo on hold';c[5].textContent='-';
+   c[6].textContent=x.excl.length;c[7].textContent='-';return}
+  nc.disabled=false;tr.classList.remove('held');
+  var au=psAuto(x,ok),en=psEnabled(D,x,s,ok);tr.hidden=!en.length;if(!en.length)return;nShown++;
+  var w=0,p=0,r=0;en.forEach(function(t){var a=au[t];w+=a.n;p+=a.pot;r+=a.risk});
+  var ex=x.excl.filter(function(y){return en.indexOf(y.type)>=0&&!(conf&&y.hpa)}).length,iv=inview[x.ns]||0;
   c[2].textContent=w;c[2].dataset.v=w;c[3].textContent=en.join(', ');
   c[4].textContent=m(p)+'/mo';c[4].dataset.v=p;c[5].textContent=r||'-';c[5].dataset.v=r;
   c[6].textContent=ex||'-';c[6].dataset.v=ex;c[7].textContent=iv||'-';c[7].dataset.v=iv;
   if(tr.querySelector('input.nsck').checked){nGen++;npot+=p;nex+=ex}});
  document.getElementById('nsscope').textContent=nShown?(nGen?(nGen+' of '+pl(nShown,'namespace')+' ticked \\u00b7 '+pl(nGen,'file')+' to write \\u00b7 '+m(npot)+'/mo potential savings covered \\u00b7 '+pl(nex,'workload')+' kept out'):'No namespace ticked.'):'No namespace runs the selected controller types.';
  document.getElementById('genns').disabled=!nGen;
+ var hl=hpaok(),hb=document.getElementById('hpabar');
+ if(hb){hb.hidden=!hl.length;
+  document.getElementById('hpaline').textContent=hl.length?('HPA confirmed pinned in '+pl(hl.length,'namespace')+' ('+hl.join(', ')+
+   '). The files you generate here already reflect it. To also count it in the plan and executive summary, update the plan:'):'';
+  document.getElementById('hpacmd').textContent=hl.length?(D.rerun.pin+' '+hl.join(' ')):''}
  stale()}
 cbs.concat(nck,wck).forEach(function(c){c.addEventListener('change',apply)});
-function all(list,v){list.forEach(function(c){if(vis(c)||!v)c.checked=v});apply()}
+// Confirming a namespace's HPAs pinned is the go-ahead for its held workloads: the namespace is ticked
+// for generation and its Hold rows are ticked in the ranked table. Unticking takes both back.
+hck.forEach(function(h){h.addEventListener('change',function(){
+ var ns=h.value,on=h.checked,nc=h.closest('tr').querySelector('input.nsck');
+ if(on){nc.disabled=false;nc.checked=true}else if(NS[ns]&&NS[ns].held){nc.checked=false}
+ wck.forEach(function(c){var r=c.closest('tr');if(r.dataset.hold&&r.dataset.n===ns){c.checked=on;r.classList.toggle('hpaok',on)}});
+ apply()})});
+var hc=document.getElementById('hpacopy');if(hc)hc.addEventListener('click',function(){copy(D.rerun.pin+' '+hpaok().join(' '),hc)});
+var hh=document.getElementById('hpahelper');if(hh)hh.textContent=D.rerun.helper;
+// Opened through kickoff.py (the local helper injects PS_HELPER): one click saves the confirmations,
+// renders the next version and opens it. Without the helper the command above does the same.
+var H=window.PS_HELPER,run=document.getElementById('hparun');
+if(H&&run){
+ document.querySelector('.hparunp').hidden=false;document.querySelector('.hpacmdp').hidden=true;document.querySelector('.hpahint').hidden=true;
+ run.addEventListener('click',function(){
+  var ns=hpaok(),st=document.getElementById('hpastatus');if(!ns.length)return;
+  run.disabled=true;st.textContent='Updating the plan, executive summary and kickoff pages...';
+  function fail(msg){run.disabled=false;st.textContent='Update failed: '+msg}
+  fetch(H.api+'pin-hpa',{method:'POST',headers:{'Content-Type':'application/json','X-PS-Token':H.token},
+   body:JSON.stringify({namespaces:ns,page:location.pathname})})
+  .then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j})})
+  .then(function(j){(function poll(){
+   fetch(H.api+'job/'+j.job,{headers:{'X-PS-Token':H.token}}).then(function(r){return r.json()}).then(function(s){
+    if(s.state==='running'){st.textContent='Updating... '+(s.step||'');setTimeout(poll,1500);return}
+    if(s.state==='done'){st.textContent='Done: '+s.version+' is ready. Opening it...';location.href=s.url;return}
+    fail(s.error||'see the terminal running kickoff.py')},function(){fail('lost contact with kickoff.py - is it still running?')})})()})
+  .catch(function(e){fail(e.message)})})}
+function all(list,v){list.forEach(function(c){if((vis(c)&&!c.disabled)||!v)c.checked=v});apply()}
 document.getElementById('tall').addEventListener('click',function(){cbs.forEach(function(c){c.checked=true});apply()});
 document.getElementById('tnone').addEventListener('click',function(){cbs.forEach(function(c){c.checked=false});apply()});
 document.querySelectorAll('button.gsel').forEach(function(b){b.addEventListener('click',function(){
@@ -420,7 +541,7 @@ document.querySelectorAll('button.gsel').forEach(function(b){b.addEventListener(
  all([].slice.call(t.querySelectorAll('input.wlck')),b.dataset.v==='1')})});
 document.getElementById('nsall').addEventListener('click',function(){all(nck,true)});
 document.getElementById('nsnone').addEventListener('click',function(){all(nck,false)});
-document.getElementById('nsmatch').addEventListener('click',function(){nck.forEach(function(c){c.checked=!!inview[c.value]});apply()});
+document.getElementById('nsmatch').addEventListener('click',function(){nck.forEach(function(c){c.checked=!c.disabled&&!!inview[c.value]});apply()});
 btn.addEventListener('click',function(ev){ev.stopPropagation();var o=box.hidden;box.hidden=!o;btn.setAttribute('aria-expanded',o?'true':'false')});
 document.addEventListener('click',function(ev){if(!box.hidden&&!box.contains(ev.target)&&ev.target!==btn){box.hidden=true;btn.setAttribute('aria-expanded','false')}});
 document.addEventListener('keydown',function(ev){if(ev.key==='Escape'&&!box.hidden){box.hidden=true;btn.setAttribute('aria-expanded','false');btn.focus()}});
@@ -445,10 +566,11 @@ function show(kind,title,what,zn){
  var out=document.getElementById('out');out.hidden=false;out.dataset.key=key(kind);document.getElementById('stale').hidden=true;
  document.getElementById('outtitle').textContent=title;document.getElementById('outsel').textContent=what;
  out.scrollIntoView({behavior:'smooth',block:'start'})}
-document.getElementById('genwl').addEventListener('click',function(){var s=sel();files=psBuild(D,s,wticked());if(files.length<2)return;
- show('wl','Generated workload CRDs','Controller types: '+s.join(', ')+'. '+pl(files.length-1,'ticked workload')+', one file each.',D.slug+'-workload-automation-crds.zip')});
-document.getElementById('genns').addEventListener('click',function(){var s=sel();files=psBuildNs(D,ticked(),s);if(files.length<2)return;
- show('ns','Generated namespace CRDs','Controller types: '+s.join(', ')+'. '+pl(files.length-1,'ticked namespace')+', one file each.',D.slug+'-namespace-automation-crds.zip')});
+function hnote(){var h=hpaok();return h.length?' HPA confirmed pinned: '+h.join(', ')+'.':''}
+document.getElementById('genwl').addEventListener('click',function(){var s=sel();files=psBuild(D,s,wticked(),hpaok());if(files.length<2)return;
+ show('wl','Generated workload CRDs','Controller types: '+s.join(', ')+'. '+pl(files.length-1,'ticked workload')+', one file each.'+hnote(),D.slug+'-workload-automation-crds.zip')});
+document.getElementById('genns').addEventListener('click',function(){var s=sel();files=psBuildNs(D,ticked(),s,hpaok());if(files.length<2)return;
+ show('ns','Generated namespace CRDs','Controller types: '+s.join(', ')+'. '+pl(files.length-1,'ticked namespace')+', one file each.'+hnote(),D.slug+'-namespace-automation-crds.zip')});
 document.getElementById('zip').addEventListener('click',function(){if(files.length)save(zipname,psZip(files))});
 apply()})()"""
 
@@ -462,6 +584,15 @@ POV_CSS = """.pd{position:relative;display:inline-block}
 .nsbar button:not(.go){font:inherit;font-size:13px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 9px;cursor:pointer}
 .nsbar button:not(.go):hover{border-color:var(--acc);color:var(--acc)}
 #povns tr.mgd td{color:var(--mut)}
+#povns tr.held td{color:var(--mut)}
+#povns tr.held td:last-child{color:var(--fg)}
+#povns .hpalb{white-space:nowrap;cursor:pointer;font-size:13px}
+.hpabar{font-size:13px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:0 0 10px;word-break:break-all}
+.hpabar p{margin:4px 0}
+.hpabar code{font-size:12px;background:var(--bg,#f6f7f9);padding:1px 4px;border-radius:4px}
+.hpabar button:not(.go){font:inherit;font-size:13px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 9px;cursor:pointer;margin-left:6px}
+.hpabar .go{margin-left:0}
+table.povgrp tr.hpaok td.wnote::before{content:"HPA confirmed pinned. ";color:var(--fg);font-weight:600}
 /* HPA metric names are single tokens up to ~80 characters (org_eclipse_jetty_..._utilization). Unbroken,
    the browser sizes the whole column to the longest one and squeezes the rest; breaking anywhere lets it
    collapse to a sliver. So: break only after underscores (<wbr>), and keep a readable minimum width. */
@@ -520,7 +651,8 @@ def _wave_legend(f, pv):
     rows = pv.get("rows") or []
     c = {k: sum(1 for r in rows if (r.get("wave") or "1") == k) for k in WAVE_ORDER}
     src = ("HPA triggers come from PerfectScale's public API v2. It carries no HPA min/max replicas, so an HPA "
-           "pinned at fixed replicas also shows as Hold; move it to scope by hand once confirmed."
+           "pinned at fixed replicas also shows as Hold; once the owner confirms min = max, tick HPA pinned for its "
+           "namespace under Namespace scope and its Hold rows join the scope."
            if (f.get("api_v2") or {}).get("provided") else
            "HPA data was not collected for this run, so every row's HPA reads Unknown and nothing is held for its "
            "HPA. Store API credentials (scripts/set_api_credentials.sh) and re-collect to sort rows by HPA.")
@@ -580,7 +712,8 @@ def _wave_groups(rows):
         for r in rs:
             k = f"r{r['rank']}"
             notes = table_notes(r)
-            P.append(f"<tr data-type='{e(r['type'])}' data-ns='{k}' data-n='{e(r['ns'])}' data-pot='{r['pot']:.2f}' data-sev='{r['risk_sev']}'>"
+            hold = " data-hold=1" if r.get("hpa_class") == "pod_resource" else ""
+            P.append(f"<tr data-type='{e(r['type'])}' data-ns='{k}' data-n='{e(r['ns'])}' data-pot='{r['pot']:.2f}' data-sev='{r['risk_sev']}'{hold}>"
                      f"<td><input type=checkbox class=wlck value='{r['rank']}'{' checked' if default_ticked(r) else ''} aria-label='Include {e(r['name'])}'></td>"
                      f"<td data-v='{e(r['name'])}'><button type=button class=nstog aria-expanded=false>{e(r['name'])}</button>"
                      f"<div class=wsub>{e(r['ns'])} · {e(r['type'])}</div></td>"
@@ -717,9 +850,10 @@ def render_pov_html(cfg, f):
     held = _held_lines(pv)
     if held:
         P.append("<h2>Kept out of this table</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in held) + "</ul>")
-    P.append("<p class=fn>Read-only: this page was generated from PerfectScale data and changes nothing. The configs follow the "
+    P.append("<p class=fn>Read-only for the cluster: this page was generated from PerfectScale data and applies nothing. Opened "
+             "with kickoff.py, its update button regenerates these reports and nothing else. The configs follow the "
              "cost-optimization profile of PerfectScale's published automation examples, with keepLimit set to false for review.</p></main>")
-    data = json.dumps(page_data(cluster, prepared, rows, namespaces), ensure_ascii=False).replace("</", "<\\/")
+    data = json.dumps(page_data(cluster, prepared, rows, namespaces, rerun=rerun_commands(cfg)), ensure_ascii=False).replace("</", "<\\/")
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>{e(title)}</title><style>{CSS}\n{POV_CSS}</style></head><body>{''.join(P)}"
             f"<script type=application/json id=povdata>{data}</script>"
@@ -742,29 +876,50 @@ def _ns_section(pv, namespaces, in_table):
          "A namespace where every workload is kept out is listed greyed with the reason, not selectable. Only namespaces "
          f"that run one of the selected controller types are shown. Ticked by default: the namespaces the ranked table "
          f"touches with at least ${AUTOMATION_MIN_USD}/mo of waste to act on.</p>"
+         "<p class=mut><b>HPA pinned (min = max):</b> tick it once the namespace owner confirms its pod CPU/memory HPAs have "
+         "minReplicas equal to maxReplicas. The namespace becomes selectable with those workloads covered instead of kept "
+         "out, its Hold rows in the ranked table are ticked, and every generated file records the confirmation. Untick to "
+         "undo. To count them in the plan and executive summary as well, use the update button (or command) that appears.</p>"
          "<div class=nsbar><button type=button id=nsall>Select all</button><button type=button id=nsnone>Clear</button>"
          "<button type=button id=nsmatch>Match the table</button>"
          "<button type=button id=genns class=go>Generate namespace CRDs</button><span id=nsscope class=mut></span></div>"
+         "<div id=hpabar class=hpabar hidden><p id=hpaline></p>"
+         "<p class=hparunp hidden><button type=button id=hparun class=go>Update the plan with these confirmations</button> "
+         "<span id=hpastatus class=mut></span></p>"
+         "<p class=hpacmdp>Or run this in a terminal, in the tenant folder: <code id=hpacmd></code> "
+         "<button type=button id=hpacopy>Copy command</button></p>"
+         "<p class='hpahint mut'>For a one-click update button instead, open this page with "
+         "<code id=hpahelper></code></p></div>"
          "<div class=wrap><table id=povns class=sort><thead><tr><th>In scope</th><th>Namespace</th><th>Workloads covered</th>"
          "<th>Controller types enabled</th><th>Potential savings</th><th>At High or Critical risk</th><th>Kept out</th>"
-         "<th>Ticked in ranked table</th></tr></thead><tbody>"]
+         "<th>Ticked in ranked table</th><th>HPA pinned (min = max)</th></tr></thead><tbody>"]
+
+    def hpa_cell(n, k):
+        if not n.get("hpa_auto"):
+            return "<td>-</td>"
+        nh = sum(v["n"] for v in n["hpa_auto"].values())
+        return (f"<td><label class=hpalb><input type=checkbox class=hpack value='{k}' "
+                f"aria-label='HPAs in {k} confirmed pinned (min = max)'> {plural(nh, 'workload')}</label></td>")
     for n in namespaces:
         k = e(n["ns"])
         if n["managed"]:
             P.append(f"<tr class=mgd data-managed=1 data-types='{e(','.join(n['types']))}' data-n='{k}'><td><input type=checkbox class=nsck value='{k}' disabled "
                      f"aria-label='{k} (platform-managed, not selectable)'></td><td>{k}</td><td>-</td>"
-                     "<td>Platform-managed: not automated</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>")
+                     "<td>Platform-managed: not automated</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>")
             continue
         if n.get("held"):
-            # data-managed reuses the greyed-row path in the page script: shown while one of its kinds is
-            # selected, never recomputed, never generated.
             nex = len(n["excl"])
             why = "; ".join(f"{HELD_REASON.get(k, k)} ({v})" if len(n["held_reasons"]) > 1 else HELD_REASON.get(k, k)
                             for k, v in n["held_reasons"].items())
-            P.append(f"<tr class=mgd data-managed=1 data-types='{e(','.join(n['types']))}' data-n='{k}'><td><input type=checkbox class=nsck value='{k}' disabled "
+            # Held with nothing an HPA confirmation could release: the greyed managed path (shown while one
+            # of its kinds is selected, never recomputed, never generated). Held behind HPAs: a live row the
+            # page script enables when "HPA pinned" is ticked.
+            attrs = (f"class=held data-held=1 data-types='{e(','.join(n['types']))}'" if n.get("hpa_auto")
+                     else f"class=mgd data-managed=1 data-types='{e(','.join(n['types']))}'")
+            P.append(f"<tr {attrs} data-n='{k}'><td><input type=checkbox class=nsck value='{k}' disabled "
                      f"aria-label='{k} (every workload kept out, not selectable)'></td><td>{k}</td><td class=num data-v='0'>0</td>"
                      f"<td>Held: {e(why)} on every workload</td><td class=num data-v='{n['held_pot']:.2f}'>{usd(n['held_pot'])}/mo on hold</td>"
-                     f"<td>-</td><td class=num data-v='{nex}'>{nex}</td><td class=num>-</td></tr>")
+                     f"<td>-</td><td class=num data-v='{nex}'>{nex}</td><td class=num>-</td>{hpa_cell(n, k)}</tr>")
             continue
         w = sum(t["n"] for t in n["auto"].values()); r = sum(t["risk"] for t in n["auto"].values())
         tick = n["ns"] in in_table and sum(t.get("waste", 0.0) for t in n["auto"].values()) >= AUTOMATION_MIN_USD
@@ -772,7 +927,7 @@ def _ns_section(pv, namespaces, in_table):
                  f"aria-label='Include {k}'></td><td>{k}</td>"
                  f"<td class=num data-v='{w}'>{w}</td><td>{e(', '.join(t for t in POV_CR_TYPES if t in n['auto']))}</td>"
                  f"<td class=num data-v='{n['pot']:.2f}'>{usd(n['pot'])}/mo</td><td class=num data-v='{r}'>{r or '-'}</td>"
-                 f"<td class=num data-v='{len(n['excl'])}'>{len(n['excl']) or '-'}</td><td class=num>-</td></tr>")
+                 f"<td class=num data-v='{len(n['excl'])}'>{len(n['excl']) or '-'}</td><td class=num>-</td>{hpa_cell(n, k)}</tr>")
     P.append("</tbody></table></div>")
     if pv.get("ns_nothing_to_automate"):
         P.append(f"<p class=fn>{plural(pv['ns_nothing_to_automate'], 'other namespace')} not listed: everything in them is "
