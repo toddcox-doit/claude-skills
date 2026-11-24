@@ -29,6 +29,7 @@ descending savings order, and that order carries through every output.
 """
 import argparse
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -177,6 +178,11 @@ def cmd_config(a):
         "foreign_tenants": [t.strip() for t in (a.foreign or "").split(",") if t.strip()],
         "previous_plan": None,
     })
+    tid = (getattr(a, "tenant_id", None) or "").strip().lower()
+    if tid:
+        if not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", tid):
+            raise SystemExit(f"--tenant-id {tid!r} is not a tenant UUID")
+        cfg["snapshots"] = {"tenant_id": tid}       # for scripts/snapshots.py; the bucket is per machine
     dest = root / "config" / f"{slug(customer)}.tenant.json"
     if dest.exists() and not a.force:
         raise SystemExit(f"{dest} already exists; pass --force to overwrite")
@@ -201,6 +207,8 @@ def cmd_config(a):
     print("  foreign_tenants           other customers this folder has held, for the leak scan")
     print()
     print("Then:")
+    if tid:
+        print(f"  python3 skill/{LIB.name}/scripts/snapshots.py      # optional: HPA/PDB facts from the cluster snapshots")
     print(f"  python3 skill/{LIB.name}/scripts/run_plan.py --config {dest.relative_to(root)} --collect")
     print(f"  python3 skill/{LIB.name}/scripts/run_plan.py --config {dest.relative_to(root)}")
     return 0
@@ -266,7 +274,7 @@ def cmd_onboard(a):
               f"--top {a.top}\n  (or --clusters a,b,c for an explicit scope)")
         return 0
     cmd_config(argparse.Namespace(dir=str(root), customer=a.customer, profile=a.profile, cloud=None, top=a.top,
-                                  clusters=a.clusters, foreign=None, force=a.force))
+                                  clusters=a.clusters, foreign=None, force=a.force, tenant_id=a.tenant_id))
     if a.collect:
         cfg = root / "config" / f"{slug(a.customer)}.tenant.json"
         print("\nCollecting ...")
@@ -301,6 +309,7 @@ def main():
     o.add_argument("--write-config", action="store_true", help="write the config from the ranking without stopping to review")
     o.add_argument("--collect", action="store_true", help="also collect the configured clusters (implies --write-config)")
     o.add_argument("--force", action="store_true")
+    o.add_argument("--tenant-id", help="the tenant's UUID, saved in the config for snapshots.py")
     o.set_defaults(fn=cmd_onboard)
 
     lp = sub.add_parser("launcher", help=f"add the double-click '{LAUNCHER}' to an existing tenant folder")
@@ -315,6 +324,7 @@ def main():
     c.add_argument("--top", type=int, default=10)
     c.add_argument("--clusters", help="explicit comma-separated names or UIDs, instead of --top")
     c.add_argument("--foreign", help="comma-separated other tenant names, for the leak scan")
+    c.add_argument("--tenant-id", help="the tenant's UUID, saved in the config for snapshots.py")
     c.add_argument("--force", action="store_true")
     c.set_defaults(fn=cmd_config)
 

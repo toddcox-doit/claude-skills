@@ -10,18 +10,23 @@ cost or recommendations - those still come from the API - but it carries what th
 HPA minReplicas/maxReplicas and every scaling metric, PDBs, node pools and the autoscaler, the
 PerfectScale component versions installed, and how replica and node counts move over time.
 
-Two steps, both run by the SE:
-  pull    lists the month with `aws s3 ls` and copies the chosen snapshots (`aws s3 cp`) into
-          <tenant>/data/snapshots/<cluster>/. The AWS CLI uses the SE's own profile; nothing here
-          sees a credential.
+One command, run by the SE (`snapshots.py pull`), does both steps:
+  pull    lists the trailing window (30 days by default) with `aws s3 ls` and copies the chosen
+          snapshots (`aws s3 cp`) into <tenant>/data/snapshots/<cluster>/. The AWS CLI uses the
+          SE's own profile; nothing here sees a credential.
   digest  reads those zips and writes <tenant>/data/snapshots/<cluster>/digest.json: only the
           fields the plan uses. Annotations, environment values and images other than PerfectScale's
           are never copied - the raw snapshot carries kubectl last-applied configurations with
           literal environment values, so the zips stay in the tenant folder and only the digest is
           read downstream.
 
-The bucket is not named in the skill: the tenant config holds it, with the tenant id
-("snapshots": {"s3_prefix": "s3://<bucket>/raw", "tenant_id": "<uuid>"}).
+Two values, each given once and then remembered:
+  - the bucket prefix (s3://<bucket>/raw), per machine: --bucket saves it to
+    ~/.perfectscale/snapshots.json (PS_SNAPSHOT_PREFIX in the environment also works). It is never
+    named in the skill or in a tenant config.
+  - the tenant UUID, per tenant: --tenant-id saves it in the tenant config ("snapshots":
+    {"tenant_id": ...}); `new_tenant.py config/onboard --tenant-id` writes it at setup.
+Cluster ids come from the config's clusters, which the tenant setup already wrote.
 """
 import json
 
@@ -37,6 +42,9 @@ PREFIX_RX = re.compile(r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/[A-Za-z0-9._=-]
 KEY_RX = re.compile(r"snapshots/year=(\d{4})/month=(\d{2})/day=(\d{2})/(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})_v(\d+)\.zip$")
 LOCAL_RX = re.compile(r"^(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})_v\d+\.zip$")
 SAMPLES = ("latest", "daily", "week", "all")
+DEFAULT_DAYS = 30      # one daily snapshot a day: replica and node movement over a month, the plan's run-rate window
+MIN_DAYS = 14          # the plan's own min_history_days: fewer days of snapshots and the trends are flagged as short
+MACHINE_FILE = Path.home() / ".perfectscale" / "snapshots.json"
 MAX_JSON = 512 * 1024 * 1024          # one unpacked snapshot is ~15 MB; refuse anything absurd
 POOL_LABELS = ("cloud.google.com/gke-nodepool", "eks.amazonaws.com/nodegroup", "karpenter.sh/nodepool",
                "agentpool", "kubernetes.azure.com/agentpool", "node.kubernetes.io/instancegroup")
@@ -45,15 +53,40 @@ EVICT = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 
 # ---------------------------------------------------------------- config / naming
 
-def settings(cfg_raw):
-    """(s3_prefix, tenant_id, [(name, uid)]) from the tenant config, validated."""
-    s = cfg_raw.get("snapshots") or {}
-    prefix, tid = (s.get("s3_prefix") or "").rstrip("/"), s.get("tenant_id") or ""
+def machine_prefix(path=None):
+    p = Path(path or MACHINE_FILE)
+    try:
+        return (json.loads(p.read_text()).get("s3_prefix") or "").rstrip("/")
+    except (OSError, ValueError):
+        return ""
+
+
+def save_machine_prefix(prefix, path=None):
+    prefix = (prefix or "").rstrip("/")
     if not PREFIX_RX.match(prefix):
-        raise SystemExit('Add "snapshots": {"s3_prefix": "s3://<bucket>/raw", "tenant_id": "<tenant uuid>"} to the '
-                         "tenant config (ask the PerfectScale team for the bucket).")
+        raise SystemExit(f"--bucket must look like s3://<bucket>/raw, not {prefix!r}")
+    p = Path(path or MACHINE_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"s3_prefix": prefix}, indent=2) + "\n")
+    p.chmod(0o600)
+    return p
+
+
+def settings(cfg_raw, prefix=None, tenant_id=None, env=None, machine_file=None):
+    """(s3_prefix, tenant_id, [(name, uid)]), validated. The prefix comes from the argument, the
+    tenant config, PS_SNAPSHOT_PREFIX, then the machine file; the tenant id from the argument or
+    the tenant config."""
+    import os
+    env = os.environ if env is None else env
+    s = cfg_raw.get("snapshots") or {}
+    prefix = (prefix or s.get("s3_prefix") or env.get("PS_SNAPSHOT_PREFIX") or machine_prefix(machine_file) or "").rstrip("/")
+    tid = (tenant_id or s.get("tenant_id") or "").strip().lower()
+    if not PREFIX_RX.match(prefix):
+        raise SystemExit("First time on this machine: add --bucket s3://<bucket>/raw (ask the PerfectScale team for "
+                         "the bucket). It is saved for every later run.")
     if not UUID_RX.match(tid):
-        raise SystemExit(f"snapshots.tenant_id {tid!r} is not a tenant UUID")
+        raise SystemExit("First pull for this tenant: add --tenant-id <tenant UUID>. It is saved in the tenant config."
+                         if not tid else f"{tid!r} is not a tenant UUID")
     clusters = [(c["name"], c["uid"]) for c in cfg_raw.get("clusters") or [] if UUID_RX.match(c.get("uid") or "")]
     if not clusters:
         raise SystemExit("no clusters with a uid in the tenant config")
@@ -74,6 +107,24 @@ def parse_listing(text):
         if len(parts) >= 4 and KEY_RX.search(parts[-1]):
             out.append((KEY_RX.search(parts[-1]).group(4), parts[-1]))
     return sorted(set(out))
+
+
+def months(start, end):
+    """(YYYY, MM) partitions from start to end, inclusive."""
+    y, m, out = start.year, start.month, []
+    while (y, m) <= (end.year, end.month):
+        out.append((f"{y:04d}", f"{m:02d}"))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def window(stamps, days, end=None):
+    """Stamps in the `days` before end (default: the newest stamp)."""
+    stamps = sorted(set(stamps))
+    if not stamps:
+        return []
+    end = end or stamp(stamps[-1])
+    return [s for s in stamps if end - timedelta(days=days) < stamp(s) <= end + timedelta(minutes=1)]
 
 
 def select(stamps, samples, now=None):
@@ -105,32 +156,46 @@ def _run(cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
 
 
-def pull(cfg_raw, root, month, samples=("latest", "daily"), profile=None, dry_run=False, run=_run, log=print):
-    """Copy the chosen snapshots of every configured cluster for one month (YYYY-MM) into
-    <root>/data/snapshots/<cluster>/. Files already there are not fetched again."""
-    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month or ""):
-        raise SystemExit(f"--month must be YYYY-MM, not {month!r}")
-    prefix, tid, clusters = settings(cfg_raw)
-    yy, mm = month.split("-")
+def pull(cfg_raw, root, days=DEFAULT_DAYS, samples=("latest", "daily"), profile=None, dry_run=False, run=_run,
+         log=print, now=None, prefix=None, tenant_id=None):
+    """Copy the chosen snapshots of every configured cluster from the trailing `days` into
+    <root>/data/snapshots/<cluster>/. Files already there are not fetched again. Returns
+    {cluster: [stamps in the window]}."""
+    if not isinstance(days, int) or not 1 <= days <= 400:
+        raise SystemExit(f"--days must be between 1 and 400, not {days!r}")
+    prefix, tid, clusters = settings(cfg_raw, prefix, tenant_id)
+    now = now or datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
     extra = ["--profile", profile] if profile else []
-    total = 0
+    bucket = prefix.split("/")[2]
+    found = {}
     for name, uid in clusters:
-        base = f"{prefix}/{tid}/{uid}/snapshots/year={yy}/month={mm}/"
-        listing = parse_listing(run(["aws", "s3", "ls", base, "--recursive"] + extra))
-        bucket = prefix.split("/")[2]
-        keys = dict(listing)
+        listing = []
+        for yy, mm in months(start, now):
+            base = f"{prefix}/{tid}/{uid}/snapshots/year={yy}/month={mm}/"
+            try:
+                listing += parse_listing(run(["aws", "s3", "ls", base, "--recursive"] + extra))
+            except subprocess.CalledProcessError as e:
+                if e.returncode == 1 and not (e.stderr or "").strip():      # `aws s3 ls` on an empty prefix
+                    continue
+                raise SystemExit(f"aws s3 ls failed for {name}: {(e.stderr or '').strip() or e}")
+        keys = {s: k for s, k in listing if stamp(s) > start}
+        found[name] = sorted(keys)
         chosen = select(list(keys), samples)
         dest = Path(root) / "data" / "snapshots" / name
         todo = [(s, keys[s]) for s in chosen if not (dest / Path(keys[s]).name).exists()]
-        log(f"{name}: {len(listing)} snapshots in {month}, {len(chosen)} chosen ({'+'.join(samples)}), "
-            f"{len(todo)} to fetch")
+        span = (stamp(found[name][-1]) - stamp(found[name][0])).days + 1 if found[name] else 0
+        log(f"{name}: {len(keys)} snapshots in the last {days} days"
+            + (f" (from {found[name][0][:10]}, {span} days)" if keys else "")
+            + f", {len(chosen)} chosen ({'+'.join(samples)}), {len(todo)} to fetch")
+        if keys and span < min(MIN_DAYS, days):
+            log(f"  note: only {span} days of snapshots exist for {name}; trends cover that much")
         if dry_run:
             continue
         dest.mkdir(parents=True, exist_ok=True)
         for _, key in todo:
             run(["aws", "s3", "cp", f"s3://{bucket}/{key}", str(dest / Path(key).name), "--only-show-errors"] + extra)
-        total += len(todo)
-    return total
+    return found
 
 
 # ---------------------------------------------------------------- reading
@@ -334,10 +399,15 @@ def hpa_findings(fx, tr):
     return out
 
 
-def digest(root, cluster, log=print):
-    """Read every snapshot of one cluster under <root>/data/snapshots/<cluster>/ and write digest.json."""
+def digest(root, cluster, days=DEFAULT_DAYS, log=print):
+    """Read one cluster's snapshots from the `days` before its newest under
+    <root>/data/snapshots/<cluster>/ and write digest.json. Older files stay on disk but are left out,
+    so trends always describe the same trailing window."""
     d = Path(root) / "data" / "snapshots" / cluster
     files = sorted(f for f in d.glob("*") if LOCAL_RX.match(f.name) or f.name == "snapshot.json")
+    stamped = {LOCAL_RX.match(f.name).group(1): f for f in files if LOCAL_RX.match(f.name)}
+    if stamped:
+        files = [stamped[s] for s in window(list(stamped), days)]
     if not files:
         raise SystemExit(f"no snapshots in {d}")
     series = []
@@ -349,7 +419,7 @@ def digest(root, cluster, log=print):
     series.sort(key=lambda x: x[0])
     stamp_l, latest = series[-1]
     tr = trends([(s, fx) for s, fx in series])
-    out = {"cluster": cluster, "latest": stamp_l, "snapshots": [s for s, _ in series],
+    out = {"cluster": cluster, "latest": stamp_l, "snapshots": [s for s, _ in series], "window_days": days,
            "prerequisites": prerequisites(latest), "summary": {
                "counts": latest["counts"], "namespaces": latest["namespaces"], "karpenter": latest["karpenter"],
                "argo_rollouts": latest["argo_rollouts"], "perfectscale": latest["perfectscale"],

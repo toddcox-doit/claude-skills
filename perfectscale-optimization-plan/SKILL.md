@@ -170,32 +170,41 @@ PerfectScale's exporter writes a Kubernetes inventory of each cluster every 30 m
 hours to S3. It holds what the API never does - HPA `minReplicas`/`maxReplicas`
 and every scaling metric, PDBs, node pools and the autoscaler, the PerfectScale
 component versions - but no usage, cost or recommendations, so it adds to the
-API data and never replaces it. Add `"snapshots": {"s3_prefix": "s3://<bucket>/raw",
-"tenant_id": "<uuid>"}` to the config (ask the PerfectScale team for the bucket),
-sign the AWS CLI in, then:
+API data and never replaces it. With the AWS CLI signed in, one command pulls
+the trailing 30 days for every cluster in the config and digests them:
 
 ```bash
-python3 skill/perfectscale-optimization-plan/scripts/snapshots.py pull --month 2026-11   # latest + one a day, every cluster
-python3 skill/perfectscale-optimization-plan/scripts/snapshots.py digest
+python3 skill/perfectscale-optimization-plan/scripts/snapshots.py --tenant-id <tenant uuid>   # first pull for a tenant
+python3 skill/perfectscale-optimization-plan/scripts/snapshots.py                             # every later pull
 ```
 
-`--sample latest|daily|week|all` (comma list) picks the snapshots; files already
-fetched are skipped. The zips stay in `data/snapshots/<cluster>/` - they carry
-kubectl last-applied annotations with literal environment values, so treat them
-as customer data. `digest` writes `digest.json` beside them with only the fields
-the plan uses (no annotations, no environment values, no images other than
-PerfectScale's) and prints per cluster: node pools and how full their requests
-are, exporter/agent versions, HPAs whose triggers or `minReplicas` HPA
-automation would change, pinned HPAs (min == max), PDBs allowing no disruption,
-containers without requests, and, over several snapshots, how replica and node
-counts move. The next plan run reads the digest on its own (and re-reads it
-whenever it changes): an HPA the snapshot shows pinned at `minReplicas` =
-`maxReplicas` is treated as fixed replicas (Wave 1, no `hpa` block) without
-`hpa_pinned_namespaces`; the kickoff page's HPA section lists exact
-`minReplicas` changes (with the PDB that floors them) instead of hints, reports
-workloads at `maxReplicas` in a quarter or more of the snapshots, and states the
-exporter/agent versions it found, starting each prerequisite box it confirms
-ticked. The Kubernetes version is not in a snapshot, so that box stays a question.
+Two values are asked for once and then remembered: `--bucket s3://<bucket>/raw`
+the first time on a machine (saved to `~/.perfectscale/snapshots.json`; ask the
+PerfectScale team for it - it is never written into the skill or a tenant
+config), and `--tenant-id` the first time for a tenant (saved in its config;
+`new_tenant.py config|onboard --tenant-id` writes it at setup). Cluster ids come
+from the config. `--days N` changes the window (default 30: the newest snapshot
+plus one a day, the same month the plan scales savings to; under 14 days of
+snapshots is flagged as short), `--sample latest|daily|week|all` the sampling,
+`--dry-run` only counts. Files already fetched are skipped, and the digest only
+reads the window, so older files never skew the trends.
+
+The zips stay in `data/snapshots/<cluster>/` - they carry kubectl last-applied
+annotations with literal environment values, so treat them as customer data.
+`digest.json` beside them keeps only the fields the plan uses (no annotations, no
+environment values, no images other than PerfectScale's), and the command prints
+per cluster: node pools and how full their requests are, exporter/agent
+versions, HPAs whose triggers or `minReplicas` HPA automation would change,
+pinned HPAs (min == max), PDBs allowing no disruption, containers without
+requests, and how replica and node counts moved. The next plan run reads the
+digest on its own (and re-reads it whenever it changes): an HPA the snapshot
+shows pinned at `minReplicas` = `maxReplicas` is treated as fixed replicas
+(Wave 1, no `hpa` block) without `hpa_pinned_namespaces`; the kickoff page's HPA
+section lists exact `minReplicas` changes (with the PDB that floors them)
+instead of hints, reports workloads at `maxReplicas` in a quarter or more of the
+snapshots, and states the exporter/agent versions it found, starting each
+prerequisite box it confirms ticked. The Kubernetes version is not in a
+snapshot, so that box stays a question.
 
 ### 4. Analyse, render, verify
 

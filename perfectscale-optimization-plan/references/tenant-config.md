@@ -35,11 +35,14 @@ The public API has no HPA min/max, so set this only after asking. Anchor the
 patterns: `^payments$`. `run_plan.py --pin-hpa <namespace>...` adds the anchored
 entries and renders the next version.
 
-`snapshots` (default unset) enables `scripts/snapshots.py`: `{"s3_prefix":
-"s3://<bucket>/raw", "tenant_id": "<tenant uuid>"}`. Snapshots are read from
-`<s3_prefix>/<tenant_id>/<cluster uid>/snapshots/year=YYYY/month=MM/day=DD/`
-for each cluster in `clusters`, with the SE's own AWS CLI profile. The rest of a
-run ignores it.
+`snapshots` (default unset) holds `{"tenant_id": "<tenant uuid>"}` for
+`scripts/snapshots.py`, which writes it the first time it is given
+`--tenant-id` (as does `new_tenant.py config|onboard --tenant-id`). Snapshots are
+read from `<prefix>/<tenant_id>/<cluster uid>/snapshots/year=YYYY/month=MM/day=DD/`
+for each cluster in `clusters`, with the SE's own AWS CLI profile. The prefix
+(`s3://<bucket>/raw`) is a per-machine setting, not a tenant one: `--bucket`
+saves it to `~/.perfectscale/snapshots.json`, or set `PS_SNAPSHOT_PREFIX`. An
+`s3_prefix` in this block still overrides both. The rest of a run ignores it.
 
 `pov_top_n` (default 50) is how many workloads each cluster's POV automation
 kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of

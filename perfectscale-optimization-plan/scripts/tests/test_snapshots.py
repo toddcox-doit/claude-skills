@@ -93,44 +93,108 @@ class Selection(unittest.TestCase):
 
 class Settings(unittest.TestCase):
     def test_requires_prefix_and_uuid(self):
+        with self.assertRaisesRegex(SystemExit, "--bucket"):
+            S.settings({"clusters": CFG["clusters"], "snapshots": {"tenant_id": TID}}, env={}, machine_file="/nonexistent")
+        with self.assertRaisesRegex(SystemExit, "--tenant-id"):
+            S.settings({"clusters": CFG["clusters"]}, prefix="s3://example-bucket/raw", env={})
         with self.assertRaises(SystemExit):
-            S.settings({"clusters": CFG["clusters"]})
+            S.settings(CFG, tenant_id="../x", env={})
         with self.assertRaises(SystemExit):
-            S.settings({**CFG, "snapshots": {"s3_prefix": "s3://example-bucket/raw", "tenant_id": "../x"}})
-        with self.assertRaises(SystemExit):
-            S.settings({**CFG, "snapshots": {"s3_prefix": "s3://b/raw; rm -rf /", "tenant_id": TID}})
-        self.assertEqual(S.settings(CFG)[2], [("prod-a", UID)])
+            S.settings(CFG, prefix="s3://b/raw; rm -rf /", env={})
+        self.assertEqual(S.settings(CFG, env={})[2], [("prod-a", UID)])
+
+    def test_prefix_from_env_then_machine_file(self):
+        cfg = {"clusters": CFG["clusters"], "snapshots": {"tenant_id": TID}}
+        with tempfile.TemporaryDirectory() as t:
+            mf = Path(t) / "snapshots.json"
+            S.save_machine_prefix("s3://machine-bucket/raw/", mf)
+            self.assertEqual(oct(mf.stat().st_mode & 0o777), "0o600")
+            self.assertEqual(S.settings(cfg, env={}, machine_file=mf)[0], "s3://machine-bucket/raw")
+            self.assertEqual(S.settings(cfg, env={"PS_SNAPSHOT_PREFIX": "s3://env-bucket/raw"}, machine_file=mf)[0],
+                             "s3://env-bucket/raw")
+            self.assertEqual(S.settings(cfg, prefix="s3://arg-bucket/raw", env={}, machine_file=mf)[0], "s3://arg-bucket/raw")
+            with self.assertRaises(SystemExit):
+                S.save_machine_prefix("http://nope", mf)
+
+    def test_months_and_window(self):
+        from datetime import datetime, timezone
+        d = lambda *x: datetime(*x, tzinfo=timezone.utc)  # noqa: E731
+        self.assertEqual(S.months(d(2026, 11, 20), d(2027, 1, 3)), [("2026", "11"), ("2026", "12"), ("2027", "01")])
+        st = ["2026-10-01-00-00", "2026-10-21-00-00", "2026-11-10-00-00", "2026-11-19-00-00"]
+        self.assertEqual(S.window(st, 30), ["2026-10-21-00-00", "2026-11-10-00-00", "2026-11-19-00-00"])
 
 
 class Pull(unittest.TestCase):
-    def test_commands_and_skip_existing(self):
-        keys = [f"raw/{TID}/{UID}/snapshots/year=2026/month=11/day=0{d}/2026-11-0{d}-0{h}-41_v2.zip"
-                for d in (1, 2) for h in (1, 3)]
+    def keys(self, days):
+        return [f"raw/{TID}/{UID}/snapshots/year=2026/month={m}/day={dd}/2026-{m}-{dd}-{h}-41_v2.zip"
+                for m, dd in days for h in ("01", "03")]
+
+    def test_trailing_window_spans_months_and_skips_existing(self):
+        from datetime import datetime, timezone
+        by_month = {"10": self.keys([("10", "10"), ("10", "30")]), "11": self.keys([("11", "02")])}
         calls = []
 
         def run(cmd):
             calls.append(cmd)
-            return "\n".join(f"2026-11-02 00:00:00 700000 {k}" for k in keys) if cmd[2] == "ls" else ""
+            if cmd[2] == "ls":
+                m = cmd[3].split("month=")[1][:2]
+                return "\n".join(f"2026-11-02 00:00:00 700000 {k}" for k in by_month.get(m, []))
+            return ""
 
         with tempfile.TemporaryDirectory() as t:
             dest = Path(t) / "data" / "snapshots" / "prod-a"
             dest.mkdir(parents=True)
             (dest / "2026-11-02-03-41_v2.zip").write_bytes(b"x")       # already here
-            n = S.pull(CFG, t, "2026-11", ("latest", "daily"), profile="ro", run=run, log=lambda *_: None)
-        self.assertEqual(calls[0], ["aws", "s3", "ls", f"s3://example-bucket/raw/{TID}/{UID}/snapshots/year=2026/month=11/",
-                                    "--recursive", "--profile", "ro"])
-        cps = [c for c in calls if c[2] == "cp"]
-        self.assertEqual(n, 1)
-        self.assertEqual(cps[0][3], f"s3://example-bucket/{keys[1]}")       # day 1's newest; day 2's is local
+            found = S.pull(CFG, t, 30, ("latest", "daily"), profile="ro", run=run, log=lambda *_: None,
+                           now=datetime(2026, 11, 5, tzinfo=timezone.utc))
+        ls = [c for c in calls if c[2] == "ls"]
+        self.assertEqual([c[3].split("year=")[1] for c in ls], ["2026/month=10/", "2026/month=11/"])
+        self.assertEqual(ls[0][-2:], ["--profile", "ro"])
+        self.assertEqual(found["prod-a"][0], "2026-10-10-01-41")       # Oct 6..Nov 5 window keeps Oct 10, drops nothing older
+        cps = [c[3].rsplit("/", 1)[1] for c in calls if c[2] == "cp"]
+        self.assertEqual(cps, ["2026-10-10-03-41_v2.zip", "2026-10-30-03-41_v2.zip"])   # Nov 2's newest is local
         self.assertTrue(all(isinstance(c, list) for c in calls))           # never a shell string
 
-    def test_dry_run_fetches_nothing_and_bad_month(self):
+    def test_old_snapshots_outside_window_are_ignored(self):
+        from datetime import datetime, timezone
+        keys = self.keys([("11", "01"), ("11", "20")])
+        run = lambda c: "\n".join(f"x y 1 {k}" for k in keys) if c[2] == "ls" else ""  # noqa: E731
+        with tempfile.TemporaryDirectory() as t:
+            found = S.pull(CFG, t, 7, ("latest", "daily"), run=run, dry_run=True, log=lambda *_: None,
+                           now=datetime(2026, 11, 21, tzinfo=timezone.utc))
+        self.assertEqual(found["prod-a"], ["2026-11-20-01-41", "2026-11-20-03-41"])
+
+    def test_dry_run_fetches_nothing_and_bad_days(self):
         calls = []
         with tempfile.TemporaryDirectory() as t:
-            S.pull(CFG, t, "2026-11", run=lambda c: calls.append(c) or "", dry_run=True, log=lambda *_: None)
+            S.pull(CFG, t, run=lambda c: calls.append(c) or "", dry_run=True, log=lambda *_: None)
             with self.assertRaises(SystemExit):
-                S.pull(CFG, t, "2026-13", run=lambda c: "", log=lambda *_: None)
-        self.assertEqual([c[2] for c in calls], ["ls"])
+                S.pull(CFG, t, 0, run=lambda c: "", log=lambda *_: None)
+        self.assertTrue(calls and all(c[2] == "ls" for c in calls))
+
+
+class Cli(unittest.TestCase):
+    """One command: the tenant id is saved in the config the first time, then never asked again."""
+
+    def test_tenant_id_saved_once(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as t:
+            cfgp = Path(t) / "config" / "acme.tenant.json"
+            cfgp.parent.mkdir()
+            cfgp.write_text(json.dumps({"customer": "Acme", "clusters": CFG["clusters"], "profile": "acme"}))
+            sys.path.insert(0, str(HERE.parent))
+            import snapshots as cli
+            raw = cli.save_tenant_id(cfgp, json.loads(cfgp.read_text()), TID.upper())
+            saved = json.loads(cfgp.read_text())
+            self.assertEqual(saved["snapshots"], {"tenant_id": TID})
+            self.assertEqual(saved["profile"], "acme")
+            self.assertIs(cli.save_tenant_id(cfgp, raw, TID), raw)
+            with self.assertRaises(SystemExit):
+                cli.save_tenant_id(cfgp, raw, "not-a-uuid")
+            r = subprocess.run([sys.executable, str(HERE.parent / "snapshots.py"), "--config", str(cfgp), "--dry-run",
+                                "--bucket", "s3://example-bucket/raw"], capture_output=True, text=True,
+                               env={"HOME": t, "PATH": "/nonexistent"})
+            self.assertTrue((Path(t) / ".perfectscale" / "snapshots.json").exists(), r.stderr)
 
 
 class Digest(unittest.TestCase):
@@ -140,6 +204,7 @@ class Digest(unittest.TestCase):
         self.d.mkdir(parents=True)
         write_zip(self.d / "2026-11-02-17-41_v2.zip", doc(replicas=10, nodes=5))
         write_zip(self.d / "2026-11-03-17-41_v2.zip", doc(replicas=3, nodes=3))
+        write_zip(self.d / "2026-09-01-17-41_v2.zip", doc(replicas=99, nodes=99))      # outside the 30-day window
         self.dg = S.digest(self.t.name, "prod-a", log=lambda *_: None)
         self.text = (self.d / "digest.json").read_text()
 
@@ -163,7 +228,8 @@ class Digest(unittest.TestCase):
         self.assertEqual(self.dg["latest"], "2026-11-03-17-41")
         t = self.dg["trends"]["hpa"]["Deployment/shop/cart"]
         self.assertEqual((t["low"], t["high"], t["at_max_pct"], t["at_min_pct"]), (3, 10, 50, 50))
-        self.assertEqual(self.dg["trends"]["nodes"], [5, 3])
+        self.assertEqual(self.dg["trends"]["nodes"], [5, 3])           # the September snapshot is left out
+        self.assertEqual(self.dg["window_days"], 30)
 
     def test_prereqs_pools_and_blockers(self):
         pr = self.dg["prerequisites"]
