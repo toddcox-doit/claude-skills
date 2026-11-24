@@ -35,6 +35,12 @@ The public API has no HPA min/max, so set this only after asking. Anchor the
 patterns: `^payments$`. `run_plan.py --pin-hpa <namespace>...` adds the anchored
 entries and renders the next version.
 
+`snapshots` (default unset) enables `scripts/snapshots.py`: `{"s3_prefix":
+"s3://<bucket>/raw", "tenant_id": "<tenant uuid>"}`. Snapshots are read from
+`<s3_prefix>/<tenant_id>/<cluster uid>/snapshots/year=YYYY/month=MM/day=DD/`
+for each cluster in `clusters`, with the SE's own AWS CLI profile. The rest of a
+run ignores it.
+
 `pov_top_n` (default 50) is how many workloads each cluster's POV automation
 kickoff table holds. `pov_savings_weight` (default 0.6) is the savings share of
 its 0-100 ranking score; the rest is risk severity. See

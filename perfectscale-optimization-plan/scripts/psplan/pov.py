@@ -680,6 +680,7 @@ POV_CSS = """.pd{position:relative;display:inline-block}
 .hpagrid .hpaf span{display:block;font-size:13px;color:var(--mut)}
 .hpagrid input{font:inherit;width:7em;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
 .hpastate{font-size:13px;font-weight:600}
+.snapnote{font-size:13px;border-left:3px solid #2f6fdb;padding:4px 10px;background:#f3f7fd}
 details.hparoll>summary,details.outgrp>summary{cursor:pointer;font-weight:600}
 details.outgrp>summary .gsub,details.outgrp>summary .gstale{font-weight:400}
 table.hpaft{table-layout:fixed}table.hpaft th:nth-child(1){width:28%}table.hpaft th:nth-child(2){width:18%}
@@ -1051,6 +1052,8 @@ def _hpa_section(f, pv, namespaces):
     rp = [x for x in items if "report" in kinds(x[1])]
     mn = [x for x in items if "min" in kinds(x[1])]
     mv = [x for x in items if any("application container" in y["text"] for y in x[1]["findings"])]
+    sn = f.get("snapshot")
+    when = (lambda s: f"{s[:10]} {s[11:13]}:{s[14:16]} UTC")(sn["latest"]) if sn else ""
     P = [f"<h2>HPA automation</h2><p>{plural(n_all, 'workload')} in this cluster {'has' if n_all == 1 else 'have'} an HPA that "
          f"scales on pod CPU or memory, carrying {usd(pot)}/mo of potential savings. PerfectScale sizes their request from the "
          "HPA trigger (about 1.25x observed usage at an 80% trigger), so they are automated with the rest. PerfectScale's "
@@ -1065,9 +1068,14 @@ def _hpa_section(f, pv, namespaces):
     else:
         will.append("Leave every trigger as it is: from the data, each CPU and memory trigger is between 80% and the highest "
                     "it can reach with the recommended requests and limits.")
-    will.append("Lower minReplicas to 2 (or to what a single PodDisruptionBudget needs) where it sits higher. The public API "
-                "does not carry each HPA's minReplicas, so PodFit's HPA tab shows the exact value"
-                + (f"; {plural(len(mn), 'workload')} held replicas flat at 3 or more all window, the likeliest candidates." if mn else "."))
+    if sn:
+        will.append("Lower minReplicas to 2 (or to what a single PodDisruptionBudget needs) where it sits higher"
+                    + (f": {plural(len(mn), 'workload')} here, from the HPA settings in the cluster snapshot of {when}." if mn
+                       else f". From the cluster snapshot of {when}, no HPA here has minReplicas above 2."))
+    else:
+        will.append("Lower minReplicas to 2 (or to what a single PodDisruptionBudget needs) where it sits higher. The public API "
+                    "does not carry each HPA's minReplicas, so PodFit's HPA tab shows the exact value"
+                    + (f"; {plural(len(mn), 'workload')} held replicas flat at 3 or more all window, the likeliest candidates." if mn else "."))
     own = ["maxReplicas and scaling behaviour: PerfectScale never changes them. A workload that stays at maxReplicas is a "
            "scaling question, not a sizing one."]
     if rp:
@@ -1075,10 +1083,24 @@ def _hpa_section(f, pv, namespaces):
                    "Findings by workload.")
     P.append("<h3>What HPA automation will change</h3><ul>" + "".join(f"<li>{e(x)}</li>" for x in will) + "</ul>"
              "<h3>What stays with the owners</h3><ul>" + "".join(f"<li>{e(x)}</li>" for x in own) + "</ul>")
-    P.append("<h3>Prerequisites</h3><p class=mut>Ask the customer, then tick. Generated files include the hpa block only "
-             "once both required boxes are ticked.</p><div class=hpapre>"
-             "<label><input type=checkbox id=hpaagent> PerfectScale automation agent v1.0.71 or later on this cluster (required)</label>"
-             "<label><input type=checkbox id=hpaexporter> PerfectScale exporter v1.1.28 or later (required)</label>"
+    pr = (sn or {}).get("prerequisites") or {}
+    seen = ""
+    if sn:
+        agent = (f"automation agent {pr['agent']} ({'meets' if pr.get('agent_ok') else 'below'} v1.0.71)" if pr.get("agent")
+                 else "no PerfectScale automation agent found - it needs installing before automation can run")
+        exp = (f"exporter {pr['exporter']} ({'meets' if pr.get('exporter_ok') else 'below'} v1.1.28)" if pr.get("exporter")
+               else "no PerfectScale exporter found")
+        pinned = sn.get("pinned") or 0
+        seen = (f"<p class=snapnote>From the cluster snapshot of {e(when)}: {e(exp)}; {e(agent)}. The Kubernetes version is not "
+                "in a snapshot, so ask."
+                + (f" {plural(pinned, 'HPA')} pinned at minReplicas = maxReplicas {'is' if pinned == 1 else 'are'} treated as "
+                   "fixed replicas (Wave 1, no hpa block)." if pinned else "") + "</p>")
+    chk = lambda ok: " checked" if ok else ""  # noqa: E731
+    P.append("<h3>Prerequisites</h3>" + seen + "<p class=mut>"
+             + ("Boxes the snapshot confirms start ticked; ask about the rest. " if sn else "Ask the customer, then tick. ")
+             + "Generated files include the hpa block only once both required boxes are ticked.</p><div class=hpapre>"
+             f"<label><input type=checkbox id=hpaagent{chk(pr.get('agent_ok'))}> PerfectScale automation agent v1.0.71 or later on this cluster (required)</label>"
+             f"<label><input type=checkbox id=hpaexporter{chk(pr.get('exporter_ok'))}> PerfectScale exporter v1.1.28 or later (required)</label>"
              "<label><input type=checkbox id=hpak133> Kubernetes 1.33 or later (optional: lets a pod-level trigger move to "
              "the application container; otherwise it stays pod-level)</label></div>"
              "<p class=mut>Pod automation must cover these workloads too: HPA automation acts only on a revision PerfectScale "
@@ -1128,7 +1150,8 @@ def _hpa_section(f, pv, namespaces):
              "<p class=mut>Click a namespace for what changes on each of its workloads. Switch a namespace's HPA automation on "
              "or off under Namespace scope.</p>"
              "<div class=wrap><table class='sort nrsz'><thead><tr><th>Namespace</th><th>HPA workloads</th><th>Potential savings</th>"
-             "<th>Triggers to change</th><th>Reported only</th><th>minReplicas hints</th></tr></thead><tbody>"
+             "<th>Triggers to change</th><th>Reported only</th><th>" + ("minReplicas to lower" if sn else "minReplicas hints")
+             + "</th></tr></thead><tbody>"
              + "".join(rows) + "</tbody></table></div></details>")
     fi = [(ns, i) for ns, i in items if i["findings"]]
     if fi:
@@ -1138,7 +1161,10 @@ def _hpa_section(f, pv, namespaces):
             frows.append(f"<tr data-ns='{k}'><td data-v='{e(i['name'])}'><button type=button class=nstog aria-expanded=false>{e(i['name'])}</button></td>"
                          f"<td>{e(ns)}</td><td class=hpa>{e(hpa_line(i['detail']))}</td><td class=wnote>{e(short(i))}</td></tr>"
                          f"<tr class=nsdet data-for='{k}' hidden><td></td><td colspan=3>"
-                         f"<p class=mut>HPA triggers: {e(i['detail'] or '-')}</p><ul class=hpal>"
+                         f"<p class=mut>HPA triggers: {e(i['detail'] or '-')}"
+                         + (f"; minReplicas {i['replicas']['min']}, maxReplicas {i['replicas']['max']}"
+                            + (f"; PDB {', '.join(i['replicas']['pdbs'])}" if i['replicas']['pdbs'] else "")
+                            if i.get("replicas") else "") + "</p><ul class=hpal>"
                          + "".join(f"<li class='hk-{x['kind']}'>{e(x['text'])}</li>" for x in i["findings"]) + "</ul></td></tr>")
         P.append(f"<details class=hparoll><summary>Findings by workload ({len(fi)})</summary>"
                  "<p class=mut>Click a workload for the full notes.</p><div class=wrap><table class='sort nrsz hpaft'>"
@@ -1146,7 +1172,10 @@ def _hpa_section(f, pv, namespaces):
                  + "".join(frows) + "</tbody></table></div>"
                  + (f"<p class=mut>Showing the first 300 of {len(fi)}.</p>" if len(fi) > 300 else "") + "</details>")
     P.append("<details class=hpascript><summary>If the customer agrees to share their HPA and PDB settings</summary>"
-             "<p>Not needed for anything on this page. Read-only commands, run by someone with access to the cluster, that "
+             + (f"<p class=snapnote>The cluster snapshot of {e(when)} already gives each HPA's minReplicas and maxReplicas, "
+                "the PodDisruptionBudgets and the PerfectScale versions; only the Kubernetes version (command 2) is still "
+                "worth asking for.</p>" if sn else "")
+             + "<p>Not needed for anything on this page. Read-only commands, run by someone with access to the cluster, that "
              "give the exact values the public API does not: each HPA's minReplicas and maxReplicas, the PodDisruptionBudget "
              "floor for minReplicas, the Kubernetes version and the PerfectScale agent and exporter versions. Share the "
              "output with your PerfectScale contact to confirm the prerequisites and minReplicas changes before rollout.</p><ol>"

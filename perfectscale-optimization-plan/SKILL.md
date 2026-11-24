@@ -164,6 +164,39 @@ Resumable, globally rate-limited with backoff on 429, skips files still fresh,
 falls back to top unevictable groups if the cluster-wide pull fails. Re-run
 until it reports complete.
 
+#### 3a. Optional: cluster snapshots from S3 (no customer credentials)
+
+PerfectScale's exporter writes a Kubernetes inventory of each cluster every 30 minutes to two
+hours to S3. It holds what the API never does - HPA `minReplicas`/`maxReplicas`
+and every scaling metric, PDBs, node pools and the autoscaler, the PerfectScale
+component versions - but no usage, cost or recommendations, so it adds to the
+API data and never replaces it. Add `"snapshots": {"s3_prefix": "s3://<bucket>/raw",
+"tenant_id": "<uuid>"}` to the config (ask the PerfectScale team for the bucket),
+sign the AWS CLI in, then:
+
+```bash
+python3 skill/perfectscale-optimization-plan/scripts/snapshots.py pull --month 2026-11   # latest + one a day, every cluster
+python3 skill/perfectscale-optimization-plan/scripts/snapshots.py digest
+```
+
+`--sample latest|daily|week|all` (comma list) picks the snapshots; files already
+fetched are skipped. The zips stay in `data/snapshots/<cluster>/` - they carry
+kubectl last-applied annotations with literal environment values, so treat them
+as customer data. `digest` writes `digest.json` beside them with only the fields
+the plan uses (no annotations, no environment values, no images other than
+PerfectScale's) and prints per cluster: node pools and how full their requests
+are, exporter/agent versions, HPAs whose triggers or `minReplicas` HPA
+automation would change, pinned HPAs (min == max), PDBs allowing no disruption,
+containers without requests, and, over several snapshots, how replica and node
+counts move. The next plan run reads the digest on its own (and re-reads it
+whenever it changes): an HPA the snapshot shows pinned at `minReplicas` =
+`maxReplicas` is treated as fixed replicas (Wave 1, no `hpa` block) without
+`hpa_pinned_namespaces`; the kickoff page's HPA section lists exact
+`minReplicas` changes (with the PDB that floors them) instead of hints, reports
+workloads at `maxReplicas` in a quarter or more of the snapshots, and states the
+exporter/agent versions it found, starting each prerequisite box it confirms
+ticked. The Kubernetes version is not in a snapshot, so that box stays a question.
+
 ### 4. Analyse, render, verify
 
 ```bash

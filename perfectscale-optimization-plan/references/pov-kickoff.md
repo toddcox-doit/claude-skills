@@ -95,6 +95,25 @@ since there is one NamespaceAutomationConfig per namespace. Until then they carr
 cluster scope. `hpa_pinned_namespaces` remains as an override for HPAs confirmed
 pinned: those workloads are Wave 1 and need no HPA automation.
 
+With a cluster snapshot digest (`scripts/snapshots.py`, written to
+`data/snapshots/<cluster>/digest.json`) the section works from the cluster's own
+HPA specs instead of guesses:
+
+- an HPA with `minReplicas` = `maxReplicas` is treated as pinned, exactly as if
+  its namespace were in `hpa_pinned_namespaces` (detail: "pinned (min = max = N,
+  cluster snapshot)");
+- `minReplicas` above 2 is a finding of its own ("minReplicas 5 → 2 (PDB
+  floor)", naming the PodDisruptionBudget that floors it), and the By namespace
+  column reads **minReplicas to lower** instead of hints;
+- a workload at `maxReplicas` in 25% or more of at least two snapshots is reported
+  to the owners, never changed;
+- the Prerequisites box states the exporter and agent versions found, with the
+  date of the snapshot, and starts each box the snapshot confirms ticked;
+- the folded kubectl commands say that only the Kubernetes version is still worth
+  asking for.
+
+A run without a digest behaves exactly as before.
+
 ### Generated output, one rollup per CRD type
 
 Generated files land in **Generated CRDs**, one collapsible group per type:

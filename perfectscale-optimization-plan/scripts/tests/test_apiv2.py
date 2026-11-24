@@ -481,5 +481,88 @@ class CollectorStep(unittest.TestCase):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class HpaSnapshot(unittest.TestCase):
+    """A cluster snapshot digest (scripts/snapshots.py) beside the tenant data: an HPA pinned at
+    min == max is treated as fixed replicas, minReplicas above 2 becomes an exact change, a workload
+    often at maxReplicas is reported, and the page shows what the snapshot confirmed."""
+    NS = HpaAutomation.NS
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cfg = Config.load(fixtures.make(cls.tmp))
+        rows = [json.loads(l) for l in (cfg.data("prod-a") / "workloads-all.jsonl").read_text().splitlines() if l.strip()]
+        ns = [r for r in rows if r["namespace"] == cls.NS]
+        assert len(ns) >= 3, "fixture needs three workloads in the namespace"
+        v2 = [{"id": r["id"], "name": r["name"], "namespace": r["namespace"], "type": r["type"],
+               "scaling": {"avgReplicas": 2, "hpaTargets": {"cpu": {"utilization": 90}, "memory": {"utilization": 90}}},
+               "automation": {"automatedBy": "none", "status": "NotEnabled"},
+               "maturity": {"overall": {"isMature": True, "minutesLeftToMature": 0}}, "containers": {}} for r in ns]
+        (cfg.data("prod-a") / "workloads-v2.json").write_text(json.dumps({"data": v2, "meta": {}}))
+        cls.pinned, cls.high, cls.busy = ns[0], ns[1], ns[2]
+        key = lambda r: f"{r['type']}/{r['namespace']}/{r['name']}"  # noqa: E731
+        hpa = [{"namespace": cls.NS, "hpa": "a", "target": key(cls.pinned), "min": 3, "max": 3, "pinned": True, "pdbs": [],
+                "other_metrics": [], "trend": None},
+               {"namespace": cls.NS, "hpa": "b", "target": key(cls.high), "min": 5, "max": 12, "pinned": False,
+                "pdbs": ["b-pdb"], "other_metrics": [], "trend": {"samples": 4, "at_max_pct": 0}},
+               {"namespace": cls.NS, "hpa": "c", "target": key(cls.busy), "min": 2, "max": 4, "pinned": False, "pdbs": [],
+                "other_metrics": [], "trend": {"samples": 4, "at_max_pct": 50}}]
+        dg = {"cluster": "prod-a", "latest": "2026-11-24-21-00", "snapshots": ["2026-11-24-21-00"] * 4, "hpa": hpa,
+              "prerequisites": {"exporter": "v1.1.43", "exporter_ok": True, "agent": None, "agent_ok": False},
+              "summary": {}}
+        sp = model.snapshot_path(cfg, "prod-a")
+        sp.parent.mkdir(parents=True)
+        sp.write_text(json.dumps(dg))
+        cls.cfg, cls.F = cfg, model.load_all(cfg, parallel=False)
+        cls.prod = next(f for f in cls.F if f["name"] == "prod-a")
+        cls.S = Plan(cfg, cls.F).build()
+        cls.files = files = render.write_all(cfg, cls.S, cls.F)
+        cls.page = next(p for p in files if "-prod-a-pov-automation-kickoff" in p.name).read_text(encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def row(self, r):
+        return next(x for x in self.prod["pov"]["rows"] if x["ns"] == self.NS and x["name"] == r["name"])
+
+    def item(self, r):
+        n = next(n for n in self.prod["pov"]["namespaces"] if n["ns"] == self.NS)
+        return next(i for i in n["hpa"]["items"] if i["name"] == r["name"])
+
+    def test_pinned_hpa_is_fixed_replicas(self):
+        self.assertEqual(self.row(self.pinned)["hpa_class"], "pinned")
+        self.assertNotEqual(self.row(self.pinned)["wave"], "1h")
+        self.assertIn("cluster snapshot", self.row(self.pinned)["hpa_detail"])
+        self.assertEqual(self.row(self.high)["wave"], "1h")
+
+    def test_exact_min_replicas_and_max_report(self):
+        f = self.item(self.high)["findings"]
+        self.assertIn("Lower minReplicas from 5 to 2, or to what PodDisruptionBudget b-pdb needs (maxReplicas 12 stays)",
+                      [x["text"] for x in f])
+        self.assertFalse(any("hint" in x["short"] for x in f))
+        busy = [x for x in self.item(self.busy)["findings"] if x["kind"] == "report"]
+        self.assertTrue(any("At maxReplicas (4) in 50% of 4 cluster snapshots" in x["text"] for x in busy))
+        self.assertEqual(self.item(self.high)["replicas"]["max"], 12)
+
+    def test_page_shows_snapshot_and_ticks_what_it_confirms(self):
+        t = self.page
+        self.assertIn("From the cluster snapshot of 2026-11-24 21:00 UTC: exporter v1.1.43 (meets v1.1.28)", t)
+        self.assertIn("no PerfectScale automation agent found", t)
+        self.assertIn("id=hpaexporter checked", t)
+        self.assertNotIn("id=hpaagent checked", t)
+        self.assertIn("<th>minReplicas to lower</th>", t)
+        self.assertIn("minReplicas 5, maxReplicas 12; PDB b-pdb", t)
+        self.assertIn("1 HPA pinned at minReplicas = maxReplicas is treated as fixed replicas", t)
+        self.assertTrue(*verify.verify(self.cfg, self.S, self.F, self.files))
+
+    def test_cache_invalidated_when_digest_changes(self):
+        sp = model.snapshot_path(self.cfg, "prod-a")
+        files = [sp]
+        a = model.fingerprint(self.cfg, self.cfg["clusters"][0], files)
+        sp.write_text(sp.read_text() + " ")
+        self.assertNotEqual(a, model.fingerprint(self.cfg, self.cfg["clusters"][0], files))
+
+
 if __name__ == "__main__":
     unittest.main()

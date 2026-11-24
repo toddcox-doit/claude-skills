@@ -137,7 +137,7 @@ def _cres(c, kind, which):
     return rec if rec else cur
 
 
-def hpa_analysis(r2, x):
+def hpa_analysis(r2, x, snap=None):
     """What PerfectScale's HPA automation would change on a workload whose HPA scales on pod CPU or
     memory, worked out from public API v2 data with the rules PerfectScale documents:
 
@@ -150,8 +150,10 @@ def hpa_analysis(r2, x):
         (Kubernetes 1.33 or later)
 
     minReplicas needs the HPA's own min/max, which the API does not carry: a replica count that
-    never moved above 2 is flagged as a hint only. maxReplicas and scaling behaviour are never
-    recommended, by PerfectScale or here."""
+    never moved above 2 is flagged as a hint only. With a cluster snapshot (snap: this HPA's entry
+    in data/snapshots/<cluster>/digest.json) the exact minReplicas, maxReplicas and PDBs are known,
+    so the hint becomes the change itself, and a workload often at maxReplicas is reported.
+    maxReplicas and scaling behaviour are never recommended, by PerfectScale or here."""
     t = (r2.get("scaling") or {}).get("hpaTargets") or {}
     conts = r2.get("containers") or {}
     conts = list(conts.values()) if isinstance(conts, dict) else list(conts)
@@ -190,12 +192,38 @@ def hpa_analysis(r2, x):
     rc = x.get("replicas_counts") or {}
     avg = rc.get("avg_count") or 0
     mx = rc.get("max_count", avg)
-    if avg >= 3 and mx <= avg:
+    if snap:
+        lo, hi, pdbs, tr = snap.get("min") or 1, snap.get("max"), snap.get("pdbs") or [], snap.get("trend") or {}
+        if lo > 2:
+            F.append(("min", f"minReplicas {lo} \u2192 2" + (" (PDB floor)" if pdbs else ""),
+                      f"Lower minReplicas from {lo} to 2" + (f", or to what PodDisruptionBudget {', '.join(pdbs)} needs" if pdbs else "")
+                      + f" (maxReplicas {hi} stays)"))
+        if (tr.get("samples") or 0) >= 2 and (tr.get("at_max_pct") or 0) >= 25:
+            F.append(("report", f"at maxReplicas {tr['at_max_pct']}% of snapshots",
+                      f"At maxReplicas ({hi}) in {tr['at_max_pct']}% of {tr['samples']} cluster snapshots: a scaling question for "
+                      "the owners - PerfectScale never changes maxReplicas"))
+    elif avg >= 3 and mx <= avg:
         F.append(("min", f"minReplicas hint: flat at {avg:g}",
                   f"Replicas held at {avg:g} all window: minReplicas may sit above need, or equal maxReplicas. "
                   "HPA automation lowers minReplicas to 2 when maxReplicas allows; PodFit's HPA tab shows the exact value"))
-    return {"triggers": trig, "usable": {k: (math.floor(v) if v is not None else None) for k, v in usable.items()},
-            "containers": declared, "findings": [{"kind": k, "short": sh, "text": t} for k, sh, t in F]}
+    out = {"triggers": trig, "usable": {k: (math.floor(v) if v is not None else None) for k, v in usable.items()},
+           "containers": declared, "findings": [{"kind": k, "short": sh, "text": t} for k, sh, t in F]}
+    if snap:
+        out["replicas"] = {"min": snap.get("min"), "max": snap.get("max"), "pdbs": snap.get("pdbs") or [],
+                           "other_metrics": snap.get("other_metrics") or []}
+    return out
+
+
+def snapshot_path(cfg, name):
+    """Where scripts/snapshots.py digest writes a cluster's digest (tenant folder, not data_dir)."""
+    return Path(getattr(cfg, "root", ".")) / "data" / "snapshots" / name / "digest.json"
+
+
+def load_snapshot(cfg, name):
+    """The cluster snapshot digest, or None. Optional: without it the HPA analysis works from the
+    public API alone, as before."""
+    d = jload(snapshot_path(cfg, name), None)
+    return d if isinstance(d, dict) and d.get("hpa") is not None else None
 
 
 def pov_wave(x):
@@ -371,7 +399,8 @@ def pov_namespaces(w, R):
             info = x.get("_hpa_info") or {}
             h["items"].append({"name": x["name"], "type": x["type"], "detail": x.get("_hpa_detail") or "",
                                "pot": R(max(x["potential_savings"], 0.0)), "findings": info.get("findings") or [],
-                               "usable": info.get("usable") or {}, "containers": info.get("containers") or []})
+                               "usable": info.get("usable") or {}, "containers": info.get("containers") or [],
+                               "replicas": info.get("replicas")})
         t = a["auto"].setdefault(x["type"], {"n": 0, "pot": 0.0, "risk": 0, "waste": 0.0})
         t["n"] += 1
         t["pot"] += R(max(x["potential_savings"], 0.0))
@@ -646,6 +675,7 @@ def load_cluster(cfg, cluster, use_cache=True):
         files.append(Path(cfg["eligibility_file"]))
     if cfg.get("hpa_file"):
         files.append(Path(cfg["hpa_file"]))
+    files.append(snapshot_path(cfg, name))
     cache = cfg.data(name).parent / ".cache" / f"{name}.json"
     fp = fingerprint(cfg, cluster, files)
     if use_cache and cache.exists():
@@ -678,6 +708,8 @@ def _load(cfg, cluster, d):
     held_rx = re.compile("|".join(cfg["held_out_from_automation"]), re.I) if cfg["held_out_from_automation"] else None
     jvm_rx = re.compile("|".join(cfg["jvm_patterns"]), re.I) if cfg["jvm_patterns"] else None
     pinned_rx = re.compile("|".join(cfg["hpa_pinned_namespaces"]), re.I) if cfg.get("hpa_pinned_namespaces") else None
+    snap = load_snapshot(cfg, name)
+    snap_hpa = {h["target"]: h for h in (snap or {}).get("hpa") or []}
     nonprod_rx = re.compile("|".join(cfg["nonprod_patterns"]), re.I) if cfg["nonprod_patterns"] else None
     excl = [e.lower() for e in cfg["exclusions"]]
 
@@ -760,7 +792,12 @@ def _load(cfg, cluster, d):
         if x["_hpa_class"] == "pod_resource" and pinned_rx and pinned_rx.search(x["namespace"]):
             # Customer-confirmed min == max: the HPA cannot scale, so a resize cannot move it.
             x["_hpa_class"], x["_hpa_detail"] = "pinned", (x["_hpa_detail"] or "CPU/memory") + "; pinned (min = max, confirmed)"
-        x["_hpa_info"] = hpa_analysis(r2, x) if x["_hpa_class"] == "pod_resource" else None
+        sh = snap_hpa.get(f"{x['type']}/{x['namespace']}/{x['name']}")
+        if x["_hpa_class"] == "pod_resource" and sh and sh.get("pinned"):
+            # The cluster snapshot shows minReplicas == maxReplicas: as good as the customer's word.
+            x["_hpa_class"], x["_hpa_detail"] = "pinned", (x["_hpa_detail"] or "CPU/memory") + \
+                f"; pinned (min = max = {sh['min']}, cluster snapshot)"
+        x["_hpa_info"] = hpa_analysis(r2, x, sh) if x["_hpa_class"] == "pod_resource" else None
         x["_auto_status"] = (r2.get("automation") or {}).get("status") if r2 else None
         x["_immature"] = bool(r2) and not ((r2.get("maturity") or {}).get("overall") or {}).get("isMature", True)
 
@@ -769,6 +806,12 @@ def _load(cfg, cluster, d):
         "name": name, "uid": uid, "cloud": cloud, "window_days": window_days, "factor": f,
         "first_seen": first.isoformat(), "last_seen": last.isoformat(),
         "early": window_days < cfg["min_history_days"],
+        # From scripts/snapshots.py digest, when present: what the cluster itself says about HPA automation.
+        "snapshot": ({"latest": snap["latest"], "n": len(snap.get("snapshots") or []),
+                      "prerequisites": snap.get("prerequisites") or {}, "summary": snap.get("summary") or {},
+                      "pinned": sum(1 for h in snap["hpa"] if h.get("pinned")),
+                      "min_above_2": sum(1 for h in snap["hpa"] if (h.get("min") or 1) > 2 and not h.get("pinned"))}
+                     if snap else None),
         "n_workloads": len(w), "n_synth_dropped": n_synth, "n_muted": n_muted, "n_excluded": n_excl,
         "excluded_cost": R(excl_cost), "excluded_waste": R(excl_waste),
         "cost_o": cost_o, "waste_o": waste_o, "pot_o": pot_o, "cost": R(cost_o), "waste": R(waste_o), "pot": R(pot_o),

@@ -49,6 +49,7 @@ DEFAULTS = {
     # that simply never crossed its target produces too. Matched on namespace. Workloads there are
     # treated like workloads without an HPA: wave 1, ticked by default, automated by namespace configs.
     "hpa_pinned_namespaces": [],
+    "snapshots": None,                      # {"s3_prefix": "s3://<bucket>/raw", "tenant_id": uuid}: scripts/snapshots.py only
     "runtime_file": None,                   # optional JSON from a PodFit browser pass, if a Runtime column is available
     "nonprod_patterns": ["stage", "staging", "dev", "nonprod", "sbx", "sandbox", "test", "uat", "qa"],
     "managed_namespaces": [],               # extra namespaces treated as platform-managed
